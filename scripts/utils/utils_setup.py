@@ -25,7 +25,6 @@ def pull_reqs():
     )
 
     print('Packages installed.')
-    print()
 
 def print_runtime_info():
     print()
@@ -62,3 +61,4 @@ def print_runtime_info():
         print('RAM tier     : Standard RAM')
 
     print('=' * 40)
+    print()

@@ -3,7 +3,7 @@
 Helpers for regular notebook information.
 
 Latest changes: 06/08/26:
-- Imported os
+- Improved spacing v2
 """
 
 import os 
@@ -25,9 +25,10 @@ def pull_reqs():
     )
 
     print('Packages installed.')
-
+    print()
 
 def print_runtime_info():
+    print()
     print('=' * 40)
     print('Runtime information')
     print('=' * 40)

@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+torch
+scikit-learn
+python-chess
+zstandard
+requests
+tqdm

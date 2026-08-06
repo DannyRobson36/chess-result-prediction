@@ -3,9 +3,10 @@
 Helpers for regular notebook information.
 
 Latest changes: 06/08/26:
-- Initial commit
+- Imported os
 """
 
+import os 
 import subprocess
 import sys
 from pathlib import Path

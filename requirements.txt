@@ -7,3 +7,4 @@ python-chess
 zstandard
 requests
 tqdm
+psutil

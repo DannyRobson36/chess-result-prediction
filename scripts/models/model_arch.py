@@ -3,11 +3,12 @@ model_arch.py
 Contains all models using PyTorch
 
 Latest changes: 10/08/26:
-- Initial commit
+- Prediction registries created for compatible training/inference with different models
 """
 
 import torch
 import torch.nn as nn
+from collections.abc import Callable
 
 from scripts.utils.utils_chess import FEN_VOCAB, BOARD_SEQ_LEN
 
@@ -288,7 +289,7 @@ class PureTransformer(nn.Module):
         self.value_out = nn.Linear(cfg.value_hidden_dim, n_result_classes)
 
     def forward(self, board_token_ids, features: dict):
-        x = self.token_embedding(board_token_ids)  # (b, 76, dim_vit)
+        x = self.token_embedding(board_token_ids)  
         board_tok, meta_tok = x[:, :64], x[:, 64:]
 
         if self.cfg.pos_embed_type == "learned":
@@ -317,6 +318,12 @@ class PureTransformer(nn.Module):
         value_logits = self.value_out(value_hidden)
         return value_logits
 
+
+####################
+# EXTRAS
+####################
+
+# (a) MODEL BUILDING
 
 MODEL_REGISTRY: dict[str, tuple[type[nn.Module], type[BaseModelConfig]]] = {
     "maia2_value_board": (Maia2ValueBoard, Maia2ValueBoardConfig),
@@ -351,3 +358,43 @@ def build_model(arch_name: str, cfg: BaseModelConfig,
 
     extra_kwargs = get_model_kwargs(arch_name, n_elo_bins, two_way)
     return model_cls(cfg, **extra_kwargs)
+
+# (b) MODEL INFERENCE
+
+def predict_maia2_value_board(model: nn.Module, batch: dict) -> torch.Tensor:
+    """Runs Maia2ValueBoard on a batch dict, returning its predictions."""
+    return model(batch["boards"])
+
+def predict_maia2_value_replica(model: nn.Module, batch: dict) -> torch.Tensor:
+    """Runs Maia2ValueReplica on a batch dict, returning its predictions."""
+    return model(batch["boards"], batch["elo_self_bin"], batch["elo_oppo_bin"])
+
+
+def _batch_features(model: nn.Module, batch: dict) -> dict:
+    """Pulls just model.feature_names out of a flat batch dict, raising if any are missing."""
+    missing = [name for name in model.feature_names if name not in batch]
+    if missing:
+        raise KeyError(f"cfg.features asks for {missing}, which the batch does not contain.")
+    return {name: batch[name] for name in model.feature_names}
+
+def predict_maia2_value_feature(model: nn.Module, batch: dict) -> torch.Tensor:
+    """Runs Maia2ValueFeature on a batch dict, returning its predictions."""
+    return model(batch["boards"], _batch_features(model, batch))
+
+def predict_pure_transformer(model: nn.Module, batch: dict) -> torch.Tensor:
+    """Runs PureTransformer on a batch dict, returning its predictions."""
+    return model(batch["board_token_ids"], _batch_features(model, batch))
+
+
+PREDICT_REGISTRY: dict[str, Callable[[nn.Module, dict], torch.Tensor]] = {
+    "maia2_value_board": predict_maia2_value_board,
+    "maia2_value_replica": predict_maia2_value_replica,
+    "maia2_value_feature": predict_maia2_value_feature,
+    "pure_transformer": predict_pure_transformer,
+}
+
+def get_predict_fn(arch_name: str) -> Callable[[nn.Module, dict], torch.Tensor]:
+    """Returns the predict(model, batch) function for arch_name."""
+    if arch_name not in PREDICT_REGISTRY:
+        raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(PREDICT_REGISTRY)}")
+    return PREDICT_REGISTRY[arch_name]

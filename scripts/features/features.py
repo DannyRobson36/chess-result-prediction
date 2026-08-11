@@ -3,7 +3,7 @@ features.py
 Builds model-ready SplitData from raw dataframes: scaling, elo binning, task-mode detection.
 
 Latest changes: 08/08/26:
-- Initial commit
+- External helper remap_targets - notation corrected
 """
 
 import json
@@ -270,7 +270,7 @@ def class_names_for_mode(two_way: bool) -> list[str]:
     return TWO_WAY_CLASS_NAMES if two_way else RESULT_CLASS_NAMES
 
 
-def _remap_targets(result_class: torch.Tensor, two_way: bool) -> torch.Tensor:
+def remap_targets(result_class: torch.Tensor, two_way: bool) -> torch.Tensor:
     """Remaps result_class to two-way (loss/win) labels."""
     return result_class // 2 if two_way else result_class
 

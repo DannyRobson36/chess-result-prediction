@@ -1,11 +1,12 @@
 """
 training.py
-Batches a SplitData, runs one training loop with early stopping.
+Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
-Latest changes: 10/08/26:
-- Initial commit
+Latest changes: 12/08/26:
+- Added save_checkpoint functionality for storing best model 
 """
 
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -15,9 +16,10 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report
 
-from scripts.features.features import SplitData, class_names_for_mode, remap_targets
+from scripts.features.features import SplitData, PrepConfig, class_names_for_mode, remap_targets
 from scripts.models.model_arch import get_output_type, get_predict_fn
-from scripts.utils.utils_eval import metric_mode, is_better
+from scripts.models.model_config import BaseModelConfig
+from scripts.utils.utils_eval import metric_mode, is_better, fit_temperature, fit_binary_temperature
 
 ####################
 # CONSTANTS
@@ -327,6 +329,59 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     return {"history": history, "best_epoch": best_epoch, "best_score": best_score,
             "best_state_dict": best_state_dict}
 
+# (h) CHECKPOINTING
+
+def _fit_checkpoint_temperature(model: nn.Module, arch_name: str, val: SplitData, two_way: bool,
+                                 device: torch.device, batch_size: int = 256) -> float:
+    """Runs the (already best-weights-loaded) model on val and fits a temperature for its output_type."""
+    output_type = get_output_type(arch_name)
+    predict_fn = get_predict_fn(arch_name)
+    model.eval()
+    idx = np.arange(len(val))
+    all_preds = []
+    with torch.no_grad():
+        for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
+            batch = make_batch(val, batch_idx, device)
+            all_preds.append(predict_fn(model, batch).cpu())
+    preds = torch.cat(all_preds)
+
+    if output_type == "classification":
+        targets = remap_targets(val.result_class, two_way).long()
+        return fit_temperature(preds, targets)
+    if not two_way:
+        raise ValueError("Regression-output architectures are only valid for two-way (no-draw) data; "
+                          "got two_way=False, so val.result_cont is not guaranteed to be pure {0.0, 1.0}.")
+    targets = val.result_cont.long()
+    return fit_binary_temperature(preds, targets)
+
+def save_checkpoint(model: nn.Module, arch_name: str, model_cfg: BaseModelConfig, run_result: dict,
+                     val: SplitData, prep_cfg: PrepConfig, two_way: bool, path: str,
+                     n_elo_bins: int | None = None, device: torch.device | None = None) -> None:
+    """Loads best_state_dict, fits a temperature on val, and saves everything needed for inference to path."""
+    device = device or get_device()
+    model = model.to(device)
+    model.load_state_dict(run_result["best_state_dict"])
+
+    temperature = _fit_checkpoint_temperature(model, arch_name, val, two_way, device)
+
+    checkpoint = TrainedModel(
+        arch_name=arch_name,
+        model_cfg=model_cfg,
+        state_dict=run_result["best_state_dict"],
+        n_elo_bins=n_elo_bins,
+        two_way=two_way,
+        prep_cfg=prep_cfg,
+        best_epoch=run_result["best_epoch"],
+        best_score=run_result["best_score"],
+        temperature=temperature,
+    )
+
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint ({arch_name}, temperature={temperature:.3f}) to {path}")
+
 ####################
 # CLASSES
 ####################
@@ -352,3 +407,17 @@ class TrainConfig:
 
     seed: int = 0
     verbose: bool = True
+
+
+@dataclass
+class TrainedModel:
+    """Necessities for reconstructing a trained model and running inference."""
+    arch_name: str
+    model_cfg: BaseModelConfig
+    state_dict: dict
+    n_elo_bins: int | None
+    two_way: bool
+    prep_cfg: PrepConfig
+    best_epoch: int
+    best_score: float
+    temperature: float

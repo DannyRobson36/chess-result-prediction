@@ -1,9 +1,10 @@
 """
 features.py
 Builds model-ready SplitData from raw dataframes: scaling, elo binning, task-mode detection.
+Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
-Latest changes: 11/08/26:
-- Writing in prepare_splits streams directly, regularly to disk - avoids SystemRAM issues
+Latest changes: 12/08/26:
+- Added PrepConfig & apply_prepared_splits to prep eval-data for prediction
 """
 
 import json
@@ -11,18 +12,16 @@ import os
 import time
 import warnings
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-import psutil
 import torch
-from tqdm import tqdm
 
 from scripts.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_edges, elo_bin_labels,
     fen_to_tensor, fen_to_token_ids, encode_result_class, encode_result_continuous,
-    RESULT_CLASS_NAMES, BOARD_SEQ_LEN,
+    RESULT_CLASS_NAMES,
 )
 
 ####################
@@ -43,14 +42,15 @@ _CLOCK_TRANS = {
 }
 _FLAG_TRANS = {'raw': 'raw'}
 
+_TRANS_NAME_TO_BASE: dict[str, str] = {}
+for _trans_map in (_ELO_TRANS, _PLY_TRANS, _PAST_TRANS, _LAST_RESULT_TRANS, _HOURS_TRANS, _CLOCK_TRANS, _FLAG_TRANS):
+    _TRANS_NAME_TO_BASE.update(_trans_map)
+
 SEC_MAPPING = {'600+0': 600, '600+5': 600, '900+10': 900}
 INC_FLAG_MAPPING = {'600+0': 0, '600+5': 1, '900+10': 1}
 TOTAL_LENGTH_FLAG_MAPPING = {'600+0': 0, '600+5': 0, '900+10': 1}
 
 TWO_WAY_CLASS_NAMES = ['loss', 'win']
-
-CHUNK_SIZE = 1_000_000
-BOARD_TENSOR_SHAPE = (18, 8, 8)
 
 ####################
 # FUNCTIONS
@@ -63,27 +63,7 @@ def cp_to_mover_winprob(cp: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
     return 0.5 + 0.5 * (2 / (1 + np.exp(-0.00368208 * cp)) - 1)
 
 
-# (b) SPLIT DATA CONTAINER
-
-@dataclass
-class SplitData:
-    """Model inputs and targets for one split."""
-    boards: torch.Tensor
-    board_token_ids: torch.Tensor
-    elo_mean_bin: torch.Tensor
-    elo_self_bin: torch.Tensor
-    elo_oppo_bin: torch.Tensor
-    features: dict
-    result_class: torch.Tensor
-    result_cont: torch.Tensor
-    n_elo_bins: int
-    bin_labels: list
-
-    def __len__(self) -> int:
-        return len(self.boards)
-
-
-# (c) SCALING TRANSFORMS
+# (b) SCALING TRANSFORMS
 
 def _fit_raw(pooled_train: np.ndarray) -> dict:
     """Empty stats for the raw transform."""
@@ -180,7 +160,14 @@ def _fit_apply_pooled(train_mover_raw: np.ndarray, train_opponent_raw: np.ndarra
     return scaled, {'trans_name': trans_name, **stats}
 
 
-# (d) COLUMN GROUP RESOLUTION
+def _apply_stored_stats(raw: np.ndarray, stats: dict) -> np.ndarray:
+    """Applies a previously-fitted transform's apply function using its stored trans_name/stats."""
+    base_trans = _TRANS_NAME_TO_BASE[stats['trans_name']]
+    apply_fn = _TRANS_FIT_APPLY[base_trans][1]
+    return apply_fn(raw, stats)
+
+
+# (c) COLUMN GROUP RESOLUTION
 
 def _match_one(cols: list[str], keyword: str, group_label: str) -> str:
     """Returns the one column containing keyword, or raises."""
@@ -258,7 +245,7 @@ def _validate_time_control(values: pd.Series, valid_keys: Iterable[str]) -> None
                           f'expected only {sorted(valid_keys)}.')
 
 
-# (e) TASK MODE DETECTION - TWO-WAY VS THREE-WAY
+# (d) TASK MODE DETECTION - TWO-WAY (WIN/LOSS) VS THREE-WAY (WIN/DRAW/LOSS)
 
 def detect_two_way(*splits: 'SplitData | None') -> bool:
     """True if no split contains a draw."""
@@ -280,7 +267,7 @@ def remap_targets(result_class: torch.Tensor, two_way: bool) -> torch.Tensor:
     return result_class // 2 if two_way else result_class
 
 
-# (f) ELO BINNING FOR SPLITS
+# (e) ELO BINNING FOR SPLITS
 
 def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
                      cfg: EloBinConfig = ELO_BINS) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, list[str]]:
@@ -297,60 +284,33 @@ def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
     return elo_mean_bin, elo_self_bin, elo_oppo_bin, n_bins, labels
 
 
-# (g) DISK STORAGE
+# (f) DISK PERSISTENCE
 
-def _rss_gb() -> float:
-    """Returns the current process's resident memory usage in GB."""
-    return psutil.Process().memory_info().rss / (1024 ** 3)
-
-
-def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
-    """Creates a disk-backed .npy array at path, preallocated to shape/dtype."""
-    return np.lib.format.open_memmap(path, mode='w+', dtype=dtype, shape=shape)
-
-
-def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, name: str, chunk_size: int) -> None:
-    """Encodes fens row by row directly into preallocated boards/board_token_ids .npy files, flushing every chunk_size rows."""
-    n_rows = len(fens)
-    boards_mm = _preallocate_npy(os.path.join(split_dir, 'boards.npy'), (n_rows, *BOARD_TENSOR_SHAPE), np.bool_)
-    token_ids_mm = _preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
-
-    last_flush = 0
-    for i in tqdm(range(n_rows), desc=f'{name} boards/tokens', unit='rows'):
-        boards_mm[i] = fen_to_tensor(fens[i]).numpy().astype(np.bool_)
-        token_ids_mm[i] = fen_to_token_ids(fens[i]).numpy().astype(np.uint8)
-
-        if (i + 1) % chunk_size == 0 or i + 1 == n_rows:
-            boards_mm.flush()
-            token_ids_mm.flush()
-            tqdm.write(f'{name:>5}: rows {last_flush:,}-{i + 1:,}/{n_rows:,} flushed to disk. '
-                       f'RSS: {_rss_gb():.2f} GB')
-            last_flush = i + 1
-
-    del boards_mm, token_ids_mm
-
-
-def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: np.ndarray, elo_oppo_bin: np.ndarray,
-                         features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
-                         n_elo_bins: int, bin_labels: list) -> None:
-    """Writes elo bins, features, targets, and meta.json to split_dir as .npy/json files."""
-    np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), elo_mean_bin.astype(np.uint8))
-    np.save(os.path.join(split_dir, 'elo_self_bin.npy'), elo_self_bin.astype(np.uint8))
-    np.save(os.path.join(split_dir, 'elo_oppo_bin.npy'), elo_oppo_bin.astype(np.uint8))
-    np.save(os.path.join(split_dir, 'result_class.npy'), result_class.numpy())
-    np.save(os.path.join(split_dir, 'result_cont.npy'), result_cont.numpy())
+def _save_split(split: 'SplitData', split_dir: str) -> None:
+    """Writes SplitData fields to split_dir as .npy files, plus ids.json for game_id/fen."""
+    os.makedirs(split_dir, exist_ok=True)
+    np.save(os.path.join(split_dir, 'boards.npy'), split.boards.numpy())
+    np.save(os.path.join(split_dir, 'board_token_ids.npy'), split.board_token_ids.numpy())
+    np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), split.elo_mean_bin.numpy())
+    np.save(os.path.join(split_dir, 'elo_self_bin.npy'), split.elo_self_bin.numpy())
+    np.save(os.path.join(split_dir, 'elo_oppo_bin.npy'), split.elo_oppo_bin.numpy())
+    np.save(os.path.join(split_dir, 'result_class.npy'), split.result_class.numpy())
+    np.save(os.path.join(split_dir, 'result_cont.npy'), split.result_cont.numpy())
 
     feature_dir = os.path.join(split_dir, 'features')
     os.makedirs(feature_dir, exist_ok=True)
-    for name, tensor in features.items():
+    for name, tensor in split.features.items():
         np.save(os.path.join(feature_dir, f'{name}.npy'), tensor.numpy())
 
     with open(os.path.join(split_dir, 'meta.json'), 'w') as f:
-        json.dump({'n_elo_bins': n_elo_bins, 'bin_labels': bin_labels}, f)
+        json.dump({'n_elo_bins': split.n_elo_bins, 'bin_labels': split.bin_labels}, f)
+
+    with open(os.path.join(split_dir, 'ids.json'), 'w') as f:
+        json.dump({'game_id': split.game_id, 'fen': split.fen}, f)
 
 
-def load_split(split_dir: str) -> SplitData:
-    """Loads SplitData from split_dir, memory-mapped."""
+def load_split(split_dir: str) -> 'SplitData':
+    """Loads SplitData from split_dir, memory-mapped (game_id/fen loaded fully, not memory-mapped)."""
     def _mmap_path(path: str) -> torch.Tensor:
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='.*not writable.*', category=UserWarning)
@@ -368,6 +328,9 @@ def load_split(split_dir: str) -> SplitData:
     with open(os.path.join(split_dir, 'meta.json')) as f:
         meta = json.load(f)
 
+    with open(os.path.join(split_dir, 'ids.json')) as f:
+        ids = json.load(f)
+
     return SplitData(
         boards=_mmap('boards'),
         board_token_ids=_mmap('board_token_ids'),
@@ -379,27 +342,27 @@ def load_split(split_dir: str) -> SplitData:
         result_cont=_mmap('result_cont'),
         n_elo_bins=meta['n_elo_bins'],
         bin_labels=meta['bin_labels'],
+        game_id=ids['game_id'],
+        fen=ids['fen'],
     )
 
 
-# (h) DATA PREP PIPELINE
+# (g) DATA PREP PIPELINE
 
 def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.DataFrame | None = None, *,
                     mover_result_col: str,
                     out_dir: str,
                     fen_col: str = 'fen',
+                    game_id_col: str = 'game_id',
                     elo_cols: list[str] | None = None, elo_scale: dict | None = None,
                     clock_cols: list[str] | None = None, clock_scale: dict | None = None,
                     past_cols: list[str] | None = None, past_scale: dict | None = None,
                     color_cols: list[str] | None = None, color_scale: dict | None = None,
                     ply_cols: list[str] | None = None, ply_scale: dict | None = None,
-                    cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
-                    ) -> tuple[SplitData, SplitData, SplitData | None, dict, bool]:
-    """Builds, saves, and memory-maps train/val/test SplitData, writing boards/tokens to disk in chunk_size-row increments."""
+                    cfg: EloBinConfig = ELO_BINS) -> tuple['SplitData', 'SplitData', 'SplitData | None', 'PrepConfig', bool]:
+    """Builds, saves, and memory-maps train/val/test SplitData; returns a PrepConfig for reapplying to new data."""
     if elo_cols is None or elo_scale is None:
         raise ValueError('elo_cols and elo_scale are mandatory.')
-
-    print(f'prepare_splits start. RSS: {_rss_gb():.2f} GB')
 
     dfs = {'train': df_train, 'val': df_val}
     if df_test is not None:
@@ -429,9 +392,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
 
     elo_bins = {name: _bin_elo_splits(df[mover_elo_col], df[opponent_elo_col], cfg) for name, df in dfs.items()}
 
-    print(f'RSS after elo features: {_rss_gb():.2f} GB')
-
     # Clock
+    mover_clock_col = opponent_clock_col = time_control_col = None
     if clock_cols is not None:
         if clock_scale is None:
             raise ValueError('clock_scale is required whenever clock_cols is given.')
@@ -472,9 +434,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
                 features[name][f'{flag_name}_scaled'] = apply_fn(raw, {})
             scaling_stats[flag_name] = {'trans_name': trans_name}
 
-        print(f'RSS after clock features: {_rss_gb():.2f} GB')
-
     # Past
+    past_cols_resolved = None
     if past_cols is not None:
         if past_scale is None:
             raise ValueError('past_scale is required whenever past_cols is given.')
@@ -485,6 +446,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
             expected_scale_keys.add('pooled_last_result')
         _validate_scale_keys(past_scale, expected_scale_keys, 'past_scale')
         resolved = _resolve_past_cols(past_cols)
+        past_cols_resolved = resolved
 
         trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_past', _PAST_TRANS, 'past_scale')
         train_mover_raw = df_train[resolved['past_mover']].to_numpy(dtype='float64')
@@ -572,9 +534,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
                 features[name]['last_result_mover_scaled'] = scaled[name]['mover']
                 features[name]['last_result_opponent_scaled'] = scaled[name]['opponent']
 
-        print(f'RSS after past features: {_rss_gb():.2f} GB')
-
     # Color
+    color_col = None
     if color_cols is not None:
         if color_scale is None:
             raise ValueError('color_scale is required whenever color_cols is given.')
@@ -589,6 +550,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
         scaling_stats['mover_is_white'] = {'trans_name': trans_name}
 
     # Ply
+    ply_col = None
     if ply_cols is not None:
         if ply_scale is None:
             raise ValueError('ply_scale is required whenever ply_cols is given.')
@@ -604,31 +566,34 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
             features[name]['ply_played_unscaled'] = raw.astype('float32')
             features[name]['ply_played_scaled'] = apply_fn(raw, stats)
 
-    print(f'RSS before board/token encoding: {_rss_gb():.2f} GB')
-
     # Assemble, save, memory-map
     splits = {}
     for name, df in dfs.items():
         t0 = time.time()
-        n_rows = len(df)
-        split_dir = os.path.join(out_dir, name)
-        os.makedirs(split_dir, exist_ok=True)
-
-        fens = df[fen_col].to_numpy()
-        _write_boards_and_tokens(split_dir, fens, name, chunk_size)
-
+        boards = torch.stack([fen_to_tensor(f) for f in df[fen_col]]).to(torch.bool)
+        board_token_ids = torch.stack([fen_to_token_ids(f) for f in df[fen_col]]).to(torch.uint8)
         elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
-        _write_split_arrays(
-            split_dir, elo_mean_bin, elo_self_bin, elo_oppo_bin,
-            {k: torch.tensor(v, dtype=torch.float32) for k, v in features[name].items()},
-            encode_result_class(df[mover_result_col]).to(torch.uint8),
-            encode_result_continuous(df[mover_result_col]),
-            n_elo_bins, bin_labels,
-        )
-        print(f'{name:>5}: {n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
+        split = SplitData(
+            boards=boards,
+            board_token_ids=board_token_ids,
+            elo_mean_bin=torch.tensor(elo_mean_bin, dtype=torch.uint8),
+            elo_self_bin=torch.tensor(elo_self_bin, dtype=torch.uint8),
+            elo_oppo_bin=torch.tensor(elo_oppo_bin, dtype=torch.uint8),
+            features={k: torch.tensor(v, dtype=torch.float32) for k, v in features[name].items()},
+            result_class=encode_result_class(df[mover_result_col]).to(torch.uint8),
+            result_cont=encode_result_continuous(df[mover_result_col]),
+            n_elo_bins=n_elo_bins,
+            bin_labels=bin_labels,
+            game_id=df[game_id_col].astype(str).tolist(),
+            fen=df[fen_col].tolist(),
+        )
+        print(f'{name:>5}: {len(split):>9,} rows prepared in {time.time() - t0:.2f}s')
+
+        split_dir = os.path.join(out_dir, name)
+        _save_split(split, split_dir)
         splits[name] = load_split(split_dir)
-        print(f'{name:>5}: saved and memory-mapped from {split_dir}. RSS: {_rss_gb():.2f} GB')
+        print(f'{name:>5}: saved and memory-mapped from {split_dir}')
 
     train_out = splits['train']
     two_way = detect_two_way(train_out, splits['val'], splits.get('test'))
@@ -643,6 +608,196 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
 
     class_counts = torch.bincount(train_out.result_class).tolist()
     print(f'Target distribution (train, by class index): {class_counts}')
-    print(f'prepare_splits done. RSS: {_rss_gb():.2f} GB')
 
-    return train_out, splits['val'], splits.get('test'), scaling_stats, two_way
+    prep_cfg = PrepConfig(
+        mover_result_col=mover_result_col,
+        fen_col=fen_col,
+        game_id_col=game_id_col,
+        cfg=cfg,
+        mover_elo_col=mover_elo_col,
+        opponent_elo_col=opponent_elo_col,
+        mover_clock_col=mover_clock_col,
+        opponent_clock_col=opponent_clock_col,
+        time_control_col=time_control_col,
+        past_cols_resolved=past_cols_resolved,
+        color_col=color_col,
+        ply_col=ply_col,
+        scaling_stats=scaling_stats,
+    )
+
+    return train_out, splits['val'], splits.get('test'), prep_cfg, two_way
+
+
+def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str) -> 'SplitData':
+    """Applies an already-fitted PrepConfig to new raw data, returning a memory-mapped SplitData."""
+    required = [prep_cfg.mover_result_col, prep_cfg.fen_col, prep_cfg.game_id_col,
+                prep_cfg.mover_elo_col, prep_cfg.opponent_elo_col]
+    if prep_cfg.mover_clock_col is not None:
+        required += [prep_cfg.mover_clock_col, prep_cfg.opponent_clock_col, prep_cfg.time_control_col]
+    if prep_cfg.past_cols_resolved is not None:
+        required += list(prep_cfg.past_cols_resolved.values())
+    if prep_cfg.color_col is not None:
+        required.append(prep_cfg.color_col)
+    if prep_cfg.ply_col is not None:
+        required.append(prep_cfg.ply_col)
+
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f'apply_prepared_splits: df is missing required column(s) {missing}.')
+
+    stats = prep_cfg.scaling_stats
+    features = {}
+
+    # Elo
+    mover_raw = df[prep_cfg.mover_elo_col].to_numpy(dtype='float64')
+    opponent_raw = df[prep_cfg.opponent_elo_col].to_numpy(dtype='float64')
+    features['mover_elo_unscaled'] = mover_raw.astype('float32')
+    features['opponent_elo_unscaled'] = opponent_raw.astype('float32')
+    features['mover_elo_scaled'] = _apply_stored_stats(mover_raw, stats['pooled_elo'])
+    features['opponent_elo_scaled'] = _apply_stored_stats(opponent_raw, stats['pooled_elo'])
+
+    # Clock
+    if prep_cfg.mover_clock_col is not None:
+        _validate_time_control(df[prep_cfg.time_control_col], SEC_MAPPING.keys())
+        game_time = df[prep_cfg.time_control_col].map(SEC_MAPPING).to_numpy(dtype='float64')
+        mover_prop = df[prep_cfg.mover_clock_col].to_numpy(dtype='float64') / game_time
+        opponent_prop = df[prep_cfg.opponent_clock_col].to_numpy(dtype='float64') / game_time
+        features['mover_clock_unscaled'] = mover_prop.astype('float32')
+        features['opponent_clock_unscaled'] = opponent_prop.astype('float32')
+        features['mover_clock_scaled'] = _apply_stored_stats(mover_prop, stats['pooled_clock'])
+        features['opponent_clock_scaled'] = _apply_stored_stats(opponent_prop, stats['pooled_clock'])
+
+        for flag_name, mapping in (('inc_flag', INC_FLAG_MAPPING), ('total_length_flag', TOTAL_LENGTH_FLAG_MAPPING)):
+            raw = df[prep_cfg.time_control_col].map(mapping).to_numpy(dtype='float64')
+            features[f'{flag_name}_unscaled'] = raw.astype('float32')
+            features[f'{flag_name}_scaled'] = _apply_stored_stats(raw, stats[flag_name])
+
+    # Past
+    if prep_cfg.past_cols_resolved is not None:
+        resolved = prep_cfg.past_cols_resolved
+        mover_raw = df[resolved['past_mover']].to_numpy(dtype='float64')
+        opponent_raw = df[resolved['past_opponent']].to_numpy(dtype='float64')
+        features['past_mover_unscaled'] = mover_raw.astype('float32')
+        features['past_opponent_unscaled'] = opponent_raw.astype('float32')
+        features['past_mover_scaled'] = _apply_stored_stats(mover_raw, stats['pooled_past'])
+        features['past_opponent_scaled'] = _apply_stored_stats(opponent_raw, stats['pooled_past'])
+
+        if 'hours_since_mover' in resolved:
+            for side in ('mover', 'opponent'):
+                notna = pd.to_numeric(df[resolved[f'hours_since_{side}']], errors='coerce').notna().to_numpy()
+                raw = notna.astype('float64')
+                features[f'has_history_{side}_unscaled'] = raw.astype('float32')
+                features[f'has_history_{side}_scaled'] = _apply_stored_stats(raw, {'trans_name': 'raw'})
+
+            max_hours = stats['pooled_hours_since']['max_hours']
+            m_hours = (pd.to_numeric(df[resolved['hours_since_mover']], errors='coerce')
+                       .fillna(max_hours).to_numpy(dtype='float64')) / max_hours
+            o_hours = (pd.to_numeric(df[resolved['hours_since_opponent']], errors='coerce')
+                       .fillna(max_hours).to_numpy(dtype='float64')) / max_hours
+            features['hours_since_mover_unscaled'] = m_hours.astype('float32')
+            features['hours_since_opponent_unscaled'] = o_hours.astype('float32')
+            features['hours_since_mover_scaled'] = _apply_stored_stats(m_hours, stats['pooled_hours_since'])
+            features['hours_since_opponent_scaled'] = _apply_stored_stats(o_hours, stats['pooled_hours_since'])
+
+        if 'last_result_mover' in resolved:
+            m_res = pd.to_numeric(df[resolved['last_result_mover']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
+            o_res = pd.to_numeric(df[resolved['last_result_opponent']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
+            features['last_result_mover_unscaled'] = m_res.astype('float32')
+            features['last_result_opponent_unscaled'] = o_res.astype('float32')
+            features['last_result_mover_scaled'] = _apply_stored_stats(m_res, stats['pooled_last_result'])
+            features['last_result_opponent_scaled'] = _apply_stored_stats(o_res, stats['pooled_last_result'])
+
+    # Color
+    if prep_cfg.color_col is not None:
+        raw = df[prep_cfg.color_col].to_numpy(dtype='float64')
+        features['mover_is_white_unscaled'] = raw.astype('float32')
+        features['mover_is_white_scaled'] = _apply_stored_stats(raw, stats['mover_is_white'])
+
+    # Ply
+    if prep_cfg.ply_col is not None:
+        raw = df[prep_cfg.ply_col].to_numpy(dtype='float64')
+        features['ply_played_unscaled'] = raw.astype('float32')
+        features['ply_played_scaled'] = _apply_stored_stats(raw, stats['ply_played'])
+
+    # Assemble, save, memory-map
+    t0 = time.time()
+    boards = torch.stack([fen_to_tensor(f) for f in df[prep_cfg.fen_col]]).to(torch.bool)
+    board_token_ids = torch.stack([fen_to_token_ids(f) for f in df[prep_cfg.fen_col]]).to(torch.uint8)
+    elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
+        df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
+
+    split = SplitData(
+        boards=boards,
+        board_token_ids=board_token_ids,
+        elo_mean_bin=torch.tensor(elo_mean_bin, dtype=torch.uint8),
+        elo_self_bin=torch.tensor(elo_self_bin, dtype=torch.uint8),
+        elo_oppo_bin=torch.tensor(elo_oppo_bin, dtype=torch.uint8),
+        features={k: torch.tensor(v, dtype=torch.float32) for k, v in features.items()},
+        result_class=encode_result_class(df[prep_cfg.mover_result_col]).to(torch.uint8),
+        result_cont=encode_result_continuous(df[prep_cfg.mover_result_col]),
+        n_elo_bins=n_elo_bins,
+        bin_labels=bin_labels,
+        game_id=df[prep_cfg.game_id_col].astype(str).tolist(),
+        fen=df[prep_cfg.fen_col].tolist(),
+    )
+    print(f'{len(split):>9,} rows prepared in {time.time() - t0:.2f}s')
+
+    _save_split(split, out_dir)
+    split = load_split(out_dir)
+    print(f'saved and memory-mapped from {out_dir}')
+
+    base_names = sorted({k.rsplit('_', 1)[0] for k in split.features})
+    print('Features:')
+    for i in range(0, len(base_names), 6):
+        print('  ' + ', '.join(base_names[i:i + 6]))
+
+    class_counts = torch.bincount(split.result_class).tolist()
+    print(f'Target distribution (by class index): {class_counts}')
+
+    return split
+
+####################
+# CLASSES
+####################
+
+@dataclass
+class SplitData:
+    """Model inputs and targets for one split."""
+    game_id: list
+    fen: list
+    boards: torch.Tensor
+    board_token_ids: torch.Tensor
+    elo_mean_bin: torch.Tensor
+    elo_self_bin: torch.Tensor
+    elo_oppo_bin: torch.Tensor
+    features: dict
+    result_class: torch.Tensor
+    result_cont: torch.Tensor
+    n_elo_bins: int
+    bin_labels: list
+
+    def __len__(self) -> int:
+        return len(self.boards)
+
+
+@dataclass
+class PrepConfig:
+    """Resolved column names, transform choices, and fitted scaling stats needed to reapply prepare_splits to new data."""
+    mover_result_col: str
+    fen_col: str
+    game_id_col: str
+    cfg: EloBinConfig
+
+    mover_elo_col: str
+    opponent_elo_col: str
+
+    mover_clock_col: str | None = None
+    opponent_clock_col: str | None = None
+    time_control_col: str | None = None
+
+    past_cols_resolved: dict[str, str] | None = None
+
+    color_col: str | None = None
+    ply_col: str | None = None
+
+    scaling_stats: dict = field(default_factory=dict)

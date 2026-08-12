@@ -13,19 +13,16 @@ Run:
     !python stockfish_reader.py --input-path /path/to/val_pos.csv --output-path /path/to/val_predictions_stockfish_7.csv --depth 7
 
 Latest changes: 11/08/26:
-- Initial commit
+- Made style more concise
 """
-
-import ast
-import importlib.util
-import subprocess
-import sys
 
 import argparse
 import csv
 import os
 import signal
 import multiprocessing as mp
+import subprocess
+import sys
 from types import FrameType
 
 import numpy as np
@@ -64,11 +61,11 @@ def ensure_stockfish_installed(engine_path: str) -> None:
     """Installs Stockfish via apt-get if not already present at engine_path."""
     if os.path.exists(engine_path):
         return
-    print('Stockfish not found -- installing via apt-get...')
+    print('Stockfish not found, installing via apt-get...')
     install = subprocess.run(['apt-get', 'install', '-y', 'stockfish'], capture_output=True, text=True)
     if install.returncode != 0 or not os.path.exists(engine_path):
         sys.exit(f'Stockfish install failed or binary not found at {engine_path}.\n{install.stderr}')
-    print('Stockfish installed successfully.')
+    print('Stockfish installed.')
 
 # (b) LOADING
 
@@ -204,14 +201,11 @@ def main(argv: list[str] | None = None) -> None:
 
     ensure_stockfish_installed(ENGINE_PATH)
 
-    print(f'Detected {NUM_WORKERS} CPU core(s) available -- using all of them as workers.')
-    print(f'Mate evals stored as +-{MATE_SCORE_MOVER} in eval_{depth} (mover-perspective).')
-    print(f'Per-attempt timeout: {ATTEMPT_TIMEOUT_SECONDS}s, falling back one depth at a time, '
-          f'no retry at the same depth, hard error if depth 1 also fails.')
+    print(f'Detected {NUM_WORKERS} CPU core(s), using all as workers.')
 
     print(f'Loading positions from: {input_path}')
     rows = load_positions(input_path)
-    print(f'Loaded {len(rows):,} position(s) -- every row will get an evaluation.')
+    print(f'Loaded {len(rows):,} position(s).')
 
     tasks = [(row['fen'], depth) for row in rows]
 
@@ -248,8 +242,8 @@ def main(argv: list[str] | None = None) -> None:
 
     assert len(df_out) == len(rows), 'Output row count does not match input row count.'
 
-    print(f'There were {n_terminal} terminal position(s) (expected 0).')
-    print(f'There were {n_fallback} position(s) evaluated at a lower depth than requested.')
+    print(f'{n_terminal} terminal position(s) (expected 0).')
+    print(f'{n_fallback} position(s) evaluated at a lower depth than requested.')
 
     out_dir = os.path.dirname(output_path)
     if out_dir:

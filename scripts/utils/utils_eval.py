@@ -177,6 +177,18 @@ def apply_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     return torch.softmax(logits / temperature, dim=1)
 
 
+def fit_binary_temperature(logit: torch.Tensor, targets: torch.Tensor, max_iter: int = 100) -> float:
+    """Fits a single temperature for a binary model."""
+    two_class_logits = torch.stack([torch.zeros_like(logit), logit], dim=1)
+    return fit_temperature(two_class_logits, targets, max_iter=max_iter)
+
+
+def apply_binary_temperature(logit: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Returns P(win) for a binary model, using a fitted temperature."""
+    two_class_logits = torch.stack([torch.zeros_like(logit), logit], dim=1)
+    return apply_temperature(two_class_logits, temperature)[:, 1]
+
+
 def _ordered_probit_probs(preds: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor,
                            sigma: torch.Tensor) -> torch.Tensor:
     """Returns W/D/L probabilities for scalar preds under cutpoints c1<c2 and scale sigma."""

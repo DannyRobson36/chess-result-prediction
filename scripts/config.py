@@ -2,13 +2,13 @@
 """
 Project-wide hardcoded config for use across scripts.
 
-Latest changes: 06/08/26:
-- Single quotes not double
+Latest changes: 12/08/26:
+- Added LOCAL_SPLITS_DIR and CHECKPOINTS_DIR
 """
 
-#####
+####################
 # Data Folders
-#####
+####################
 
 DATA_DIR = '/content/drive/MyDrive/drive_diss/data'
 RAW_DUMP_DIR = '/content/drive/MyDrive/drive_diss/data/raw_dumps'
@@ -19,14 +19,27 @@ TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train'
 VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val'
 TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test'
 
-#####
+####################
+# Local Disk - Colab session 
+####################
+
+LOCAL_SPLITS_DIR = '/content/prepared_splits'
+
+####################
+# Checkpoints
+####################
+
+CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints'
+
+####################
 # Git Dir
-#####
+####################
 
 REPO_DIR = '/content/chess-result-prediction'
 REPO_SCRIPTS_DIR = '/content/chess-result-prediction/scripts'
 
-#####
+####################
 # Reproducibility
+####################
+
 SEED = 0
-#####

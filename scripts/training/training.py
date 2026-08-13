@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 12/08/26:
-- Added save_checkpoint functionality for storing best model 
+- Regression now allows for accuracy predictions via sigmoid(logits)
 """
 
 import os
@@ -213,7 +213,11 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
 def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: np.ndarray, loss_fn: nn.Module,
                         output_type: str, two_way: bool = False, class_names: list[str] | None = None,
                         batch_size: int = 64, device: torch.device | None = None) -> dict:
-    """Evaluates a model on idx: loss (plus accuracy/macro_f1 if output_type is classification)."""
+    """Evaluates a model on idx: loss, accuracy, and macro_f1."""
+    if output_type == "regression" and not two_way:
+        raise ValueError("Regression-output architectures are only valid for two-way (no-draw) data; "
+                          "got two_way=False, so split.result_cont is not guaranteed to be pure {0.0, 1.0}.")
+
     device = device or get_device()
     predict_fn = get_predict_fn(arch_name)
     model.eval()
@@ -228,20 +232,23 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
 
             total_loss += per_sample.sum().item()
             total_n += len(batch_idx)
+
             if output_type == "classification":
                 all_preds.append(preds.argmax(dim=1).cpu())
                 all_targets.append(targets.cpu())
+            else:
+                all_preds.append((torch.sigmoid(preds) >= 0.5).long().cpu())
+                all_targets.append(targets.long().cpu())
 
     metrics = {"loss": total_loss / total_n}
-    if output_type == "classification":
-        if class_names is None:
-            class_names = class_names_for_mode(two_way)
-        preds_arr = torch.cat(all_preds).numpy()
-        targs_arr = torch.cat(all_targets).numpy()
-        report = classification_report(targs_arr, preds_arr, target_names=class_names,
-                                        output_dict=True, zero_division=0)
-        metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
-        metrics["macro_f1"] = report["macro avg"]["f1-score"]
+    if class_names is None:
+        class_names = class_names_for_mode(two_way)
+    preds_arr = torch.cat(all_preds).numpy()
+    targs_arr = torch.cat(all_targets).numpy()
+    report = classification_report(targs_arr, preds_arr, target_names=class_names,
+                                    output_dict=True, zero_division=0)
+    metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
+    metrics["macro_f1"] = report["macro avg"]["f1-score"]
     return metrics
 
 # (g) FULL TRAINING LOOP
@@ -249,7 +256,7 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
 def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitData, cfg: "TrainConfig",
                   two_way: bool = False, train_probe_idx: np.ndarray | None = None,
                   val_probe_idx: np.ndarray | None = None, device: torch.device | None = None) -> dict:
-    """Trains with early stopping on cfg.primary_metric, returning history and best epoch weights."""
+    """Trains with early stopping on cfg.primary_metric; returns history and best epoch (1-indexed) weights."""
     device = device or get_device()
     model = model.to(device)
     output_type = get_output_type(arch_name)
@@ -262,7 +269,7 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     bin_weights = _resolve_bin_weights(train, cfg, device)
     warmup_steps = _resolve_warmup_steps(cfg.warmup_prop, len(train), cfg.batch_size, cfg.n_epochs)
 
-    keys = ["loss", "accuracy", "macro_f1"] if output_type == "classification" else ["loss"]
+    keys = ["loss", "accuracy", "macro_f1"]
     history = {f"{prefix}_{k}": [] for prefix in ("train", "val") for k in keys}
     history["epoch_time"] = []
     history["lr"] = []
@@ -309,7 +316,7 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
 
         score = val_metrics[cfg.primary_metric]
         if best_score is None or is_better(score, best_score, mode):
-            best_score, best_epoch = score, epoch
+            best_score, best_epoch = score, epoch + 1
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             epochs_without_improvement = 0
         else:
@@ -411,7 +418,7 @@ class TrainConfig:
 
 @dataclass
 class TrainedModel:
-    """Necessities for reconstructing a trained model and running inference."""
+    """Everything needed to reconstruct a trained model and run inference on new data."""
     arch_name: str
     model_cfg: BaseModelConfig
     state_dict: dict

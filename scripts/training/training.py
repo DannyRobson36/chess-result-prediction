@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 12/08/26:
-- Regression now allows for accuracy predictions via sigmoid(logits)
+- Naming changes to match downstream use
 """
 
 import os
@@ -105,7 +105,7 @@ def probe_idx(split: SplitData, n: int, seed: int = 0) -> np.ndarray:
     n = min(n, len(split))
     return rng.choice(len(split), size=n, replace=False)
 
-def _get_targets(split: SplitData, batch_idx: np.ndarray, output_type: str,
+def get_targets(split: SplitData, batch_idx: np.ndarray, output_type: str,
                   two_way: bool, device: torch.device) -> torch.Tensor:
     """Returns the target tensor matching output_type, sliced at batch_idx and moved to device."""
     if output_type == "classification":
@@ -121,7 +121,7 @@ def build_loss(loss_name: str, **kwargs) -> nn.Module:
     kwargs.setdefault("reduction", "none")
     return LOSS_REGISTRY[loss_name](**kwargs)
 
-def _resolve_loss_name(output_type: str, loss_name: str | None) -> str:
+def resolve_loss_name(output_type: str, loss_name: str | None) -> str:
     """Returns loss_name if given, else the standard default loss for output_type."""
     return loss_name if loss_name is not None else DEFAULT_LOSS_BY_OUTPUT_TYPE[output_type]
 
@@ -193,7 +193,7 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
             apply_warmup_lr(optimizer, base_lr, step_counter[0], warmup_steps)
 
         batch = make_batch(split, batch_idx, device)
-        targets = _get_targets(split, batch_idx, output_type, two_way, device)
+        targets = get_targets(split, batch_idx, output_type, two_way, device)
 
         optimizer.zero_grad()
         preds = predict_fn(model, batch)
@@ -213,7 +213,7 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
 def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: np.ndarray, loss_fn: nn.Module,
                         output_type: str, two_way: bool = False, class_names: list[str] | None = None,
                         batch_size: int = 64, device: torch.device | None = None) -> dict:
-    """Evaluates a model on idx: loss, accuracy, and macro_f1."""
+    """Evaluates a model on idx: loss, accuracy, and macro_f1 (regression uses sigmoid(logit) >= 0.5 as the class)."""
     if output_type == "regression" and not two_way:
         raise ValueError("Regression-output architectures are only valid for two-way (no-draw) data; "
                           "got two_way=False, so split.result_cont is not guaranteed to be pure {0.0, 1.0}.")
@@ -226,7 +226,7 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
-            targets = _get_targets(split, batch_idx, output_type, two_way, device)
+            targets = get_targets(split, batch_idx, output_type, two_way, device)
             preds = predict_fn(model, batch)
             per_sample = loss_fn(preds, targets)
 
@@ -245,8 +245,8 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
         class_names = class_names_for_mode(two_way)
     preds_arr = torch.cat(all_preds).numpy()
     targs_arr = torch.cat(all_targets).numpy()
-    report = classification_report(targs_arr, preds_arr, target_names=class_names,
-                                    output_dict=True, zero_division=0)
+    report = classification_report(targs_arr, preds_arr, labels=list(range(len(class_names))),
+                                    target_names=class_names, output_dict=True, zero_division=0)
     metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
     metrics["macro_f1"] = report["macro avg"]["f1-score"]
     return metrics
@@ -262,7 +262,7 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     output_type = get_output_type(arch_name)
     mode = metric_mode(cfg.primary_metric)
 
-    loss_name = _resolve_loss_name(output_type, cfg.loss_name)
+    loss_name = resolve_loss_name(output_type, cfg.loss_name)
     loss_fn = build_loss(loss_name)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = build_scheduler(optimizer, cfg.schedule_cfg, cfg.n_epochs, mode)

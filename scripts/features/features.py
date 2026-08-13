@@ -3,8 +3,8 @@ features.py
 Builds model-ready SplitData from raw dataframes: scaling, elo binning, task-mode detection.
 Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
-Latest changes: 12/08/26:
-- Added PrepConfig & apply_prepared_splits to prep eval-data for prediction
+Latest changes: 13/08/26:
+- Version mismatch fix - writes to disk more frequently, RAM-saving
 """
 
 import json
@@ -16,12 +16,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+import psutil
 import torch
+from tqdm import tqdm
 
 from scripts.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_edges, elo_bin_labels,
     fen_to_tensor, fen_to_token_ids, encode_result_class, encode_result_continuous,
-    RESULT_CLASS_NAMES,
+    RESULT_CLASS_NAMES, BOARD_SEQ_LEN,
 )
 
 ####################
@@ -51,6 +53,9 @@ INC_FLAG_MAPPING = {'600+0': 0, '600+5': 1, '900+10': 1}
 TOTAL_LENGTH_FLAG_MAPPING = {'600+0': 0, '600+5': 0, '900+10': 1}
 
 TWO_WAY_CLASS_NAMES = ['loss', 'win']
+
+CHUNK_SIZE = 1_000_000
+BOARD_TENSOR_SHAPE = (18, 8, 8)
 
 ####################
 # FUNCTIONS
@@ -245,7 +250,7 @@ def _validate_time_control(values: pd.Series, valid_keys: Iterable[str]) -> None
                           f'expected only {sorted(valid_keys)}.')
 
 
-# (d) TASK MODE DETECTION - TWO-WAY (WIN/LOSS) VS THREE-WAY (WIN/DRAW/LOSS)
+# (d) TASK MODE DETECTION - TWO-WAY VS THREE-WAY
 
 def detect_two_way(*splits: 'SplitData | None') -> bool:
     """True if no split contains a draw."""
@@ -286,27 +291,53 @@ def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
 
 # (f) DISK PERSISTENCE
 
-def _save_split(split: 'SplitData', split_dir: str) -> None:
-    """Writes SplitData fields to split_dir as .npy files, plus ids.json for game_id/fen."""
-    os.makedirs(split_dir, exist_ok=True)
-    np.save(os.path.join(split_dir, 'boards.npy'), split.boards.numpy())
-    np.save(os.path.join(split_dir, 'board_token_ids.npy'), split.board_token_ids.numpy())
-    np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), split.elo_mean_bin.numpy())
-    np.save(os.path.join(split_dir, 'elo_self_bin.npy'), split.elo_self_bin.numpy())
-    np.save(os.path.join(split_dir, 'elo_oppo_bin.npy'), split.elo_oppo_bin.numpy())
-    np.save(os.path.join(split_dir, 'result_class.npy'), split.result_class.numpy())
-    np.save(os.path.join(split_dir, 'result_cont.npy'), split.result_cont.numpy())
+def _rss_gb() -> float:
+    """Returns the current process's resident memory usage in GB."""
+    return psutil.Process().memory_info().rss / (1024 ** 3)
+
+
+def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
+    """Creates a disk-backed .npy array at path, preallocated to shape/dtype."""
+    return np.lib.format.open_memmap(path, mode='w+', dtype=dtype, shape=shape)
+
+
+def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int) -> None:
+    """Encodes fens row by row directly into preallocated boards/board_token_ids .npy files, flushing silently every chunk_size rows."""
+    n_rows = len(fens)
+    boards_mm = _preallocate_npy(os.path.join(split_dir, 'boards.npy'), (n_rows, *BOARD_TENSOR_SHAPE), np.bool_)
+    token_ids_mm = _preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
+
+    for i in tqdm(range(n_rows), desc=desc, unit='rows'):
+        boards_mm[i] = fen_to_tensor(fens[i]).numpy().astype(np.bool_)
+        token_ids_mm[i] = fen_to_token_ids(fens[i]).numpy().astype(np.uint8)
+
+        if (i + 1) % chunk_size == 0 or i + 1 == n_rows:
+            boards_mm.flush()
+            token_ids_mm.flush()
+
+    del boards_mm, token_ids_mm
+
+
+def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: np.ndarray, elo_oppo_bin: np.ndarray,
+                         features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
+                         n_elo_bins: int, bin_labels: list, game_id: list, fen: list) -> None:
+    """Writes elo bins, features, targets, meta.json, and ids.json (game_id/fen) to split_dir."""
+    np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), elo_mean_bin.astype(np.uint8))
+    np.save(os.path.join(split_dir, 'elo_self_bin.npy'), elo_self_bin.astype(np.uint8))
+    np.save(os.path.join(split_dir, 'elo_oppo_bin.npy'), elo_oppo_bin.astype(np.uint8))
+    np.save(os.path.join(split_dir, 'result_class.npy'), result_class.numpy())
+    np.save(os.path.join(split_dir, 'result_cont.npy'), result_cont.numpy())
 
     feature_dir = os.path.join(split_dir, 'features')
     os.makedirs(feature_dir, exist_ok=True)
-    for name, tensor in split.features.items():
+    for name, tensor in features.items():
         np.save(os.path.join(feature_dir, f'{name}.npy'), tensor.numpy())
 
     with open(os.path.join(split_dir, 'meta.json'), 'w') as f:
-        json.dump({'n_elo_bins': split.n_elo_bins, 'bin_labels': split.bin_labels}, f)
+        json.dump({'n_elo_bins': n_elo_bins, 'bin_labels': bin_labels}, f)
 
     with open(os.path.join(split_dir, 'ids.json'), 'w') as f:
-        json.dump({'game_id': split.game_id, 'fen': split.fen}, f)
+        json.dump({'game_id': game_id, 'fen': fen}, f)
 
 
 def load_split(split_dir: str) -> 'SplitData':
@@ -359,7 +390,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
                     past_cols: list[str] | None = None, past_scale: dict | None = None,
                     color_cols: list[str] | None = None, color_scale: dict | None = None,
                     ply_cols: list[str] | None = None, ply_scale: dict | None = None,
-                    cfg: EloBinConfig = ELO_BINS) -> tuple['SplitData', 'SplitData', 'SplitData | None', 'PrepConfig', bool]:
+                    cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
+                    ) -> tuple['SplitData', 'SplitData', 'SplitData | None', 'PrepConfig', bool]:
     """Builds, saves, and memory-maps train/val/test SplitData; returns a PrepConfig for reapplying to new data."""
     if elo_cols is None or elo_scale is None:
         raise ValueError('elo_cols and elo_scale are mandatory.')
@@ -566,34 +598,32 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
             features[name]['ply_played_unscaled'] = raw.astype('float32')
             features[name]['ply_played_scaled'] = apply_fn(raw, stats)
 
+    print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
+
     # Assemble, save, memory-map
     splits = {}
     for name, df in dfs.items():
         t0 = time.time()
-        boards = torch.stack([fen_to_tensor(f) for f in df[fen_col]]).to(torch.bool)
-        board_token_ids = torch.stack([fen_to_token_ids(f) for f in df[fen_col]]).to(torch.uint8)
-        elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
-
-        split = SplitData(
-            boards=boards,
-            board_token_ids=board_token_ids,
-            elo_mean_bin=torch.tensor(elo_mean_bin, dtype=torch.uint8),
-            elo_self_bin=torch.tensor(elo_self_bin, dtype=torch.uint8),
-            elo_oppo_bin=torch.tensor(elo_oppo_bin, dtype=torch.uint8),
-            features={k: torch.tensor(v, dtype=torch.float32) for k, v in features[name].items()},
-            result_class=encode_result_class(df[mover_result_col]).to(torch.uint8),
-            result_cont=encode_result_continuous(df[mover_result_col]),
-            n_elo_bins=n_elo_bins,
-            bin_labels=bin_labels,
-            game_id=df[game_id_col].astype(str).tolist(),
-            fen=df[fen_col].tolist(),
-        )
-        print(f'{name:>5}: {len(split):>9,} rows prepared in {time.time() - t0:.2f}s')
-
+        n_rows = len(df)
         split_dir = os.path.join(out_dir, name)
-        _save_split(split, split_dir)
+        os.makedirs(split_dir, exist_ok=True)
+
+        fens = df[fen_col].to_numpy()
+        _write_boards_and_tokens(split_dir, fens, desc=f'{name} boards/tokens', chunk_size=chunk_size)
+
+        elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
+        _write_split_arrays(
+            split_dir, elo_mean_bin, elo_self_bin, elo_oppo_bin,
+            {k: torch.tensor(v, dtype=torch.float32) for k, v in features[name].items()},
+            encode_result_class(df[mover_result_col]).to(torch.uint8),
+            encode_result_continuous(df[mover_result_col]),
+            n_elo_bins, bin_labels,
+            df[game_id_col].astype(str).tolist(), df[fen_col].tolist(),
+        )
+        print(f'{name:>5}: {n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
+
         splits[name] = load_split(split_dir)
-        print(f'{name:>5}: saved and memory-mapped from {split_dir}')
+        print(f'{name:>5}: saved and memory-mapped from {split_dir}. RSS: {_rss_gb():.2f} GB')
 
     train_out = splits['train']
     two_way = detect_two_way(train_out, splits['val'], splits.get('test'))
@@ -608,6 +638,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
 
     class_counts = torch.bincount(train_out.result_class).tolist()
     print(f'Target distribution (train, by class index): {class_counts}')
+    print(f'prepare_splits done. RSS: {_rss_gb():.2f} GB')
 
     prep_cfg = PrepConfig(
         mover_result_col=mover_result_col,
@@ -628,7 +659,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
     return train_out, splits['val'], splits.get('test'), prep_cfg, two_way
 
 
-def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str) -> 'SplitData':
+def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str,
+                           chunk_size: int = CHUNK_SIZE) -> 'SplitData':
     """Applies an already-fitted PrepConfig to new raw data, returning a memory-mapped SplitData."""
     required = [prep_cfg.mover_result_col, prep_cfg.fen_col, prep_cfg.game_id_col,
                 prep_cfg.mover_elo_col, prep_cfg.opponent_elo_col]
@@ -719,32 +751,31 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
         features['ply_played_unscaled'] = raw.astype('float32')
         features['ply_played_scaled'] = _apply_stored_stats(raw, stats['ply_played'])
 
+    print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
+
     # Assemble, save, memory-map
     t0 = time.time()
-    boards = torch.stack([fen_to_tensor(f) for f in df[prep_cfg.fen_col]]).to(torch.bool)
-    board_token_ids = torch.stack([fen_to_token_ids(f) for f in df[prep_cfg.fen_col]]).to(torch.uint8)
+    n_rows = len(df)
+    os.makedirs(out_dir, exist_ok=True)
+
+    fens = df[prep_cfg.fen_col].to_numpy()
+    _write_boards_and_tokens(out_dir, fens, desc='boards/tokens', chunk_size=chunk_size)
+
     elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
         df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
 
-    split = SplitData(
-        boards=boards,
-        board_token_ids=board_token_ids,
-        elo_mean_bin=torch.tensor(elo_mean_bin, dtype=torch.uint8),
-        elo_self_bin=torch.tensor(elo_self_bin, dtype=torch.uint8),
-        elo_oppo_bin=torch.tensor(elo_oppo_bin, dtype=torch.uint8),
-        features={k: torch.tensor(v, dtype=torch.float32) for k, v in features.items()},
-        result_class=encode_result_class(df[prep_cfg.mover_result_col]).to(torch.uint8),
-        result_cont=encode_result_continuous(df[prep_cfg.mover_result_col]),
-        n_elo_bins=n_elo_bins,
-        bin_labels=bin_labels,
-        game_id=df[prep_cfg.game_id_col].astype(str).tolist(),
-        fen=df[prep_cfg.fen_col].tolist(),
+    _write_split_arrays(
+        out_dir, elo_mean_bin, elo_self_bin, elo_oppo_bin,
+        {k: torch.tensor(v, dtype=torch.float32) for k, v in features.items()},
+        encode_result_class(df[prep_cfg.mover_result_col]).to(torch.uint8),
+        encode_result_continuous(df[prep_cfg.mover_result_col]),
+        n_elo_bins, bin_labels,
+        df[prep_cfg.game_id_col].astype(str).tolist(), df[prep_cfg.fen_col].tolist(),
     )
-    print(f'{len(split):>9,} rows prepared in {time.time() - t0:.2f}s')
+    print(f'{n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
-    _save_split(split, out_dir)
     split = load_split(out_dir)
-    print(f'saved and memory-mapped from {out_dir}')
+    print(f'saved and memory-mapped from {out_dir}. RSS: {_rss_gb():.2f} GB')
 
     base_names = sorted({k.rsplit('_', 1)[0] for k in split.features})
     print('Features:')
@@ -763,8 +794,6 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
 @dataclass
 class SplitData:
     """Model inputs and targets for one split."""
-    game_id: list
-    fen: list
     boards: torch.Tensor
     board_token_ids: torch.Tensor
     elo_mean_bin: torch.Tensor
@@ -775,6 +804,8 @@ class SplitData:
     result_cont: torch.Tensor
     n_elo_bins: int
     bin_labels: list
+    game_id: list
+    fen: list
 
     def __len__(self) -> int:
         return len(self.boards)

@@ -2,8 +2,8 @@
 """
 Project-wide hardcoded config for use across scripts.
 
-Latest changes: 12/08/26:
-- Added LOCAL_SPLITS_DIR and CHECKPOINTS_DIR
+Latest changes: 14/08/26:
+- Added RESULTS_DIR
 """
 
 ####################
@@ -18,6 +18,7 @@ IDS_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/ids'
 TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train'
 VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val'
 TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test'
+RESULTS_DIR = '/content/drive/MyDrive/drive_diss/data/results'
 
 ####################
 # Local Disk - Colab session 

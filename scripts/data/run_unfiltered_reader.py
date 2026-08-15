@@ -5,7 +5,7 @@ aim is to apply substantial filtering decisions to this dataset, including data
 analysis for choice-justification. 
 
 Latest changes: 15/08/26:
-- Initial commit
+- Output-name change
 
 Run:
     !python run_reader_unfiltered.py --date 2026-01
@@ -288,7 +288,7 @@ def main(argv: list[str] | None = None) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     input_path = os.path.join(args.in_dir, f'lichess_{args.date}.pgn.zst')
-    output_path = os.path.join(args.out_dir, f'metadata_full_{args.date}.csv')
+    output_path = os.path.join(args.out_dir, f'game_unfiltered_{args.date}.csv')
 
     if not os.path.exists(input_path):
         sys.exit(f'No local dump at {input_path} -- run run_download_dumps.py --date {args.date} first.')

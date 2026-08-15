@@ -2,8 +2,8 @@
 training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
-Latest changes: 12/08/26:
-- Naming changes to match downstream use
+Latest changes: 15/08/26:
+- Adam betas/eps made explicit constants
 """
 
 import os
@@ -44,6 +44,9 @@ SCHEDULER_REGISTRY: dict[str, type] = {
 
 ELO_WEIGHT_DEFAULT_ALPHA = 0.5
 ELO_WEIGHT_MAX_RATIO = 5.0
+
+ADAM_BETAS = (0.9, 0.999)
+ADAM_EPS = 1e-8
 
 ####################
 # FUNCTIONS
@@ -264,7 +267,8 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
 
     loss_name = resolve_loss_name(output_type, cfg.loss_name)
     loss_fn = build_loss(loss_name)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, betas=ADAM_BETAS, eps=ADAM_EPS,
+                                  weight_decay=cfg.weight_decay)
     scheduler = build_scheduler(optimizer, cfg.schedule_cfg, cfg.n_epochs, mode)
     bin_weights = _resolve_bin_weights(train, cfg, device)
     warmup_steps = _resolve_warmup_steps(cfg.warmup_prop, len(train), cfg.batch_size, cfg.n_epochs)
@@ -418,7 +422,7 @@ class TrainConfig:
 
 @dataclass
 class TrainedModel:
-    """Everything needed to reconstruct a trained model and run inference on new data."""
+    """Everything for reconstructing a trained model and running inference on new data."""
     arch_name: str
     model_cfg: BaseModelConfig
     state_dict: dict

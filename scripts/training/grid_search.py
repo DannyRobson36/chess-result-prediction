@@ -1,10 +1,10 @@
 """
 grid_search.py
 Cartesian-searches model and training config grids for one or more architectures on prepared splits,
-via run_training, ranking parameter influence on val loss.
+via run_training, ranking parameter influence on val loss and on per-epoch runtime.
 
 Latest changes: 15/08/26:
-- Initial commit
+- Added a second influence table, ranking params by effect on per-epoch runtime
 """
 
 import time
@@ -91,6 +91,15 @@ def _format_metrics_line(metrics: dict, prefix: str = "val") -> str:
 
 # (c) PARAMETER INFLUENCE
 
+def _hashable(val):
+    """Recursively converts dicts/lists into hashable tuple forms; other values pass through unchanged."""
+    if isinstance(val, dict):
+        return tuple(sorted((k, _hashable(v)) for k, v in val.items()))
+    if isinstance(val, (list, tuple)):
+        return tuple(_hashable(v) for v in val)
+    return val
+
+
 def _param_source(keys: tuple, cfg_grid_keys: set, train_grid_keys: set) -> str:
     """Labels a (possibly grouped) axis as 'model', 'train', or 'mixed' by which grid(s) its keys came from."""
     in_cfg = bool(set(keys) & cfg_grid_keys)
@@ -101,16 +110,17 @@ def _param_source(keys: tuple, cfg_grid_keys: set, train_grid_keys: set) -> str:
 
 
 def _param_influence_table(rows: list[dict], combined_grid: dict, fixed_groups: list[tuple] | None,
-                            cfg_grid_keys: set, train_grid_keys: set, metric: str = "loss") -> pd.DataFrame:
-    """Ranks swept params by the count-weighted std of their per-level mean val metric, most influential first."""
+                            cfg_grid_keys: set, train_grid_keys: set,
+                            metric_key: str, metric_label: str) -> pd.DataFrame:
+    """Ranks swept params by the count-weighted std of their per-level mean metric_key, most influential first."""
     axes = _resolve_grid_axes(combined_grid, fixed_groups)
     out_rows = []
 
     for keys, _ in axes:
         level_values = defaultdict(list)
         for row in rows:
-            level = tuple(row[k] for k in keys)
-            level_values[level].append(row[metric])
+            level = tuple(_hashable(row[k]) for k in keys)
+            level_values[level].append(row[metric_key])
         if len(level_values) <= 1:
             continue
 
@@ -129,14 +139,14 @@ def _param_influence_table(rows: list[dict], combined_grid: dict, fixed_groups: 
             "param": "+".join(keys),
             "source": _param_source(keys, cfg_grid_keys, train_grid_keys),
             "n_levels": len(level_means),
-            f"influence_on_val_{metric}": round(float(np.sqrt(weighted_var)), 4),
-            f"mean_val_{metric}_by_level": display_levels,
+            f"influence_on_{metric_label}": round(float(np.sqrt(weighted_var)), 4),
+            f"mean_{metric_label}_by_level": display_levels,
         })
 
     if not out_rows:
-        return pd.DataFrame(columns=["param", "source", "n_levels", f"influence_on_val_{metric}",
-                                      f"mean_val_{metric}_by_level"])
-    return pd.DataFrame(out_rows).sort_values(f"influence_on_val_{metric}", ascending=False).reset_index(drop=True)
+        return pd.DataFrame(columns=["param", "source", "n_levels", f"influence_on_{metric_label}",
+                                      f"mean_{metric_label}_by_level"])
+    return pd.DataFrame(out_rows).sort_values(f"influence_on_{metric_label}", ascending=False).reset_index(drop=True)
 
 
 # (d) MAIN GRID SEARCH
@@ -152,7 +162,7 @@ def grid_search(
     device: torch.device | None = None,
     verbose: int = 1,
 ) -> dict:
-    """Cartesian-searches cfg_grid x train_grid via run_training, defaulting anything not swept to its config class's own field default; returns the best combo, results table, and parameter-influence ranking."""
+    """Cartesian-searches cfg_grid x train_grid via run_training, defaulting anything not swept to its config class's own field default; returns the best combo, results table, and parameter-influence rankings."""
     t_start = time.time()
     device = device or get_device()
     train_grid = train_grid or {}
@@ -214,14 +224,18 @@ def grid_search(
 
         best_idx = result["best_epoch"] - 1
         combo_metrics = {k: result["history"][f"val_{k}"][best_idx] for k in COMBO_METRIC_KEYS}
+        n_epochs_run = len(result["history"]["train_loss"])
+        time_per_epoch = combo_runtime / n_epochs_run
 
         if verbose >= 1:
             print(_format_metrics_line(combo_metrics) +
                   f"  (best_epoch={result['best_epoch']}, "
-                  f"epochs_run={len(result['history']['train_loss'])}, time={combo_runtime:.2f}s)")
+                  f"epochs_run={n_epochs_run}, time={combo_runtime:.2f}s, "
+                  f"time_per_epoch={time_per_epoch:.2f}s)")
 
         rows.append({**combo, **combo_metrics, "best_epoch": result["best_epoch"],
-                     "n_epochs_run": len(result["history"]["train_loss"]), "runtime": combo_runtime})
+                     "n_epochs_run": n_epochs_run, "runtime": combo_runtime,
+                     "time_per_epoch": time_per_epoch})
 
         score = combo_metrics[primary_metric]
         if best_score is None or is_better(score, best_score, mode):
@@ -247,12 +261,21 @@ def grid_search(
           f"train={best_combo_desc['train_overrides']}")
     print(f"Best val {primary_metric}: {best_score:.4f}")
 
-    influence_df = _param_influence_table(rows, combined_grid, fixed_groups, set(cfg_grid), set(train_grid))
+    influence_df = _param_influence_table(rows, combined_grid, fixed_groups, set(cfg_grid), set(train_grid),
+                                           metric_key="loss", metric_label="val_loss")
     print("\nParameter influence on val loss (most influential first):")
     if influence_df.empty:
         print("No swept parameter had more than one level; nothing to rank.")
     else:
         print(influence_df.to_string(index=False))
+
+    time_influence_df = _param_influence_table(rows, combined_grid, fixed_groups, set(cfg_grid), set(train_grid),
+                                                metric_key="time_per_epoch", metric_label="time_per_epoch")
+    print("\nParameter influence on per-epoch runtime (most influential first):")
+    if time_influence_df.empty:
+        print("No swept parameter had more than one level; nothing to rank.")
+    else:
+        print(time_influence_df.to_string(index=False))
 
     total_time = time.time() - t_start
     print(f"\nTotal grid search runtime: {total_time:.2f}s")
@@ -260,6 +283,7 @@ def grid_search(
     return {
         "results_df": results_df,
         "influence_df": influence_df,
+        "time_influence_df": time_influence_df,
         "best_combo": best_combo_desc,
         "best_model": best_model,
         "best_model_cfg": best_model_cfg,
@@ -268,4 +292,5 @@ def grid_search(
         "arch_name": best_model_cfg.arch_name,
         "two_way": two_way,
         "total_time": total_time,
+        "device": device,
     }

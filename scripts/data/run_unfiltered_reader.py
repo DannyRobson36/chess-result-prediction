@@ -1,26 +1,34 @@
 """
 run_reader_unfiltered.py
 Unfiltered pass over a lichess .pgn.zst dump. Applies only structural sanity checks,
-aim is to apply substantial filtering decisions to this dataset, including data 
-analysis for choice-justification. 
+aim is to apply substantial filtering decisions to this dataset, including data
+analysis for choice-justification.
 
-Latest changes: 15/08/26:
-- Output-name change
+Latest changes: 17/08/26:
+- Fixed tmp writing to avoid overwrites
 
 Run:
     !python run_reader_unfiltered.py --date 2026-01
 CLI:
     --date       Dump month, YYYY-MM. Required.
-    --in-dir     Folder holding lichess_{date}.pgn.zst. Default: raw_dumps/.
-    --out-dir    Folder to write game_unfiltered_{date}.csv into. Default: game_data/.
+    --in-dir     Folder holding lichess_{date}.pgn.zst. Default: RAW_DUMP_DIR (config.py).
+    --out-dir    Folder to write game_unfiltered_{date}.csv into. Default: GAME_DIR (config.py).
 """
+
+import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from scripts.config import RAW_DUMP_DIR, GAME_DIR
 
 import argparse
 import csv
 import io
-import os
 import re
-import sys
+import shutil
 from dataclasses import dataclass
 
 import zstandard as zstd
@@ -29,9 +37,6 @@ from tqdm import tqdm
 ####################
 # CONSTANTS
 ####################
-
-RAW_DIR = '/content/drive/MyDrive/drive_diss/data/raw_dumps'
-GAME_DIR = '/content/drive/MyDrive/drive_diss/data/game_data'
 
 DATE_RE = re.compile(r'^\d{4}-\d{2}$')
 HEADER_RE = re.compile(r'\[(\w+)\s+"(.*)"\]')
@@ -45,17 +50,10 @@ RESULT_TOKENS = set(RESULT_MAP) | {'*'}
 MIN_ELO_BOUND = 0
 MAX_ELO_BOUND = 4000
 
-FIELDNAMES = ['game_id', 'datetime', 'white', 'black', 'white_elo', 'black_elo',
-              'white_title', 'black_title', 'white_rating_diff', 'black_rating_diff',
-              'result', 'speed', 'time_control', 'termination', 'rated',
-              'eco', 'ply_count', 'clock_ok']
-
-# Speed derivation (functional - determines value in 'speed' col)
 BULLET_PRESETS = ['60+0', '120+1']
 BLITZ_PRESETS = ['180+0', '180+2', '300+0', '300+3']
 RAPID_PRESETS = ['600+0', '600+5', '900+10']
 CLASSICAL_PRESETS = ['1800+0', '1800+20']
-# base+increment in seconds, as stored in PGN TimeControl header
 
 SPEED_PRESETS = {
     'Bullet': BULLET_PRESETS,
@@ -65,27 +63,41 @@ SPEED_PRESETS = {
 }
 PRESET_TO_SPEED = {tc: speed for speed, presets in SPEED_PRESETS.items() for tc in presets}
 
+FIELDNAMES = ['game_id', 'datetime', 'white', 'black', 'white_elo', 'black_elo',
+              'white_title', 'black_title', 'white_rating_diff', 'black_rating_diff',
+              'result', 'speed', 'time_control', 'termination', 'rated',
+              'eco', 'ply_count', 'clock_ok']
+
+UNFILTERED_CSV_DTYPES = {
+    'game_id': 'string',
+    'white': 'string',
+    'black': 'string',
+    'white_elo': 'int32',
+    'black_elo': 'int32',
+    'white_title': 'category',
+    'black_title': 'category',
+    'white_rating_diff': 'Int64',
+    'black_rating_diff': 'Int64',
+    'result': 'float32',
+    'speed': 'category',
+    'time_control': 'category',
+    'termination': 'category',
+    'eco': 'category',
+    'ply_count': 'int16',
+}
+# load 'datetime' with parse_dates=['datetime']
+# load 'rated'/'clock_ok' with true_values=['True'], false_values=['False']
+
 MAX_GAMES = None
-# Cap on games processed, or None for the whole dump.
+# Cap on games processed. None reads the whole dump.
 
-####################
-# DOWNSTREAM FILTERS - DEAD HERE
-####################
-
-MIN_PLIES = 1
-TERMINATIONS = ['Normal', 'Time forfeit', 'Abandoned', 'Rules infraction', 'Unterminated']
-RATED_ONLY = False
-TIME_CONTROLS = ['Bullet', 'Blitz', 'Rapid', 'Classical', 'Custom']
-MIN_ELO = 0
-MAX_ELO = None
-REMOVE_BOTS = False
-OUTPUT_REQUIRE_VALID_CLOCK = True
+MIN_FREE_DISK_GB = 20.0
 
 ####################
 # FUNCTIONS
 ####################
 
-# (a) PLY COUNTING
+# (a) PARSING
 
 def _count_plies(movetext: str) -> int:
     """Counts plies in movetext, stripping comments, NAG codes, move numbers, and result tokens."""
@@ -98,8 +110,6 @@ def _count_plies(movetext: str) -> int:
         plies += 1
     return plies
 
-# (b) RATING DIFF PARSING
-
 def _parse_rating_diff(raw: str) -> int | None:
     """Parses a WhiteRatingDiff/BlackRatingDiff header value to int, or None if missing/malformed."""
     try:
@@ -107,10 +117,9 @@ def _parse_rating_diff(raw: str) -> int | None:
     except ValueError:
         return None
 
-# (c) GAME PARSING
-
-def process_game(header_lines: str, movetext: str, dump_date: str, seen_game_ids: set[str]) -> dict | None:
-    """Parses one game's headers/movetext into a metadata row, applying every SanityChecks check; returns None on any failure."""
+def parse_core(header_lines: str, movetext: str, dump_date: str, seen_game_ids: set[str]) -> dict | None:
+    """Parses one game's headers/movetext into a metadata row, applying every SanityChecks check;
+    returns None on any failure."""
     headers = dict(HEADER_RE.findall(header_lines))
 
     termination = headers.get('Termination', '').strip()
@@ -191,10 +200,22 @@ def process_game(header_lines: str, movetext: str, dump_date: str, seen_game_ids
         'clock_ok': clock_ok,
     }
 
-# (d) STREAMED EXTRACTION
+# (b) OUTPUT I/O
 
-def extract_metadata(input_path: str, output_path: str, dump_date: str, max_games: int | None) -> tuple[int, int]:
-    """Streams input_path through process_game, writing kept rows to output_path; returns (games_seen, games_kept)."""
+def _check_disk_space(path: str, required_gb: float) -> None:
+    """Raises if path's filesystem has less than required_gb free."""
+    os.makedirs(path, exist_ok=True)
+    free_gb = shutil.disk_usage(path).free / (1024 ** 3)
+    if free_gb < required_gb:
+        raise RuntimeError(
+            f'Not enough free disk space at {path}: {free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
+        )
+
+# (c) STREAMED EXTRACTION
+
+def run(input_path: str, output_path: str, dump_date: str, max_games: int | None) -> tuple[int, int]:
+    """Streams input_path through parse_core, writing kept rows to a tmp file that's atomically
+    renamed to output_path once the stream finishes; returns (games_seen, games_kept)."""
     games_seen = 0
     games_kept = 0
     seen_game_ids: set[str] = set()
@@ -204,7 +225,8 @@ def extract_metadata(input_path: str, output_path: str, dump_date: str, max_game
 
     total_size = os.path.getsize(input_path)
 
-    out_f = open(output_path, 'w', newline='', encoding='utf-8')
+    output_tmp = output_path + '.tmp'
+    out_f = open(output_tmp, 'w', newline='', encoding='utf-8')
     writer = csv.DictWriter(out_f, fieldnames=FIELDNAMES)
     writer.writeheader()
 
@@ -223,7 +245,7 @@ def extract_metadata(input_path: str, output_path: str, dump_date: str, max_game
 
                     def handle_block():
                         nonlocal games_seen, games_kept, header_lines, movetext, stop
-                        row = process_game(header_lines, movetext, dump_date, seen_game_ids)
+                        row = parse_core(header_lines, movetext, dump_date, seen_game_ids)
                         games_seen += 1
                         if row is not None:
                             writer.writerow(row)
@@ -261,18 +283,20 @@ def extract_metadata(input_path: str, output_path: str, dump_date: str, max_game
     finally:
         out_f.close()
 
+    os.replace(output_tmp, output_path)
+
     print('Done.')
     print(f'Games parsed (pre validity checks): {games_seen:,}')
     print(f'Games kept (in output CSV):         {games_kept:,}')
     return games_seen, games_kept
 
-# (e) CLI
+# (d) CLI
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parses --date, --in-dir, --out-dir CLI arguments."""
     parser = argparse.ArgumentParser(description='Unfiltered baseline metadata pass over a local lichess dump.')
     parser.add_argument('--date', required=True, help='Dump month, YYYY-MM.')
-    parser.add_argument('--in-dir', default=RAW_DIR, help=f'Default: {RAW_DIR}')
+    parser.add_argument('--in-dir', default=RAW_DUMP_DIR, help=f'Default: {RAW_DUMP_DIR}')
     parser.add_argument('--out-dir', default=GAME_DIR, help=f'Default: {GAME_DIR}')
     args = parser.parse_args(argv)
     if not DATE_RE.match(args.date):
@@ -280,12 +304,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 def main(argv: list[str] | None = None) -> None:
-    """Reads args, runs extract_metadata, exits early if the dump or MAX_GAMES is invalid."""
+    """Reads args, runs the extraction, exits early if the dump or MAX_GAMES is invalid."""
     if MAX_GAMES is not None and MAX_GAMES <= 0:
         sys.exit('MAX_GAMES must be > 0 or None.')
 
     args = parse_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
+    _check_disk_space(args.out_dir, MIN_FREE_DISK_GB)
 
     input_path = os.path.join(args.in_dir, f'lichess_{args.date}.pgn.zst')
     output_path = os.path.join(args.out_dir, f'game_unfiltered_{args.date}.csv')
@@ -293,7 +318,7 @@ def main(argv: list[str] | None = None) -> None:
     if not os.path.exists(input_path):
         sys.exit(f'No local dump at {input_path} -- run run_download_dumps.py --date {args.date} first.')
 
-    extract_metadata(input_path, output_path, args.date, MAX_GAMES)
+    run(input_path, output_path, args.date, MAX_GAMES)
 
 ####################
 # CLASSES

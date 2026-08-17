@@ -1,35 +1,35 @@
 """
 run_history_reader.py
-Loads one month's unfiltered game CSV, applies domain and output filters, and computes full
-per-lag past-performance history for past-perf-metric EDA.
+Streams one month's unfiltered game CSV row by row, applying domain and output filters and
+computing full per-lag past-performance history for past-perf-metric EDA.
 
 Latest changes: 17/08/26:
-- Initial commit
+- Rewritten to stream row-by-row to avoid RAM crashes
 
 Run:
     !python run_history_reader.py --date 2026-01
 CLI:
     --date       Dump month, YYYY-MM. Required.
-    --in-dir     Folder holding game_unfiltered_{date}.csv. Default: GAME_DIR.
-    --out-dir    Folder to write game_history_{date}.csv into. Default: GAME_DIR.
+    --in-dir     Folder holding game_unfiltered_{date}.csv. Default: GAME_DIR (config.py).
+    --out-dir    Folder to write game_history_{date}.csv into. Default: GAME_DIR (config.py).
 """
 
 import os
 import sys
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.config import GAME_DIR
 
 import argparse
+import csv
 import re
+import shutil
 from collections import deque
 from dataclasses import dataclass
-
-import numpy as np
-import pandas as pd
+from datetime import datetime, timedelta
 
 ####################
 # CONSTANTS
@@ -56,25 +56,9 @@ MAX_ELO = 2200
 HISTORY_MAX_GAMES = 10
 HISTORY_MAX_DAYS = 10
 
-UNFILTERED_CSV_DTYPES = {
-    'game_id': 'string',
-    'white': 'string',
-    'black': 'string',
-    'white_elo': 'int32',
-    'black_elo': 'int32',
-    'white_title': 'category',
-    'black_title': 'category',
-    'white_rating_diff': 'Int64',
-    'black_rating_diff': 'Int64',
-    'result': 'float32',
-    'speed': 'category',
-    'time_control': 'category',
-    'termination': 'category',
-    'eco': 'category',
-    'ply_count': 'int16',
-}
-# load 'datetime' with parse_dates=['datetime']
-# load 'rated'/'clock_ok' with true_values=['True'], false_values=['False']
+MIN_FREE_DISK_GB = 20.0
+
+PROGRESS_EVERY_N_ROWS = 1_000_000
 
 HISTORY_BASE_FIELDNAMES = [
     'game_id', 'datetime', 'white', 'black', 'white_elo', 'black_elo',
@@ -121,127 +105,212 @@ HISTORY_CSV_BOOL_COLS = ['has_history_white', 'has_history_black', 'rematch']
 # FUNCTIONS
 ####################
 
-# (a) DOMAIN / OUTPUT FILTERING
+# (a) PARSING
 
-def build_domain_mask(df: pd.DataFrame, config: 'DomainFilterConfig') -> np.ndarray:
-    """Returns a boolean mask selecting rows eligible to contribute to history."""
-    mask = np.ones(len(df), dtype=bool)
-    if config.rated_only:
-        mask = mask & df['rated'].to_numpy()
-    mask = mask & df['speed'].isin(config.time_controls).to_numpy()
+def parse_row(row: dict[str, str]) -> dict:
+    """Converts one unfiltered-CSV row's string fields to typed values."""
+    return {
+        'game_id': row['game_id'],
+        'datetime': datetime.strptime(row['datetime'], '%Y-%m-%d %H:%M:%S'),
+        'white': row['white'], 'black': row['black'],
+        'white_elo': int(row['white_elo']), 'black_elo': int(row['black_elo']),
+        'white_title': row['white_title'], 'black_title': row['black_title'],
+        'white_rating_diff': int(row['white_rating_diff']) if row['white_rating_diff'] else None,
+        'black_rating_diff': int(row['black_rating_diff']) if row['black_rating_diff'] else None,
+        'result': float(row['result']), 'speed': row['speed'], 'time_control': row['time_control'],
+        'termination': row['termination'], 'rated': row['rated'] == 'True',
+        'eco': row['eco'], 'ply_count': int(row['ply_count']), 'clock_ok': row['clock_ok'] == 'True',
+    }
+
+# (b) DOMAIN / OUTPUT FILTERING
+
+def passes_domain_filter(core: dict, config: 'DomainFilterConfig') -> bool:
+    """Returns whether a parsed row is eligible to contribute to history."""
+    if config.rated_only and not core['rated']:
+        return False
+    if core['speed'] not in config.time_controls:
+        return False
     if config.remove_bots:
-        mask = mask & (df['white_title'].str.upper() != 'BOT').to_numpy()
-        mask = mask & (df['black_title'].str.upper() != 'BOT').to_numpy()
-    mask = mask & (df['white'] != df['black']).to_numpy()
-    return mask
+        if core['white_title'].upper() == 'BOT' or core['black_title'].upper() == 'BOT':
+            return False
+    if core['white'] == core['black']:
+        return False
+    return True
 
-def build_output_mask(df: pd.DataFrame, config: 'OutputFilterConfig') -> np.ndarray:
-    """Returns a boolean mask selecting rows to keep in the output CSV."""
-    mask = df['termination'].isin(config.terminations).to_numpy()
-    mask = mask & (df['ply_count'] >= config.min_plies).to_numpy()
-    if config.valid_clock:
-        mask = mask & df['clock_ok'].to_numpy()
+def passes_output_filter(core: dict, config: 'OutputFilterConfig') -> bool:
+    """Returns whether a parsed row passes the output-quality filters."""
+    if core['ply_count'] < config.min_plies:
+        return False
+    if core['termination'] not in config.terminations:
+        return False
+    if config.valid_clock and not core['clock_ok']:
+        return False
     if not config.tails:
-        mask = mask & (df['white_elo'] >= config.min_elo).to_numpy()
-        mask = mask & (df['black_elo'] >= config.min_elo).to_numpy()
+        if core['white_elo'] < config.min_elo or core['black_elo'] < config.min_elo:
+            return False
         if config.max_elo is not None:
-            mask = mask & (df['white_elo'] < config.max_elo).to_numpy()
-            mask = mask & (df['black_elo'] < config.max_elo).to_numpy()
-    return mask
+            if core['white_elo'] >= config.max_elo or core['black_elo'] >= config.max_elo:
+                return False
+    return True
 
-# (b) HISTORY COMPUTATION
+# (c) HISTORY COMPUTATION
 
-def _check_sorted(df: pd.DataFrame, datetime_col: str = 'datetime') -> None:
-    """Raises if df isn't sorted ascending by datetime_col."""
-    if not df[datetime_col].is_monotonic_increasing:
-        raise ValueError(f"df must be sorted ascending by '{datetime_col}' before computing history.")
+def _prune(dq: deque, now: datetime) -> None:
+    """Evicts entries older than HISTORY_MAX_DAYS from dq, in place."""
+    cutoff = now - timedelta(days=HISTORY_MAX_DAYS)
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
 
-def compute_history(df: pd.DataFrame, max_games: int, max_days: int) -> dict[str, np.ndarray]:
-    """Computes per-lag result/hours-since/elo-gain history (1..max_games, day-windowed to max_days)
-    plus prev/hours_since/has_history/rematch, using the same per-player-deque method as
-    HistoryTracker in run_game_reader.py."""
-    _check_sorted(df)
-    n = len(df)
-    dt = df['datetime'].to_numpy()
-    white = df['white'].to_numpy()
-    black = df['black'].to_numpy()
-    result = df['result'].to_numpy(dtype='float64')
-    white_elo_gain = df['white_rating_diff'].to_numpy(dtype='float64', na_value=np.nan)
-    black_elo_gain = df['black_rating_diff'].to_numpy(dtype='float64', na_value=np.nan)
+def _lag_features(dq: deque | None, now: datetime) -> dict:
+    """Returns per-lag result/hours-since/elo-gain (1..HISTORY_MAX_GAMES) plus prev/hours_since/
+    has_history/last_opponent, for an already-pruned deque."""
+    feats: dict = {}
+    for lag in range(1, HISTORY_MAX_GAMES + 1):
+        feats[f'past_result_{lag}'] = None
+        feats[f'past_hours_since_{lag}'] = None
+        feats[f'past_elo_gain_{lag}'] = None
+    feats['prev'] = None
+    feats['hours_since'] = None
+    feats['has_history'] = False
+    feats['last_opponent'] = None
+
+    if not dq:
+        return feats
+
+    entries = list(dq)[::-1]
+    for lag, (past_dt, past_result, past_opp, past_gain) in enumerate(entries, start=1):
+        feats[f'past_result_{lag}'] = past_result
+        feats[f'past_hours_since_{lag}'] = (now - past_dt).total_seconds() / 3600.0
+        feats[f'past_elo_gain_{lag}'] = past_gain
+
+    feats['prev'] = entries[0][1]
+    feats['hours_since'] = (now - entries[0][0]).total_seconds() / 3600.0
+    feats['has_history'] = True
+    feats['last_opponent'] = entries[0][2]
+    return feats
+
+# (d) ROW ASSEMBLY
+
+def _build_row(core: dict, white_feats: dict, black_feats: dict, rematch: bool) -> dict:
+    """Assembles one output CSV row from parsed core fields and both players' lag features."""
+    row = {
+        'game_id': core['game_id'],
+        'datetime': core['datetime'].strftime('%Y-%m-%d %H:%M:%S'),
+        'white': core['white'], 'black': core['black'],
+        'white_elo': core['white_elo'], 'black_elo': core['black_elo'],
+        'white_title': core['white_title'], 'black_title': core['black_title'],
+        'white_rating_diff': core['white_rating_diff'] if core['white_rating_diff'] is not None else '',
+        'black_rating_diff': core['black_rating_diff'] if core['black_rating_diff'] is not None else '',
+        'result': core['result'], 'speed': core['speed'], 'time_control': core['time_control'],
+        'termination': core['termination'], 'eco': core['eco'], 'ply_count': core['ply_count'],
+        'prev_white': white_feats['prev'] if white_feats['prev'] is not None else '',
+        'prev_black': black_feats['prev'] if black_feats['prev'] is not None else '',
+        'hours_since_white': white_feats['hours_since'] if white_feats['hours_since'] is not None else '',
+        'hours_since_black': black_feats['hours_since'] if black_feats['hours_since'] is not None else '',
+        'has_history_white': white_feats['has_history'], 'has_history_black': black_feats['has_history'],
+        'rematch': rematch,
+    }
+    for lag in range(1, HISTORY_MAX_GAMES + 1):
+        for color, feats in (('white', white_feats), ('black', black_feats)):
+            for field in ('past_result', 'past_hours_since', 'past_elo_gain'):
+                value = feats[f'{field}_{lag}']
+                row[f'{color}_{field}_{lag}'] = value if value is not None else ''
+    return row
+
+# (e) OUTPUT I/O
+
+def _check_disk_space(path: str, required_gb: float) -> None:
+    """Raises if path's filesystem has less than required_gb free."""
+    os.makedirs(path, exist_ok=True)
+    free_gb = shutil.disk_usage(path).free / (1024 ** 3)
+    if free_gb < required_gb:
+        raise RuntimeError(
+            f'Not enough free disk space at {path}: {free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
+        )
+
+# (f) STREAMED EXTRACTION
+
+def run(input_path: str, output_path: str) -> dict:
+    """Streams input_path row by row, applying domain/output filters and computing windowed
+    per-lag history, writing kept rows to a tmp file that's atomically renamed once done."""
+    domain_config = DomainFilterConfig(
+        time_controls=set(TIME_CONTROLS), rated_only=RATED_ONLY, remove_bots=REMOVE_BOTS,
+    )
+    output_config = OutputFilterConfig(
+        min_plies=MIN_PLIES, terminations=set(TERMINATIONS), valid_clock=VALID_CLOCK,
+        tails=TAILS, min_elo=MIN_ELO, max_elo=MAX_ELO,
+    )
 
     by_player: dict[str, deque] = {}
+    n_loaded = 0
+    n_domain_eligible = 0
+    n_written = 0
+    order_violations = 0
+    last_seen_dt = None
 
-    out = {name: np.full(n, np.nan, dtype='float32') for name in HISTORY_LAG_FIELDNAMES}
-    prev_white = np.full(n, np.nan, dtype='float32')
-    prev_black = np.full(n, np.nan, dtype='float32')
-    hours_since_white = np.full(n, np.nan, dtype='float32')
-    hours_since_black = np.full(n, np.nan, dtype='float32')
-    has_history_white = np.zeros(n, dtype=bool)
-    has_history_black = np.zeros(n, dtype=bool)
-    rematch = np.zeros(n, dtype=bool)
+    output_tmp = output_path + '.tmp'
+    with open(input_path, newline='', encoding='utf-8') as in_f, \
+            open(output_tmp, 'w', newline='', encoding='utf-8') as out_f:
+        reader = csv.DictReader(in_f)
+        writer = csv.DictWriter(out_f, fieldnames=HISTORY_CSV_FIELDNAMES)
+        writer.writeheader()
 
-    cutoff_delta = np.timedelta64(max_days, 'D')
+        for row in reader:
+            n_loaded += 1
+            core = parse_row(row)
 
-    def prune(dq: deque, now: np.datetime64) -> None:
-        cutoff = now - cutoff_delta
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
+            if not passes_domain_filter(core, domain_config):
+                continue
+            n_domain_eligible += 1
 
-    for i in range(n):
-        now = dt[i]
-        w, b = white[i], black[i]
+            dt = core['datetime']
+            if last_seen_dt is not None and dt < last_seen_dt:
+                order_violations += 1
+            else:
+                last_seen_dt = dt
 
-        w_dq = by_player.get(w)
-        if w_dq is not None:
-            prune(w_dq, now)
-        w_last_opp = None
-        if w_dq:
-            entries = list(w_dq)[::-1]
-            for lag, (past_dt, past_result, past_opp, past_gain) in enumerate(entries, start=1):
-                out[f'white_past_result_{lag}'][i] = past_result
-                out[f'white_past_hours_since_{lag}'][i] = (now - past_dt) / np.timedelta64(1, 'h')
-                out[f'white_past_elo_gain_{lag}'][i] = past_gain
-            prev_white[i] = entries[0][1]
-            hours_since_white[i] = (now - entries[0][0]) / np.timedelta64(1, 'h')
-            has_history_white[i] = True
-            w_last_opp = entries[0][2]
+            w, b = core['white'], core['black']
 
-        b_dq = by_player.get(b)
-        if b_dq is not None:
-            prune(b_dq, now)
-        b_last_opp = None
-        if b_dq:
-            entries = list(b_dq)[::-1]
-            for lag, (past_dt, past_result, past_opp, past_gain) in enumerate(entries, start=1):
-                out[f'black_past_result_{lag}'][i] = past_result
-                out[f'black_past_hours_since_{lag}'][i] = (now - past_dt) / np.timedelta64(1, 'h')
-                out[f'black_past_elo_gain_{lag}'][i] = past_gain
-            prev_black[i] = entries[0][1]
-            hours_since_black[i] = (now - entries[0][0]) / np.timedelta64(1, 'h')
-            has_history_black[i] = True
-            b_last_opp = entries[0][2]
+            w_dq = by_player.get(w)
+            if w_dq is not None:
+                _prune(w_dq, dt)
+            white_feats = _lag_features(w_dq, dt)
 
-        rematch[i] = (has_history_white[i] and w_last_opp == b
-                       and has_history_black[i] and b_last_opp == w)
+            b_dq = by_player.get(b)
+            if b_dq is not None:
+                _prune(b_dq, dt)
+            black_feats = _lag_features(b_dq, dt)
 
-        w_result = result[i]
-        b_result = 1.0 - result[i] if result[i] != 0.5 else 0.5
-        w_dq = by_player.setdefault(w, deque(maxlen=max_games))
-        prune(w_dq, now)
-        w_dq.append((now, w_result, b, white_elo_gain[i]))
-        b_dq = by_player.setdefault(b, deque(maxlen=max_games))
-        prune(b_dq, now)
-        b_dq.append((now, b_result, w, black_elo_gain[i]))
+            rematch = (white_feats['has_history'] and white_feats['last_opponent'] == b
+                       and black_feats['has_history'] and black_feats['last_opponent'] == w)
 
-    out.update({
-        'prev_white': prev_white, 'prev_black': prev_black,
-        'hours_since_white': hours_since_white, 'hours_since_black': hours_since_black,
-        'has_history_white': has_history_white, 'has_history_black': has_history_black,
-        'rematch': rematch,
-    })
-    return out
+            if passes_output_filter(core, output_config):
+                writer.writerow(_build_row(core, white_feats, black_feats, rematch))
+                n_written += 1
 
-# (c) CLI
+            w_result = core['result']
+            b_result = 1.0 - core['result'] if core['result'] != 0.5 else 0.5
+            w_dq = by_player.setdefault(w, deque(maxlen=HISTORY_MAX_GAMES))
+            _prune(w_dq, dt)
+            w_dq.append((dt, w_result, b, core['white_rating_diff']))
+            b_dq = by_player.setdefault(b, deque(maxlen=HISTORY_MAX_GAMES))
+            _prune(b_dq, dt)
+            b_dq.append((dt, b_result, w, core['black_rating_diff']))
+
+            if n_loaded % PROGRESS_EVERY_N_ROWS == 0:
+                print(f'Loaded: {n_loaded:,}, domain-eligible: {n_domain_eligible:,}, kept: {n_written:,}')
+
+    os.replace(output_tmp, output_path)
+
+    print(f'Loaded: {n_loaded:,}, domain-eligible: {n_domain_eligible:,}, kept: {n_written:,}')
+    if order_violations:
+        print(f'WARNING: {order_violations:,} row(s) had a datetime earlier than a preceding row. '
+              f'History features assume ascending order; investigate if this count is large.')
+
+    return {'n_loaded': n_loaded, 'n_domain_eligible': n_domain_eligible,
+            'n_written': n_written, 'order_violations': order_violations}
+
+# (g) CLI
 
 def _validate_config() -> None:
     """Validates filter/history constants, exiting with a clear message if any are invalid."""
@@ -263,7 +332,7 @@ def _validate_config() -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parses --date, --in-dir, --out-dir CLI arguments."""
     parser = argparse.ArgumentParser(
-        description='Loads one month\'s unfiltered game CSV and computes full per-lag past-'
+        description='Streams one month\'s unfiltered game CSV and computes full per-lag past-'
                      'performance history for past-perf-metric EDA.'
     )
     parser.add_argument('--date', required=True, help='Dump month, YYYY-MM.')
@@ -275,48 +344,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 def main(argv: list[str] | None = None) -> None:
-    """Reads args, loads the unfiltered CSV, applies domain filtering, computes history,
-    applies output filtering, writes the result."""
+    """Reads args, validates config, streams the unfiltered CSV, writing the history CSV."""
     _validate_config()
     args = parse_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
+    _check_disk_space(args.out_dir, MIN_FREE_DISK_GB)
 
     input_path = os.path.join(args.in_dir, f'game_unfiltered_{args.date}.csv')
-    output_final = os.path.join(args.out_dir, f'game_history_{args.date}.csv')
-    output_tmp = output_final + '.tmp'
+    output_path = os.path.join(args.out_dir, f'game_history_{args.date}.csv')
 
     if not os.path.exists(input_path):
         sys.exit(f'No input file at {input_path} -- run run_reader_unfiltered.py --date {args.date} first.')
+    if os.path.getsize(input_path) == 0:
+        sys.exit(f"{input_path} is empty (0 bytes) -- run_reader_unfiltered.py likely didn't complete "
+                  f'for {args.date}. Check its output for errors and rerun it for this month.')
 
     print(f'Reading: {input_path}')
-    df = pd.read_csv(input_path, dtype=UNFILTERED_CSV_DTYPES, parse_dates=['datetime'],
-                      true_values=['True'], false_values=['False'])
-    df = df.sort_values('datetime', kind='mergesort').reset_index(drop=True)
-    n_loaded = len(df)
-
-    domain_config = DomainFilterConfig(
-        time_controls=set(TIME_CONTROLS), rated_only=RATED_ONLY, remove_bots=REMOVE_BOTS,
-    )
-    domain_mask = build_domain_mask(df, domain_config)
-    df = df[domain_mask].reset_index(drop=True)
-    n_domain_eligible = len(df)
-
-    print('Computing history...')
-    history_cols = compute_history(df, HISTORY_MAX_GAMES, HISTORY_MAX_DAYS)
-    for col, arr in history_cols.items():
-        df[col] = arr
-
-    output_config = OutputFilterConfig(
-        min_plies=MIN_PLIES, terminations=set(TERMINATIONS), valid_clock=VALID_CLOCK,
-        tails=TAILS, min_elo=MIN_ELO, max_elo=MAX_ELO,
-    )
-    output_mask = build_output_mask(df, output_config)
-    df_out = df.loc[output_mask, HISTORY_CSV_FIELDNAMES]
-
-    print(f'Loaded: {n_loaded:,}, domain-eligible: {n_domain_eligible:,}, kept: {len(df_out):,}')
-    df_out.to_csv(output_tmp, index=False)
-    os.replace(output_tmp, output_final)
-    print(f'Done -> {output_final}')
+    run(input_path, output_path)
+    print(f'Done -> {output_path}')
 
 ####################
 # CLASSES

@@ -3,23 +3,29 @@ features.py
 Builds model-ready SplitData from raw dataframes: scaling, elo binning, task-mode detection.
 Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
-Latest changes: 13/08/26:
-- Version mismatch fix - writes to disk more frequently, RAM-saving
+Latest changes: 18/08/26:
+- Added board_mode toggle & stockfish eval feature
 """
 
 import json
+import multiprocessing as mp
 import os
+import signal
+import subprocess
 import time
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+import chess
+import chess.engine
 import numpy as np
 import pandas as pd
 import psutil
 import torch
 from tqdm import tqdm
 
+from scripts.config import STOCKFISH_PATH
 from scripts.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_edges, elo_bin_labels,
     fen_to_tensor, fen_to_token_ids, encode_result_class, encode_result_continuous,
@@ -43,9 +49,11 @@ _CLOCK_TRANS = {
     'clock_prop_log_centred': 'log_centered',
 }
 _FLAG_TRANS = {'raw': 'raw'}
+_SF_TRANS = {'raw': 'raw', 'normal': 'normal', 'centered': 'centered'}
 
 _TRANS_NAME_TO_BASE: dict[str, str] = {}
-for _trans_map in (_ELO_TRANS, _PLY_TRANS, _PAST_TRANS, _LAST_RESULT_TRANS, _HOURS_TRANS, _CLOCK_TRANS, _FLAG_TRANS):
+for _trans_map in (_ELO_TRANS, _PLY_TRANS, _PAST_TRANS, _LAST_RESULT_TRANS, _HOURS_TRANS,
+                   _CLOCK_TRANS, _FLAG_TRANS, _SF_TRANS):
     _TRANS_NAME_TO_BASE.update(_trans_map)
 
 SEC_MAPPING = {'600+0': 600, '600+5': 600, '900+10': 900}
@@ -57,6 +65,26 @@ TWO_WAY_CLASS_NAMES = ['loss', 'win']
 CHUNK_SIZE = 1_000_000
 BOARD_TENSOR_SHAPE = (18, 8, 8)
 
+# Board/token-tensor writing mode -> (write_boards, write_board_token_ids).
+BOARD_MODE_REGISTRY: dict[str, tuple[bool, bool]] = {
+    'none': (False, False),
+    'boards_only': (True, False),
+    'tokens_only': (False, True),
+    'both': (True, True),
+}
+
+# Centipawn -> win-probability sigmoid constant (the Lichess win% curve).
+WIN_PCT_CONST = 0.00368208
+
+# Sentinel mover-perspective eval for a forced mate (positive if mate favors the mover).
+MATE_SCORE_MOVER = 100_000
+
+# Per-engine hash size in MB for stockfish evaluation workers.
+HASH_MB_PER_ENGINE = 16
+
+# Timeout in seconds for one position's stockfish analysis before a same-depth retry.
+ATTEMPT_TIMEOUT_SECONDS = 120
+
 ####################
 # FUNCTIONS
 ####################
@@ -65,7 +93,7 @@ BOARD_TENSOR_SHAPE = (18, 8, 8)
 
 def cp_to_mover_winprob(cp: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
     """Cp to mover win probability, lichess logistic curve."""
-    return 0.5 + 0.5 * (2 / (1 + np.exp(-0.00368208 * cp)) - 1)
+    return 0.5 + 0.5 * (2 / (1 + np.exp(-WIN_PCT_CONST * cp)) - 1)
 
 
 # (b) SCALING TRANSFORMS
@@ -289,11 +317,110 @@ def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
     return elo_mean_bin, elo_self_bin, elo_oppo_bin, n_bins, labels
 
 
-# (f) DISK PERSISTENCE
+# (f) STOCKFISH EVALUATION
+
+_engine = None
+# Per-worker persistent engine handle, set by _stockfish_init_worker inside each pool process.
+
+
+def _ensure_stockfish_installed(engine_path: str) -> None:
+    """Installs stockfish via apt-get if engine_path doesn't already exist, raising if that fails."""
+    if os.path.exists(engine_path):
+        return
+    install = subprocess.run(['apt-get', 'install', '-y', 'stockfish'], capture_output=True, text=True)
+    if install.returncode != 0 or not os.path.exists(engine_path):
+        raise RuntimeError(f'Stockfish install failed or binary not found at {engine_path}.\n{install.stderr}')
+
+
+def _stockfish_start_engine() -> chess.engine.SimpleEngine:
+    """Starts one stockfish engine process for this worker."""
+    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    engine.configure({'Threads': 1, 'Hash': HASH_MB_PER_ENGINE})
+    return engine
+
+
+def _stockfish_init_worker() -> None:
+    """Starts this worker's persistent engine, stored in the module-level _engine global."""
+    global _engine
+    _engine = _stockfish_start_engine()
+
+
+def _stockfish_restart_engine() -> None:
+    """Closes and restarts this worker's engine after a timeout or error."""
+    global _engine
+    try:
+        _engine.close()
+    except Exception:
+        try:
+            _engine.transport.kill()
+        except Exception:
+            pass
+    _engine = _stockfish_start_engine()
+
+
+def _stockfish_alarm_handler(signum, frame) -> None:
+    """SIGALRM handler that converts a timeout into a _StockfishTimeout."""
+    raise _StockfishTimeout()
+
+
+def _stockfish_analyse_one(args: tuple[str, int]) -> float:
+    """Evaluates one fen at depth via this worker's persistent engine, mover-perspective centipawns."""
+    fen, depth = args
+    board = chess.Board(fen)
+    mover_is_white = board.turn
+
+    if board.is_game_over():
+        return float(-MATE_SCORE_MOVER) if board.is_checkmate() else 0.0
+
+    for _ in range(2):
+        signal.signal(signal.SIGALRM, _stockfish_alarm_handler)
+        signal.alarm(ATTEMPT_TIMEOUT_SECONDS)
+        try:
+            _engine.configure({'Clear Hash': None})
+            info = _engine.analyse(board, chess.engine.Limit(depth=depth))
+            signal.alarm(0)
+            white_score = info['score'].white()
+            if white_score.is_mate():
+                mate_for_white = white_score.mate() > 0
+                mate_for_mover = mate_for_white == mover_is_white
+                return float(MATE_SCORE_MOVER if mate_for_mover else -MATE_SCORE_MOVER)
+            raw_cp = white_score.score()
+            return float(raw_cp if mover_is_white else -raw_cp)
+        except Exception:
+            signal.alarm(0)
+            _stockfish_restart_engine()
+
+    print(f'Stockfish failed twice on one position, falling back to eval=0.0: {fen}')
+    return 0.0
+
+
+def _stockfish_eval_fens(fens: np.ndarray, depth: int) -> np.ndarray:
+    """Evaluates every fen at depth via a multiprocessing pool of persistent engines, mover-perspective cp."""
+    _ensure_stockfish_installed(STOCKFISH_PATH)
+
+    tasks = [(fen, depth) for fen in fens]
+    n_workers = os.cpu_count() or 1
+
+    results = []
+    with mp.Pool(processes=n_workers, initializer=_stockfish_init_worker) as pool:
+        for cp in tqdm(pool.imap(_stockfish_analyse_one, tasks), total=len(tasks), desc='stockfish eval', unit='pos'):
+            results.append(cp)
+
+    return np.array(results, dtype='float64')
+
+
+# (g) DISK PERSISTENCE
 
 def _rss_gb() -> float:
     """Returns the current process's resident memory usage in GB."""
     return psutil.Process().memory_info().rss / (1024 ** 3)
+
+
+def _resolve_board_mode(board_mode: str) -> tuple[bool, bool]:
+    """Returns (write_boards, write_board_token_ids) for board_mode, from BOARD_MODE_REGISTRY."""
+    if board_mode not in BOARD_MODE_REGISTRY:
+        raise ValueError(f"Unknown board_mode '{board_mode}', choose from {list(BOARD_MODE_REGISTRY)}")
+    return BOARD_MODE_REGISTRY[board_mode]
 
 
 def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
@@ -301,26 +428,40 @@ def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
     return np.lib.format.open_memmap(path, mode='w+', dtype=dtype, shape=shape)
 
 
-def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int) -> None:
+def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int,
+                              write_boards: bool, write_tokens: bool) -> None:
     """Encodes fens row by row directly into preallocated boards/board_token_ids .npy files, flushing silently every chunk_size rows."""
+    if not write_boards and not write_tokens:
+        return
+
     n_rows = len(fens)
-    boards_mm = _preallocate_npy(os.path.join(split_dir, 'boards.npy'), (n_rows, *BOARD_TENSOR_SHAPE), np.bool_)
-    token_ids_mm = _preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
+    boards_mm = (_preallocate_npy(os.path.join(split_dir, 'boards.npy'), (n_rows, *BOARD_TENSOR_SHAPE), np.bool_)
+                 if write_boards else None)
+    token_ids_mm = (_preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
+                    if write_tokens else None)
 
     for i in tqdm(range(n_rows), desc=desc, unit='rows'):
-        boards_mm[i] = fen_to_tensor(fens[i]).numpy().astype(np.bool_)
-        token_ids_mm[i] = fen_to_token_ids(fens[i]).numpy().astype(np.uint8)
+        if write_boards:
+            boards_mm[i] = fen_to_tensor(fens[i]).numpy().astype(np.bool_)
+        if write_tokens:
+            token_ids_mm[i] = fen_to_token_ids(fens[i]).numpy().astype(np.uint8)
 
         if (i + 1) % chunk_size == 0 or i + 1 == n_rows:
-            boards_mm.flush()
-            token_ids_mm.flush()
+            if write_boards:
+                boards_mm.flush()
+            if write_tokens:
+                token_ids_mm.flush()
 
-    del boards_mm, token_ids_mm
+    if write_boards:
+        del boards_mm
+    if write_tokens:
+        del token_ids_mm
 
 
 def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: np.ndarray, elo_oppo_bin: np.ndarray,
                          features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
-                         n_elo_bins: int, bin_labels: list, game_id: list, fen: list) -> None:
+                         n_elo_bins: int, bin_labels: list, game_id: list, fen: list,
+                         has_boards: bool, has_board_token_ids: bool) -> None:
     """Writes elo bins, features, targets, meta.json, and ids.json (game_id/fen) to split_dir."""
     np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), elo_mean_bin.astype(np.uint8))
     np.save(os.path.join(split_dir, 'elo_self_bin.npy'), elo_self_bin.astype(np.uint8))
@@ -334,7 +475,8 @@ def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: 
         np.save(os.path.join(feature_dir, f'{name}.npy'), tensor.numpy())
 
     with open(os.path.join(split_dir, 'meta.json'), 'w') as f:
-        json.dump({'n_elo_bins': n_elo_bins, 'bin_labels': bin_labels}, f)
+        json.dump({'n_elo_bins': n_elo_bins, 'bin_labels': bin_labels,
+                   'has_boards': has_boards, 'has_board_token_ids': has_board_token_ids}, f)
 
     with open(os.path.join(split_dir, 'ids.json'), 'w') as f:
         json.dump({'game_id': game_id, 'fen': fen}, f)
@@ -363,8 +505,8 @@ def load_split(split_dir: str) -> 'SplitData':
         ids = json.load(f)
 
     return SplitData(
-        boards=_mmap('boards'),
-        board_token_ids=_mmap('board_token_ids'),
+        boards=_mmap('boards') if meta.get('has_boards', True) else None,
+        board_token_ids=_mmap('board_token_ids') if meta.get('has_board_token_ids', True) else None,
         elo_mean_bin=_mmap('elo_mean_bin'),
         elo_self_bin=_mmap('elo_self_bin'),
         elo_oppo_bin=_mmap('elo_oppo_bin'),
@@ -378,7 +520,7 @@ def load_split(split_dir: str) -> 'SplitData':
     )
 
 
-# (g) DATA PREP PIPELINE
+# (h) DATA PREP PIPELINE
 
 def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.DataFrame | None = None, *,
                     mover_result_col: str,
@@ -391,10 +533,14 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
                     color_cols: list[str] | None = None, color_scale: dict | None = None,
                     ply_cols: list[str] | None = None, ply_scale: dict | None = None,
                     cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
+                    board_mode: str = 'both',
+                    sf_depth: int | None = None, sf_scale: dict | None = None,
                     ) -> tuple['SplitData', 'SplitData', 'SplitData | None', 'PrepConfig', bool]:
     """Builds, saves, and memory-maps train/val/test SplitData; returns a PrepConfig for reapplying to new data."""
     if elo_cols is None or elo_scale is None:
         raise ValueError('elo_cols and elo_scale are mandatory.')
+
+    write_boards, write_tokens = _resolve_board_mode(board_mode)
 
     dfs = {'train': df_train, 'val': df_val}
     if df_test is not None:
@@ -598,6 +744,27 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
             features[name]['ply_played_unscaled'] = raw.astype('float32')
             features[name]['ply_played_scaled'] = apply_fn(raw, stats)
 
+    # Stockfish
+    if sf_depth is not None and sf_scale is None:
+        raise ValueError('sf_scale is required whenever sf_depth is given.')
+    if sf_scale is not None and sf_depth is None:
+        raise ValueError('sf_depth is required whenever sf_scale is given.')
+
+    if sf_depth is not None:
+        _validate_scale_keys(sf_scale, {'stockfish_eval'}, 'sf_scale')
+        trans_name, base_trans = _resolve_trans_name(sf_scale, 'stockfish_eval', _SF_TRANS, 'sf_scale')
+        fit_fn, apply_fn = _TRANS_FIT_APPLY[base_trans]
+
+        sf_raw = {name: _stockfish_eval_fens(df[fen_col].to_numpy(), sf_depth) for name, df in dfs.items()}
+        stats = fit_fn(sf_raw['train'])
+        scaling_stats['stockfish_eval'] = {'trans_name': trans_name, **stats}
+        for name in dfs:
+            winprob = cp_to_mover_winprob(sf_raw[name])
+            features[name]['stockfish_eval_unscaled'] = sf_raw[name].astype('float32')
+            features[name]['stockfish_eval_scaled'] = apply_fn(sf_raw[name], stats)
+            features[name]['stockfish_winprob_unscaled'] = winprob.astype('float32')
+            features[name]['stockfish_winprob_scaled'] = winprob.astype('float32')
+
     print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
 
     # Assemble, save, memory-map
@@ -609,7 +776,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
         os.makedirs(split_dir, exist_ok=True)
 
         fens = df[fen_col].to_numpy()
-        _write_boards_and_tokens(split_dir, fens, desc=f'{name} boards/tokens', chunk_size=chunk_size)
+        _write_boards_and_tokens(split_dir, fens, desc=f'{name} boards/tokens', chunk_size=chunk_size,
+                                  write_boards=write_boards, write_tokens=write_tokens)
 
         elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
         _write_split_arrays(
@@ -619,6 +787,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
             encode_result_continuous(df[mover_result_col]),
             n_elo_bins, bin_labels,
             df[game_id_col].astype(str).tolist(), df[fen_col].tolist(),
+            has_boards=write_boards, has_board_token_ids=write_tokens,
         )
         print(f'{name:>5}: {n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
@@ -653,6 +822,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_test: pd.Dat
         past_cols_resolved=past_cols_resolved,
         color_col=color_col,
         ply_col=ply_col,
+        board_mode=board_mode,
+        sf_depth=sf_depth,
         scaling_stats=scaling_stats,
     )
 
@@ -676,6 +847,8 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f'apply_prepared_splits: df is missing required column(s) {missing}.')
+
+    write_boards, write_tokens = _resolve_board_mode(prep_cfg.board_mode)
 
     stats = prep_cfg.scaling_stats
     features = {}
@@ -751,6 +924,15 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
         features['ply_played_unscaled'] = raw.astype('float32')
         features['ply_played_scaled'] = _apply_stored_stats(raw, stats['ply_played'])
 
+    # Stockfish
+    if prep_cfg.sf_depth is not None:
+        raw = _stockfish_eval_fens(df[prep_cfg.fen_col].to_numpy(), prep_cfg.sf_depth)
+        winprob = cp_to_mover_winprob(raw)
+        features['stockfish_eval_unscaled'] = raw.astype('float32')
+        features['stockfish_eval_scaled'] = _apply_stored_stats(raw, stats['stockfish_eval'])
+        features['stockfish_winprob_unscaled'] = winprob.astype('float32')
+        features['stockfish_winprob_scaled'] = winprob.astype('float32')
+
     print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
 
     # Assemble, save, memory-map
@@ -759,7 +941,8 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
     os.makedirs(out_dir, exist_ok=True)
 
     fens = df[prep_cfg.fen_col].to_numpy()
-    _write_boards_and_tokens(out_dir, fens, desc='boards/tokens', chunk_size=chunk_size)
+    _write_boards_and_tokens(out_dir, fens, desc='boards/tokens', chunk_size=chunk_size,
+                              write_boards=write_boards, write_tokens=write_tokens)
 
     elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
         df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
@@ -771,6 +954,7 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
         encode_result_continuous(df[prep_cfg.mover_result_col]),
         n_elo_bins, bin_labels,
         df[prep_cfg.game_id_col].astype(str).tolist(), df[prep_cfg.fen_col].tolist(),
+        has_boards=write_boards, has_board_token_ids=write_tokens,
     )
     print(f'{n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
@@ -791,11 +975,13 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
 # CLASSES
 ####################
 
+# (a) DATA CONTAINERS
+
 @dataclass
 class SplitData:
     """Model inputs and targets for one split."""
-    boards: torch.Tensor
-    board_token_ids: torch.Tensor
+    boards: torch.Tensor | None
+    board_token_ids: torch.Tensor | None
     elo_mean_bin: torch.Tensor
     elo_self_bin: torch.Tensor
     elo_oppo_bin: torch.Tensor
@@ -808,7 +994,7 @@ class SplitData:
     fen: list
 
     def __len__(self) -> int:
-        return len(self.boards)
+        return len(self.result_class)
 
 
 @dataclass
@@ -831,4 +1017,13 @@ class PrepConfig:
     color_col: str | None = None
     ply_col: str | None = None
 
+    board_mode: str = 'both'
+    sf_depth: int | None = None
+
     scaling_stats: dict = field(default_factory=dict)
+
+
+# (b) STOCKFISH INTERNAL CONTROL FLOW
+
+class _StockfishTimeout(Exception):
+    """Raised when a single position's stockfish analysis exceeds ATTEMPT_TIMEOUT_SECONDS."""

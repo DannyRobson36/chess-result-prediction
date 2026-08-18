@@ -1,6 +1,7 @@
 """
 run_pos_reader.py
-Samples positions for one eda/train/val/test split, using metadata csv & pgn cache.
+Samples positions for one train/val/test/eda split, reading that split's game CSV and matching
+PGN cache from run_game_reader.py in lockstep.
 
 Sampling approach:
   For each game, sample floor((ply_count - MIN_PLIES_PLAYED + 1) / PLIES_PER_SAMPLE)
@@ -8,14 +9,14 @@ Sampling approach:
   [MIN_PLIES_PLAYED, ply_count - 1].
 
 Run:
-    !python data/run_pos_reader.py train
+    !python run_pos_reader.py train
 CLI:
     split        One of: eda, train, val, test. Required.
     --game-dir   Folder holding game_{split}_*.csv / pgn_{split}_*.pgn.zst. Default: GAME_DIR (config.py).
     --out-dir    Folder to write pos_{split}_{tag}.csv into. Default: POS_DIR (config.py).
 
 Latest changes: 18/08/26:
-- Initial commit 
+- Raised min plies in games used for sampling to match truth, reduced printing
 """
 
 import os
@@ -59,19 +60,20 @@ PLIES_PER_SAMPLE = 10
 # One position sampled per this-many eligible plies in a game, rounded down.
 
 RANDOM_SEED = 0
-# Ensures reproducible position selection.
+# Seed for position sampling.
 
-MIN_GAME_PLIES = MIN_PLIES_PLAYED + 1
-# Smallest ply_count a game needs to have at least one extractable ply.
+MIN_GAME_PLIES = MIN_PLIES_PLAYED + PLIES_PER_SAMPLE - 1
+# Smallest ply_count that can produce at least one sampled position.
 
 POSITION_BATCH_SIZE = 20_000
-# Games buffered before handing a batch to the worker pool. At this size a batch (PGN text
-# + metadata per game) is tens of MB at most, independent of split size.
+# Games buffered before handing a batch to the worker pool.
 
 SAMPLE_CHUNKSIZE = 64
 # imap chunksize for the parallel extraction pool.
 
 GC_EVERY_N_BATCHES = 50
+
+PROGRESS_EVERY_N_POSITIONS = 10_000_000
 
 NUM_WORKERS = os.cpu_count() or 1
 
@@ -160,7 +162,7 @@ def locate_split_files(split: str, game_dir: str) -> tuple[str, str]:
     return csv_path, pgn_path
 
 def _validate_csv_schema(csv_path: str) -> None:
-    """Checks the game CSV has every column this script depends on, before any real processing."""
+    """Checks the game CSV has every column this script depends on."""
     with open(csv_path, newline='', encoding='utf-8') as f:
         header = next(csv.reader(f))
     missing = set(GAME_CSV_REQUIRED_FIELDS) - set(header)
@@ -418,6 +420,7 @@ def run(csv_path: str, pgn_path: str, out_path: str) -> dict:
 
                 batch = []
                 n_batches = 0
+                last_progress_at = 0
                 for row, pgn_block in zip_longest(csv_reader, pgn_iter, fillvalue=_MISSING):
                     if row is _MISSING or pgn_block is _MISSING:
                         raise RuntimeError(
@@ -441,8 +444,10 @@ def run(csv_path: str, pgn_path: str, out_path: str) -> dict:
                         flush_batch(batch)
                         batch = []
                         n_batches += 1
-                        print(f'Games seen: {n_games:,}, eligible: {n_eligible:,}, '
-                              f'positions written: {n_written:,}, games skipped: {n_skipped:,}')
+                        if n_written - last_progress_at >= PROGRESS_EVERY_N_POSITIONS:
+                            print(f'Games seen: {n_games:,}, eligible: {n_eligible:,}, '
+                                  f'positions written: {n_written:,}, games skipped: {n_skipped:,}')
+                            last_progress_at = n_written
                         if n_batches % GC_EVERY_N_BATCHES == 0:
                             _release_memory()
 

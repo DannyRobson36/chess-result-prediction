@@ -3,7 +3,7 @@ run_game_reader.py
 Streams lichess dump months into windowed-history eda/train/val/test game CSVs, each with a matching PGN-only cache.
 
 Latest changes: 17/08/26:
-- Include insufficient material in termination types
+- Shrinkage changed to 2.0
 
 Run:
     !python run_game_reader.py
@@ -83,7 +83,7 @@ MAX_ELO = 2200
 HISTORY_MAX_GAMES = 10
 HISTORY_MAX_DAYS = 10
 PAST_PERF_WEIGHTS = list(range(HISTORY_MAX_GAMES, 0, -1))
-PAST_PERF_K = 0.0
+PAST_PERF_K = 2.0
 PRUNE_EVERY_N_GAMES = 500_000
 
 # PGN cache

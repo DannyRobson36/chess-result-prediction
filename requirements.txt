@@ -8,3 +8,4 @@ zstandard
 requests
 tqdm
 psutil
+duckdb

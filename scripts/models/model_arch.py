@@ -2,8 +2,8 @@
 model_arch.py
 Contains all models using PyTorch
 
-Latest changes: 10/08/26:
-- Prediction registries created for compatible training/inference with different models
+Latest changes: 18/08/26:
+- Added LogRegBaseline architecture and config
 """
 
 import torch
@@ -16,11 +16,12 @@ from scripts.models.model_support import (
     ChessCNN, Attention,
     RotaryAttention, FeedForward,
     build_pool, get_activation, resolve_active_features,
-    build_feature_embeds, embed_feature
+    build_feature_embeds, embed_feature, stack_raw_features
 )
 
 from scripts.models.model_config import (
     BaseModelConfig,
+    LogRegBaselineConfig,
     Maia2ValueBoardConfig, Maia2ValueFeatureConfig,
     Maia2ValueReplicaConfig, PureTransformerConfig
 )
@@ -30,6 +31,7 @@ from scripts.models.model_config import (
 ####################
 
 OUTPUT_TYPE_REGISTRY = {
+    "log_reg_baseline": "classification",
     "maia2_value_board": "regression",
     "maia2_value_replica": "regression",
     "maia2_value_feature": "classification",
@@ -52,7 +54,7 @@ def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None, two_way: boo
         if n_elo_bins is None:
             raise ValueError("maia2_value_replica requires n_elo_bins.")
         return {"n_elo_bins": n_elo_bins}
-    if arch_name in ("maia2_value_feature", "pure_transformer"):
+    if arch_name in ("maia2_value_feature", "pure_transformer", "log_reg_baseline"):
         if two_way is None:
             raise ValueError(f"{arch_name} requires two_way.")
         return {"n_result_classes": 2 if two_way else 3}
@@ -62,7 +64,25 @@ def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None, two_way: boo
 # CLASSES
 ####################
 
-# (a) CNN/ATTENTION BASED MODELS
+# (a) LOGISTIC REGRESSION (BASELINES)
+
+class LogRegBaseline(nn.Module):
+    """Plain logistic regression baseline: a single linear layer over raw scalar feature values."""
+    def __init__(self, cfg: LogRegBaselineConfig, n_result_classes: int = 3):
+        super().__init__()
+        if n_result_classes not in (2, 3):
+            raise ValueError(f"n_result_classes must be 2 or 3, got {n_result_classes}.")
+
+        self.cfg = cfg
+        self.feature_names = resolve_active_features(cfg.features)
+        self.linear = nn.Linear(len(self.feature_names), n_result_classes)
+
+    def forward(self, features: dict):
+        x = stack_raw_features(self.feature_names, features)
+        return self.linear(x)
+
+
+# (b) CNN/ATTENTION BASED MODELS
 
 class Maia2ValueBoard(nn.Module):
     """Elo-unaware ablation of Maia2ValueReplica."""
@@ -231,7 +251,7 @@ class Maia2ValueFeature(nn.Module):
         return value_logits
 
 
-# (b) PURE-TRANSFORMER MODELS
+# (c) PURE-TRANSFORMER MODELS
 
 class PureTransformer(nn.Module):
     """
@@ -326,6 +346,7 @@ class PureTransformer(nn.Module):
 # (a) MODEL BUILDING
 
 MODEL_REGISTRY: dict[str, tuple[type[nn.Module], type[BaseModelConfig]]] = {
+    "log_reg_baseline": (LogRegBaseline, LogRegBaselineConfig),
     "maia2_value_board": (Maia2ValueBoard, Maia2ValueBoardConfig),
     "maia2_value_replica": (Maia2ValueReplica, Maia2ValueReplicaConfig),
     "maia2_value_feature": (Maia2ValueFeature, Maia2ValueFeatureConfig),
@@ -377,6 +398,10 @@ def _batch_features(model: nn.Module, batch: dict) -> dict:
         raise KeyError(f"cfg.features asks for {missing}, which the batch does not contain.")
     return {name: batch[name] for name in model.feature_names}
 
+def predict_log_reg_baseline(model: nn.Module, batch: dict) -> torch.Tensor:
+    """Runs LogRegBaseline on a batch dict, returning its predictions."""
+    return model(_batch_features(model, batch))
+
 def predict_maia2_value_feature(model: nn.Module, batch: dict) -> torch.Tensor:
     """Runs Maia2ValueFeature on a batch dict, returning its predictions."""
     return model(batch["boards"], _batch_features(model, batch))
@@ -387,6 +412,7 @@ def predict_pure_transformer(model: nn.Module, batch: dict) -> torch.Tensor:
 
 
 PREDICT_REGISTRY: dict[str, Callable[[nn.Module, dict], torch.Tensor]] = {
+    "log_reg_baseline": predict_log_reg_baseline,
     "maia2_value_board": predict_maia2_value_board,
     "maia2_value_replica": predict_maia2_value_replica,
     "maia2_value_feature": predict_maia2_value_feature,

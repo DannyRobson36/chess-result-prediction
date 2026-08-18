@@ -3,7 +3,7 @@
 Project-wide hardcoded config for use across scripts.
 
 Latest changes: 14/08/26:
-- Added RESULTS_DIR
+- Added STOCKFISH_PATH
 """
 
 ####################
@@ -44,3 +44,9 @@ REPO_SCRIPTS_DIR = '/content/chess-result-prediction/scripts'
 ####################
 
 SEED = 0
+
+####################
+# Stockfish
+####################
+
+STOCKFISH_PATH = '/usr/games/stockfish'

@@ -2,15 +2,11 @@
 model_config.py
 Allows for configuration of model's parameters, depends on flexibility allowed in model_arch.py
 
-Latest changes: 10/08/26:
-- Dropout split into per-component fields, cnn_block_type added, defaults rescaled to one shared small preset
+Latest changes: 18/08/26:
+- Added LogRegBaselineConfig
 """
 
 from dataclasses import dataclass, field, asdict
-
-####################
-# FUNCTIONS
-####################
 
 ####################
 # CLASSES
@@ -24,7 +20,16 @@ class BaseModelConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
-# (a) CNN/ATTENTION BASED MODELS - CONFIG
+# (a) LOGISTIC REGRESSION (BASELINES) - CONFIG
+
+@dataclass
+class LogRegBaselineConfig(BaseModelConfig):
+    """Config for LogRegBaseline: plain logistic regression over raw scalar feature values."""
+    arch_name: str = "log_reg_baseline"
+
+    features: dict = field(default_factory=dict)
+
+# (b) CNN/ATTENTION BASED MODELS - CONFIG
 
 @dataclass
 class Maia2ValueBoardConfig(BaseModelConfig):
@@ -124,7 +129,7 @@ class Maia2ValueFeatureConfig(BaseModelConfig):
     value_dropout: float = 0.1
 
 
-# (b) PURE-TRANSFORMER MODELS - CONFIG
+# (c) PURE-TRANSFORMER MODELS - CONFIG
 
 @dataclass
 class PureTransformerConfig(BaseModelConfig):

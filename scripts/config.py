@@ -3,7 +3,7 @@
 Project-wide hardcoded config for use across scripts.
 
 Latest changes: 14/08/26:
-- Added STOCKFISH_PATH
+- Added PREDICTIONS_DIR
 """
 
 ####################
@@ -19,18 +19,14 @@ TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train'
 VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val'
 TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test'
 RESULTS_DIR = '/content/drive/MyDrive/drive_diss/data/results'
+CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints'
+PREDICTIONS_DIR = '/content/drive/MyDrive/drive_diss/data/predictions'
 
 ####################
 # Local Disk - Colab session 
 ####################
 
 LOCAL_SPLITS_DIR = '/content/prepared_splits'
-
-####################
-# Checkpoints
-####################
-
-CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints'
 
 ####################
 # Git Dir

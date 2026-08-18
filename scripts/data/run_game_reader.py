@@ -3,7 +3,7 @@ run_game_reader.py
 Streams lichess dump months into windowed-history eda/train/val/test game CSVs, each with a matching PGN-only cache.
 
 Latest changes: 17/08/26:
-- Initial commit
+- Include insufficient material in termination types
 
 Run:
     !python run_game_reader.py
@@ -73,7 +73,7 @@ REMOVE_BOTS = True
 
 # Output-quality filters
 MIN_PLIES = 12
-TERMINATIONS = ['Normal', 'Time forfeit']
+TERMINATIONS = ['Normal', 'Time forfeit', 'Insufficient material']
 VALID_CLOCK = True
 TAILS = True
 MIN_ELO = 800

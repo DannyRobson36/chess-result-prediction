@@ -4,7 +4,7 @@ Streams one month's unfiltered game CSV row by row, applying domain and output f
 computing full per-lag past-performance history for past-perf-metric EDA.
 
 Latest changes: 17/08/26:
-- Rewritten to stream row-by-row to avoid RAM crashes
+- Include insufficient material in termination types
 
 Run:
     !python run_history_reader.py --date 2026-01
@@ -46,7 +46,7 @@ REMOVE_BOTS = True
 
 # Output-quality filters
 MIN_PLIES = 12
-TERMINATIONS = ['Normal', 'Time forfeit']
+TERMINATIONS = ['Normal', 'Time forfeit', 'Insufficient material']
 VALID_CLOCK = True
 TAILS = True
 MIN_ELO = 800

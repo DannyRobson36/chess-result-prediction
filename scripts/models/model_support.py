@@ -2,8 +2,8 @@
 model_support.py
 Building blocks for models
 
-Latest changes: 10/08/26:
-- Initial commit
+Latest changes: 18/08/26:
+- Added stack_raw_features for scalar feature inputs
 """
 
 import torch
@@ -95,6 +95,12 @@ def embed_feature(feature_embeds: nn.ModuleDict, name: str, val: torch.Tensor) -
     if _is_binary_feature(name):
         return feature_embeds[name](val.long()).unsqueeze(1)
     return feature_embeds[name](val.unsqueeze(-1)).unsqueeze(1)
+
+# (c) RAW FEATURE STACKING
+
+def stack_raw_features(feature_names: list[str], features: dict) -> torch.Tensor:
+    """Stacks each named feature's raw per-row scalar value into one (b, n_features) tensor."""
+    return torch.stack([features[name].float() for name in feature_names], dim=1)
 
 ####################
 # CLASSES

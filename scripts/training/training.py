@@ -2,8 +2,8 @@
 training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
-Latest changes: 15/08/26:
-- Adam betas/eps made explicit constants
+Latest changes: 18/08/26:
+- make_batch allows for non-present board inputs
 """
 
 import os
@@ -92,12 +92,14 @@ def iterate_batches(idx: np.ndarray, batch_size: int, shuffle: bool = True,
 def make_batch(split: SplitData, idx: np.ndarray, device: torch.device) -> dict:
     """Slices split at idx, moves to device, and casts compressed storage dtypes to what PyTorch ops expect."""
     batch = {
-        "boards": split.boards[idx].to(device).float(),
-        "board_token_ids": split.board_token_ids[idx].to(device).long(),
         "elo_mean_bin": split.elo_mean_bin[idx].to(device).long(),
         "elo_self_bin": split.elo_self_bin[idx].to(device).long(),
         "elo_oppo_bin": split.elo_oppo_bin[idx].to(device).long(),
     }
+    if split.boards is not None:
+        batch["boards"] = split.boards[idx].to(device).float()
+    if split.board_token_ids is not None:
+        batch["board_token_ids"] = split.board_token_ids[idx].to(device).long()
     for name, tensor in split.features.items():
         batch[name] = tensor[idx].to(device)
     return batch

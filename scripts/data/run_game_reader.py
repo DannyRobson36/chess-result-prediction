@@ -3,7 +3,7 @@ run_game_reader.py
 Streams lichess dump months into windowed-history eda/train/val/test game CSVs, each with a matching PGN-only cache.
 
 Latest changes: 17/08/26:
-- Shrinkage changed to 2.0
+- EDA size reduced to avoid having to download Dec-25 dump
 
 Run:
     !python run_game_reader.py
@@ -90,7 +90,7 @@ PRUNE_EVERY_N_GAMES = 500_000
 PGN_CACHE_COMPRESSION_LEVEL = 9
 
 # Date ranges, 'YYYY-MM-DD', inclusive both ends. None: skips that split.
-EDA_FROM, EDA_TO = '2026-01-01', '2026-01-31'
+EDA_FROM, EDA_TO = '2026-01-11', '2026-01-31'
 TRAIN_FROM, TRAIN_TO = '2026-02-01', '2026-04-30'
 VAL_FROM, VAL_TO = '2026-05-01', '2026-05-15'
 TEST_FROM, TEST_TO = '2026-05-16', '2026-05-31'

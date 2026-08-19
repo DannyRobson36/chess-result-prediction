@@ -2,16 +2,17 @@
 utils_data.py
 Data-process helpers, including reading/outputting csvs
 
-Latest changes: 07/08/26:
-- Initial commit
+Latest changes: 19/08/26:
+- read_csv takes inclusive start_date/end_date, added df-length printer
 """
 
 import os
 import time
 
+import numpy as np
 import pandas as pd
 
-from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover
+from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_edges, elo_bin_labels
 
 ####################
 # FUNCTIONS
@@ -21,16 +22,16 @@ from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover
 
 def read_csv(path: str, max_size_gb: float, nrows: int | None = None, dtype: dict | None = None,
              parse_dates: list[str] | None = ['datetime'], usecols: list[str] | None = None,
-             from_date: str | None = None, to_date: str | None = None,
+             start_date: str | None = None, end_date: str | None = None,
              datetime_col: str = 'datetime', chunksize: int = 500_000) -> pd.DataFrame:
-    """Reads a csv with a file-size guard, optionally filtered to a date range via chunked reads."""
+    """Reads a csv with a file-size guard, optionally filtered to an inclusive datetime_col range via chunked reads."""
     if not os.path.exists(path):
         raise FileNotFoundError(f'No file found at {path}')
     size_gb = os.path.getsize(path) / (1024 ** 3)
     if size_gb > max_size_gb:
         raise MemoryError(f'File is {size_gb:.2f} GB, exceeds max_size_gb={max_size_gb}.')
 
-    if from_date is None and to_date is None:
+    if start_date is None and end_date is None:
         df = pd.read_csv(path, nrows=nrows, dtype=dtype, parse_dates=parse_dates,
                           usecols=usecols, low_memory=False)
         mem_mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
@@ -42,8 +43,8 @@ def read_csv(path: str, max_size_gb: float, nrows: int | None = None, dtype: dic
     if usecols is not None and datetime_col not in usecols:
         raise ValueError(f"datetime_col='{datetime_col}' must be in usecols to filter by date.")
 
-    from_ts = pd.Timestamp(from_date) if from_date is not None else None
-    to_ts = pd.Timestamp(to_date) if to_date is not None else None
+    start_ts = pd.Timestamp(start_date) if start_date is not None else None
+    end_ts = pd.Timestamp(end_date) if end_date is not None else None
 
     chunks = []
     rows_read = 0
@@ -51,10 +52,10 @@ def read_csv(path: str, max_size_gb: float, nrows: int | None = None, dtype: dic
                               low_memory=False, chunksize=chunksize):
         rows_read += len(chunk)
         mask = pd.Series(True, index=chunk.index)
-        if from_ts is not None:
-            mask &= chunk[datetime_col] >= from_ts
-        if to_ts is not None:
-            mask &= chunk[datetime_col] < to_ts
+        if start_ts is not None:
+            mask &= chunk[datetime_col] >= start_ts
+        if end_ts is not None:
+            mask &= chunk[datetime_col] <= end_ts
         if mask.any():
             chunks.append(chunk[mask])
         if nrows is not None and rows_read >= nrows:
@@ -65,9 +66,9 @@ def read_csv(path: str, max_size_gb: float, nrows: int | None = None, dtype: dic
         df = df.iloc[:nrows]
 
     mem_mb = df.memory_usage(deep=True).sum() / (1024 ** 2)
-    from_str = from_date or '-inf'
-    to_str = to_date or '+inf'
-    range_str = f'[{from_str}, {to_str})'
+    start_str = start_date or '-inf'
+    end_str = end_date or '+inf'
+    range_str = f'[{start_str}, {end_str}]'
     print(f'Loaded {len(df):,} rows x {len(df.columns)} cols, ~{mem_mb:.1f} MB in memory '
           f'(datetime in {range_str}, scanned {rows_read:,} rows).')
     return df
@@ -112,6 +113,36 @@ def wait_for_file(path: str, expected_size: int | None = None, timeout: int = 30
         time.sleep(poll_interval)
 
     raise TimeoutError(f'Gave up waiting for {path} after {timeout}s')
+
+
+def count_rows(path: str, by_elo_bin: bool = False, mover_elo_col: str = 'mover_elo',
+                oppo_elo_col: str = 'opponent_elo', cfg: EloBinConfig = ELO_BINS,
+                chunksize: int = 500_000) -> None:
+    """Streams path in chunks, printing total row count and optionally counts per mean-elo bin."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'No file found at {path}')
+
+    usecols = [mover_elo_col, oppo_elo_col] if by_elo_bin else None
+    edges = elo_bin_edges(cfg)
+    labels = elo_bin_labels(edges)
+    bin_counts = np.zeros(len(labels), dtype='int64') if by_elo_bin else None
+
+    total_rows = 0
+    for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize, low_memory=False):
+        total_rows += len(chunk)
+        if by_elo_bin:
+            mean_elo = (chunk[mover_elo_col] + chunk[oppo_elo_col]) / 2
+            elo_bin = pd.cut(mean_elo, bins=edges, labels=False, right=False)
+            if elo_bin.isna().any():
+                raise ValueError(f'{elo_bin.isna().sum()} rows handled incorrectly - null.')
+            bin_counts += np.bincount(elo_bin.astype('int64'), minlength=len(labels))
+
+    print(f'{total_rows:,} rows in {path}')
+    if by_elo_bin:
+        print()
+        print('Rows by mean-elo bin:')
+        for label, count in zip(labels, bin_counts):
+            print(f'  {label}: {int(count):,}')
 
 
 # (b) DATA SAMPLING/ALTERING 

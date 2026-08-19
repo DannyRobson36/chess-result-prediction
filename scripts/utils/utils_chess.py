@@ -2,8 +2,8 @@
 utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
-Latest changes: 07/08/26:
-- Added elo-binning, elo-gap restriction and result encoding/decoding
+Latest changes: 19/08/26:
+- Added fixed player-title vocabulary and encoding
 """
 
 import numpy as np
@@ -41,6 +41,28 @@ GAP_BIN_WIDTH = 10
 # Result encoding
 RESULT_TO_CLASS = {0.0: 0, 0.5: 1, 1.0: 2} 
 RESULT_CLASS_NAMES = ['loss', 'draw', 'win']
+
+# Title encoding. Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
+# lichess.org/qa/4451), rather than fit from train data, since it's a small, effectively
+# closed set. 'no_title' matches the label run_pos_storage.py substitutes for the raw 'None'
+# sentinel; 'unk' is a safety net for any value outside this vocabulary.
+TITLE_TO_IDX = {
+    'no_title': 0,
+    'GM': 1,
+    'WGM': 2,
+    'IM': 3,
+    'WIM': 4,
+    'FM': 5,
+    'WFM': 6,
+    'CM': 7,
+    'WCM': 8,
+    'NM': 9,
+    'WNM': 10,
+    'LM': 11,
+    'BOT': 12,
+    'unk': 13,
+}
+TITLE_VOCAB_SIZE = len(TITLE_TO_IDX)
 
 ####################
 # FUNCTIONS
@@ -372,3 +394,11 @@ def encode_result_class(mover_result: pd.Series) -> torch.Tensor:
 def decode_result_class(class_idx: np.ndarray | torch.Tensor | list[int]) -> list[str]:
     """Maps class indices (0/1/2) back to result names (loss/draw/win)."""
     return [RESULT_CLASS_NAMES[int(c)] for c in class_idx]
+
+
+# (g) TITLE ENCODING
+
+def encode_title_idx(title: pd.Series) -> np.ndarray:
+    """Maps a title Series to TITLE_TO_IDX indices as a plain int64 array. Any value outside
+    TITLE_TO_IDX, including NaN, falls back to the 'unk' index."""
+    return title.map(TITLE_TO_IDX).fillna(TITLE_TO_IDX['unk']).to_numpy(dtype='int64')

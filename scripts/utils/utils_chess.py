@@ -3,7 +3,7 @@ utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
 Latest changes: 19/08/26:
-- Added fixed player-title vocabulary and encoding
+- Commenting conciseness fix
 """
 
 import numpy as np
@@ -42,10 +42,7 @@ GAP_BIN_WIDTH = 10
 RESULT_TO_CLASS = {0.0: 0, 0.5: 1, 1.0: 2} 
 RESULT_CLASS_NAMES = ['loss', 'draw', 'win']
 
-# Title encoding. Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
-# lichess.org/qa/4451), rather than fit from train data, since it's a small, effectively
-# closed set. 'no_title' matches the label run_pos_storage.py substitutes for the raw 'None'
-# sentinel; 'unk' is a safety net for any value outside this vocabulary.
+# Title encoding. Fixed vocabulary matching Lichess's title set 
 TITLE_TO_IDX = {
     'no_title': 0,
     'GM': 1,

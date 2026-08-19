@@ -2,8 +2,8 @@
 utils_eval.py
 Model-independent evaluation helpers: baselines, per-row metrics, binned accuracy, calibration.
 
-Latest changes: 08/08/26:
-- Initial commit
+Latest changes: 19/08/26:
+- Added collapse_to_expected_score and binary_probit_prediction_cols
 """
 
 import numpy as np
@@ -242,7 +242,9 @@ def _binary_probit_probs(preds: torch.Tensor, c: torch.Tensor, sigma: torch.Tens
 
 
 def fit_binary_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 200) -> tuple[float, float]:
-    """Fits a single cutpoint to convert scalar predictions to W/L probabilities."""
+    """Fits a single cutpoint to convert scalar predictions to W/L probabilities. targets must be
+    decisive (hard 0/1 win/loss labels, draws excluded) -- a continuous draw-inclusive target is not
+    a valid input here, since a single scalar cannot distinguish a confident draw from a 50/50 toss-up."""
     preds_t = torch.as_tensor(preds, dtype=torch.float32)
     targets_t = torch.as_tensor(targets, dtype=torch.long)
     target_idx = 1 - targets_t  # TWO_WAY_CLASS_NAMES is loss=0/win=1; probs are win-first
@@ -268,3 +270,23 @@ def apply_binary_probit(preds: np.ndarray, params: tuple[float, float]) -> np.nd
     probs = _binary_probit_probs(torch.as_tensor(preds, dtype=torch.float32),
                                   torch.tensor(c), torch.tensor(sigma))
     return probs.detach().numpy()
+
+
+def collapse_to_expected_score(probs: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Collapses (loss, draw, win)-ordered 3-way probabilities into a single continuous expected
+    score (win=1, draw=0.5, loss=0), matching the Elo/Maia2/Stockfish-eval convention."""
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().numpy()
+    return probs[:, 2] + 0.5 * probs[:, 1]
+
+
+def binary_probit_prediction_cols(raw_scores: np.ndarray, probit_params: tuple[float, float]) -> dict:
+    """Returns prob_win/prob_draw/prob_loss/predicted_class from raw scalar scores under a fitted
+    binary probit. prob_draw is always 0.0, since a single scalar carries no draw information."""
+    probs = apply_binary_probit(raw_scores, probit_params)
+    prob_win = probs[:, 0]
+    prob_loss = probs[:, 1]
+    prob_draw = np.zeros_like(prob_win)
+    predicted_class = np.where(prob_win >= 0.5, 'win', 'loss')
+    return {'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
+            'predicted_class': predicted_class}

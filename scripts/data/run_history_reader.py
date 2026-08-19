@@ -3,8 +3,8 @@ run_history_reader.py
 Streams one month's unfiltered game CSV row by row, applying domain and output filters and
 computing full per-lag past-performance history for past-perf-metric EDA.
 
-Latest changes: 17/08/26:
-- Include insufficient material in termination types
+Latest changes: 19/08/26:
+- Fixed upstream script name in error message
 
 Run:
     !python run_history_reader.py --date 2026-01
@@ -354,9 +354,9 @@ def main(argv: list[str] | None = None) -> None:
     output_path = os.path.join(args.out_dir, f'game_history_{args.date}.csv')
 
     if not os.path.exists(input_path):
-        sys.exit(f'No input file at {input_path} -- run run_reader_unfiltered.py --date {args.date} first.')
+        sys.exit(f'No input file at {input_path} -- run run_unfiltered_reader.py --date {args.date} first.')
     if os.path.getsize(input_path) == 0:
-        sys.exit(f"{input_path} is empty (0 bytes) -- run_reader_unfiltered.py likely didn't complete "
+        sys.exit(f"{input_path} is empty (0 bytes) -- run_unfiltered_reader.py likely didn't complete "
                   f'for {args.date}. Check its output for errors and rerun it for this month.')
 
     print(f'Reading: {input_path}')

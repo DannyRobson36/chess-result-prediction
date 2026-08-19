@@ -1,10 +1,10 @@
 """
 grid_search.py
-Cartesian-searches model and training config grids for one or more architectures on prepared splits,
-via run_training, ranking parameter influence on val loss and on per-epoch runtime.
+Cartesian-searches model and training config grids for one fixed architecture on prepared
+splits, via run_training, ranking parameter influence on val loss and on per-epoch runtime.
 
-Latest changes: 15/08/26:
-- Added a second influence table, ranking params by effect on per-epoch runtime
+Latest changes: 19/08/26:
+- Moved arch_name outside the grid
 """
 
 import time
@@ -15,16 +15,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts.features.features import SplitData, detect_two_way
-from scripts.models.model_arch import MODEL_REGISTRY, build_model
+from scripts.features.features import SplitData
+from scripts.models.model_arch import MODEL_REGISTRY, build_model, get_output_type
 from scripts.training.training import TrainConfig, get_device, set_seed, probe_idx, run_training
 from scripts.utils.utils_eval import metric_mode, is_better
-
-####################
-# CONSTANTS
-####################
-
-COMBO_METRIC_KEYS = ("loss", "accuracy", "macro_f1")
 
 ####################
 # FUNCTIONS
@@ -154,6 +148,7 @@ def _param_influence_table(rows: list[dict], combined_grid: dict, fixed_groups: 
 def grid_search(
     train: SplitData,
     val: SplitData,
+    arch_name: str,
     cfg_grid: dict,
     train_grid: dict | None = None,
     fixed_groups: list[tuple] | None = None,
@@ -162,17 +157,18 @@ def grid_search(
     device: torch.device | None = None,
     verbose: int = 1,
 ) -> dict:
-    """Cartesian-searches cfg_grid x train_grid via run_training, defaulting anything not swept to its config class's own field default; returns the best combo, results table, and parameter-influence rankings."""
+    """Cartesian-searches cfg_grid x train_grid for arch_name via run_training, defaulting anything
+    not swept to its config class's own field default; returns the best combo, results table, and
+    parameter-influence rankings."""
     t_start = time.time()
     device = device or get_device()
     train_grid = train_grid or {}
 
-    if "arch_name" not in cfg_grid:
-        raise ValueError("cfg_grid must include 'arch_name' (a list of one or more registered architecture names).")
-    unknown_archs = [a for a in cfg_grid["arch_name"] if a not in MODEL_REGISTRY]
-    if unknown_archs:
-        raise ValueError(f"cfg_grid['arch_name'] contains unregistered architecture(s) {unknown_archs}, "
-                          f"choose from {list(MODEL_REGISTRY)}.")
+    if arch_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(MODEL_REGISTRY)}.")
+    _, cfg_cls = MODEL_REGISTRY[arch_name]
+    output_type = get_output_type(arch_name)
+    combo_metric_keys = ["loss", "accuracy", "macro_f1"] if output_type == "classification" else ["loss"]
 
     overlap = set(cfg_grid) & set(train_grid)
     if overlap:
@@ -182,7 +178,6 @@ def grid_search(
         raise ValueError("train_grid cannot sweep 'primary_metric', since combos would then be "
                           "compared against different, non-comparable target metrics.")
 
-    two_way = detect_two_way(train, val)
     combined_grid = {**cfg_grid, **train_grid}
     combos = _grid_combinations(combined_grid, fixed_groups)
     primary_metric = TrainConfig().primary_metric
@@ -190,8 +185,7 @@ def grid_search(
 
     if verbose >= 1:
         print(f"Running on: {device}")
-        mode_str = "two-way (win/loss only)" if two_way else "three-way (win/draw/loss)"
-        print(f"Detected task mode: {mode_str}")
+        print(f"Architecture: {arch_name} ({output_type})")
         print(f"Grid search: {len(combos)} combo(s) to run.")
 
     train_probe_idx = probe_idx(train, probe_size, seed=0)
@@ -205,25 +199,22 @@ def grid_search(
         cfg_overrides = {k: v for k, v in combo.items() if k in cfg_grid}
         train_overrides = {k: v for k, v in combo.items() if k in train_grid}
 
-        arch_name = cfg_overrides.pop("arch_name")
-        _, cfg_cls = MODEL_REGISTRY[arch_name]
         model_cfg = cfg_cls(**cfg_overrides)
         train_cfg = TrainConfig(**{**train_overrides, "verbose": (verbose == 2)})
 
         if verbose >= 1:
-            print(f"\n[combo {i + 1}/{len(combos)}] arch={arch_name}  "
-                  f"cfg={cfg_overrides}  train={train_overrides}")
+            print(f"\n[combo {i + 1}/{len(combos)}]  cfg={cfg_overrides}  train={train_overrides}")
 
         set_seed(train_cfg.seed)
-        model = build_model(arch_name, model_cfg, n_elo_bins=train.n_elo_bins, two_way=two_way)
+        model = build_model(arch_name, model_cfg, n_elo_bins=train.n_elo_bins)
 
         combo_start = time.time()
-        result = run_training(model, arch_name, train, val, train_cfg, two_way=two_way,
+        result = run_training(model, arch_name, train, val, train_cfg,
                                train_probe_idx=train_probe_idx, val_probe_idx=val_probe_idx, device=device)
         combo_runtime = time.time() - combo_start
 
         best_idx = result["best_epoch"] - 1
-        combo_metrics = {k: result["history"][f"val_{k}"][best_idx] for k in COMBO_METRIC_KEYS}
+        combo_metrics = {k: result["history"][f"val_{k}"][best_idx] for k in combo_metric_keys}
         n_epochs_run = len(result["history"]["train_loss"])
         time_per_epoch = combo_runtime / n_epochs_run
 
@@ -289,8 +280,7 @@ def grid_search(
         "best_model_cfg": best_model_cfg,
         "best_train_cfg": best_train_cfg,
         "best_result": best_result,
-        "arch_name": best_model_cfg.arch_name,
-        "two_way": two_way,
+        "arch_name": arch_name,
         "total_time": total_time,
         "device": device,
     }

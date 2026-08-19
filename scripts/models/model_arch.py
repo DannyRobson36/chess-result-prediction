@@ -2,8 +2,8 @@
 model_arch.py
 Contains all models using PyTorch
 
-Latest changes: 18/08/26:
-- Added LogRegBaseline architecture and config
+Latest changes: 19/08/26:
+- Removed two_way from get_model_kwargs/build_model
 """
 
 import torch
@@ -48,16 +48,14 @@ def get_output_type(arch_name: str) -> str:
         raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(OUTPUT_TYPE_REGISTRY)}")
     return OUTPUT_TYPE_REGISTRY[arch_name]
 
-def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None, two_way: bool | None = None) -> dict:
+def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None) -> dict:
     """Returns the extra constructor kwargs (beyond cfg) that arch_name needs."""
     if arch_name == "maia2_value_replica":
         if n_elo_bins is None:
             raise ValueError("maia2_value_replica requires n_elo_bins.")
         return {"n_elo_bins": n_elo_bins}
     if arch_name in ("maia2_value_feature", "pure_transformer", "log_reg_baseline"):
-        if two_way is None:
-            raise ValueError(f"{arch_name} requires two_way.")
-        return {"n_result_classes": 2 if two_way else 3}
+        return {"n_result_classes": 3}
     return {}
 
 ####################
@@ -365,8 +363,7 @@ def _validate_model_registry() -> None:
 
 _validate_model_registry()
 
-def build_model(arch_name: str, cfg: BaseModelConfig,
-                 n_elo_bins: int | None = None, two_way: bool | None = None) -> nn.Module:
+def build_model(arch_name: str, cfg: BaseModelConfig, n_elo_bins: int | None = None) -> nn.Module:
     """Builds a model by arch_name from MODEL_REGISTRY, using cfg plus any data-derived kwargs it needs."""
     if arch_name not in MODEL_REGISTRY:
         raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(MODEL_REGISTRY)}")
@@ -377,7 +374,7 @@ def build_model(arch_name: str, cfg: BaseModelConfig,
     if cfg.arch_name != arch_name:
         raise ValueError(f"cfg.arch_name is '{cfg.arch_name}' but build_model was called with arch_name='{arch_name}'.")
 
-    extra_kwargs = get_model_kwargs(arch_name, n_elo_bins, two_way)
+    extra_kwargs = get_model_kwargs(arch_name, n_elo_bins)
     return model_cls(cfg, **extra_kwargs)
 
 # (b) MODEL INFERENCE

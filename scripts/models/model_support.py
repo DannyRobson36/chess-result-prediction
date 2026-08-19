@@ -2,13 +2,15 @@
 model_support.py
 Building blocks for models
 
-Latest changes: 18/08/26:
-- Added stack_raw_features for scalar feature inputs
+Latest changes: 19/08/26:
+- Added shared-embedding categorical feature path for title
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from scripts.utils.utils_chess import TITLE_VOCAB_SIZE
 
 ####################
 # CONSTANTS
@@ -23,7 +25,10 @@ ACTIVATION_REGISTRY = {
 BINARY_BASE_NAMES = {
     "inc_flag", "total_length_flag", "mover_is_white",
     "has_history_mover", "has_history_opponent",
+    "new_player_mover", "new_player_opponent",
 }
+
+CATEGORICAL_BASE_NAMES = {"mover_title", "opponent_title"}
 
 ####################
 # FUNCTIONS
@@ -82,17 +87,30 @@ def _is_binary_feature(name: str) -> bool:
     return name.rsplit("_", 1)[0] in BINARY_BASE_NAMES
 
 
+def _is_categorical_feature(name: str) -> bool:
+    """True if name's base is a multi-class categorical feature."""
+    return name.rsplit("_", 1)[0] in CATEGORICAL_BASE_NAMES
+
+
 def build_feature_embeds(feature_names: list[str], dim_vit: int) -> nn.ModuleDict:
-    """Returns one embedding module per feature: Embedding(2, dim_vit) for binaries, Linear(1, dim_vit) for continuous."""
-    return nn.ModuleDict({
-        name: (nn.Embedding(2, dim_vit) if _is_binary_feature(name) else nn.Linear(1, dim_vit))
-        for name in feature_names
-    })
+    """Returns one embedding/linear module per feature; mover/opponent title share one embedding."""
+    embeds = {}
+    title_embed = None
+    for name in feature_names:
+        if _is_categorical_feature(name):
+            if title_embed is None:
+                title_embed = nn.Embedding(TITLE_VOCAB_SIZE, dim_vit)
+            embeds[name] = title_embed
+        elif _is_binary_feature(name):
+            embeds[name] = nn.Embedding(2, dim_vit)
+        else:
+            embeds[name] = nn.Linear(1, dim_vit)
+    return nn.ModuleDict(embeds)
 
 
 def embed_feature(feature_embeds: nn.ModuleDict, name: str, val: torch.Tensor) -> torch.Tensor:
     """Embeds one feature column into a (b, 1, dim_vit) token."""
-    if _is_binary_feature(name):
+    if _is_binary_feature(name) or _is_categorical_feature(name):
         return feature_embeds[name](val.long()).unsqueeze(1)
     return feature_embeds[name](val.unsqueeze(-1)).unsqueeze(1)
 

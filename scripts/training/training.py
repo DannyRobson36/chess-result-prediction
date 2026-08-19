@@ -2,8 +2,8 @@
 training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
-Latest changes: 18/08/26:
-- make_batch allows for non-present board inputs
+Latest changes: 19/08/26:
+- Removed two_way, checkpoints now store temperature + probit_params, fit from val/val_wl
 """
 
 import os
@@ -16,10 +16,13 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report
 
-from scripts.features.features import SplitData, PrepConfig, class_names_for_mode, remap_targets
+from scripts.features.features import SplitData, PrepConfig
 from scripts.models.model_arch import get_output_type, get_predict_fn
 from scripts.models.model_config import BaseModelConfig
-from scripts.utils.utils_eval import metric_mode, is_better, fit_temperature, fit_binary_temperature
+from scripts.utils.utils_chess import RESULT_CLASS_NAMES
+from scripts.utils.utils_eval import (
+    metric_mode, is_better, fit_temperature, fit_binary_probit, collapse_to_expected_score,
+)
 
 ####################
 # CONSTANTS
@@ -110,11 +113,10 @@ def probe_idx(split: SplitData, n: int, seed: int = 0) -> np.ndarray:
     n = min(n, len(split))
     return rng.choice(len(split), size=n, replace=False)
 
-def get_targets(split: SplitData, batch_idx: np.ndarray, output_type: str,
-                  two_way: bool, device: torch.device) -> torch.Tensor:
+def get_targets(split: SplitData, batch_idx: np.ndarray, output_type: str, device: torch.device) -> torch.Tensor:
     """Returns the target tensor matching output_type, sliced at batch_idx and moved to device."""
     if output_type == "classification":
-        return remap_targets(split.result_class[batch_idx], two_way).to(device).long()
+        return split.result_class[batch_idx].to(device).long()
     return split.result_cont[batch_idx].to(device)
 
 # (c) LOSS & SCHEDULER
@@ -184,7 +186,7 @@ def _resolve_warmup_steps(warmup_prop: float | None, n_train: int, batch_size: i
 # (f) TRAIN & EVALUATE ONE EPOCH
 
 def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimizer, split: SplitData,
-                     idx: np.ndarray, output_type: str, two_way: bool = False, batch_size: int = 64,
+                     idx: np.ndarray, output_type: str, batch_size: int = 64,
                      seed: int | None = None, device: torch.device | None = None, drop_last: bool = True,
                      bin_weights: torch.Tensor | None = None, grad_clip_norm: float | None = None,
                      warmup_steps: int | None = None, base_lr: float | None = None,
@@ -198,7 +200,7 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
             apply_warmup_lr(optimizer, base_lr, step_counter[0], warmup_steps)
 
         batch = make_batch(split, batch_idx, device)
-        targets = get_targets(split, batch_idx, output_type, two_way, device)
+        targets = get_targets(split, batch_idx, output_type, device)
 
         optimizer.zero_grad()
         preds = predict_fn(model, batch)
@@ -216,13 +218,9 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
             step_counter[0] += 1
 
 def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: np.ndarray, loss_fn: nn.Module,
-                        output_type: str, two_way: bool = False, class_names: list[str] | None = None,
+                        output_type: str, class_names: list[str] | None = None,
                         batch_size: int = 64, device: torch.device | None = None) -> dict:
-    """Evaluates a model on idx: loss, accuracy, and macro_f1 (regression uses sigmoid(logit) >= 0.5 as the class)."""
-    if output_type == "regression" and not two_way:
-        raise ValueError("Regression-output architectures are only valid for two-way (no-draw) data; "
-                          "got two_way=False, so split.result_cont is not guaranteed to be pure {0.0, 1.0}.")
-
+    """Evaluates a model on idx: loss, plus accuracy and macro_f1 for classification only."""
     device = device or get_device()
     predict_fn = get_predict_fn(arch_name)
     model.eval()
@@ -231,7 +229,7 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
-            targets = get_targets(split, batch_idx, output_type, two_way, device)
+            targets = get_targets(split, batch_idx, output_type, device)
             preds = predict_fn(model, batch)
             per_sample = loss_fn(preds, targets)
 
@@ -241,30 +239,31 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
             if output_type == "classification":
                 all_preds.append(preds.argmax(dim=1).cpu())
                 all_targets.append(targets.cpu())
-            else:
-                all_preds.append((torch.sigmoid(preds) >= 0.5).long().cpu())
-                all_targets.append(targets.long().cpu())
 
     metrics = {"loss": total_loss / total_n}
-    if class_names is None:
-        class_names = class_names_for_mode(two_way)
-    preds_arr = torch.cat(all_preds).numpy()
-    targs_arr = torch.cat(all_targets).numpy()
-    report = classification_report(targs_arr, preds_arr, labels=list(range(len(class_names))),
-                                    target_names=class_names, output_dict=True, zero_division=0)
-    metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
-    metrics["macro_f1"] = report["macro avg"]["f1-score"]
+    if output_type == "classification":
+        if class_names is None:
+            class_names = RESULT_CLASS_NAMES
+        preds_arr = torch.cat(all_preds).numpy()
+        targs_arr = torch.cat(all_targets).numpy()
+        report = classification_report(targs_arr, preds_arr, labels=list(range(len(class_names))),
+                                        target_names=class_names, output_dict=True, zero_division=0)
+        metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
+        metrics["macro_f1"] = report["macro avg"]["f1-score"]
     return metrics
 
 # (g) FULL TRAINING LOOP
 
 def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitData, cfg: "TrainConfig",
-                  two_way: bool = False, train_probe_idx: np.ndarray | None = None,
+                  train_probe_idx: np.ndarray | None = None,
                   val_probe_idx: np.ndarray | None = None, device: torch.device | None = None) -> dict:
     """Trains with early stopping on cfg.primary_metric; returns history and best epoch (1-indexed) weights."""
     device = device or get_device()
     model = model.to(device)
     output_type = get_output_type(arch_name)
+    if output_type == "regression" and cfg.primary_metric != "loss":
+        raise ValueError(f"cfg.primary_metric='{cfg.primary_metric}' is not available for regression "
+                          f"architectures, which only report loss; set cfg.primary_metric='loss'.")
     mode = metric_mode(cfg.primary_metric)
 
     loss_name = resolve_loss_name(output_type, cfg.loss_name)
@@ -275,7 +274,7 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     bin_weights = _resolve_bin_weights(train, cfg, device)
     warmup_steps = _resolve_warmup_steps(cfg.warmup_prop, len(train), cfg.batch_size, cfg.n_epochs)
 
-    keys = ["loss", "accuracy", "macro_f1"]
+    keys = ["loss", "accuracy", "macro_f1"] if output_type == "classification" else ["loss"]
     history = {f"{prefix}_{k}": [] for prefix in ("train", "val") for k in keys}
     history["epoch_time"] = []
     history["lr"] = []
@@ -294,14 +293,14 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
         epoch_start = time.time()
 
         train_one_epoch(model, arch_name, loss_fn, optimizer, train, train_idx, output_type,
-                         two_way=two_way, batch_size=cfg.batch_size, seed=cfg.seed + epoch, device=device,
+                         batch_size=cfg.batch_size, seed=cfg.seed + epoch, device=device,
                          drop_last=True, bin_weights=bin_weights, grad_clip_norm=cfg.grad_clip_norm,
                          warmup_steps=warmup_steps, base_lr=cfg.lr, step_counter=step_counter)
 
         train_metrics = evaluate_with_loss(model, arch_name, train, train_probe_idx, loss_fn, output_type,
-                                            two_way=two_way, batch_size=cfg.batch_size, device=device)
+                                            batch_size=cfg.batch_size, device=device)
         val_metrics = evaluate_with_loss(model, arch_name, val, val_idx, loss_fn, output_type,
-                                          two_way=two_way, batch_size=cfg.batch_size, device=device)
+                                          batch_size=cfg.batch_size, device=device)
 
         _sync_device(device)
         epoch_time = time.time() - epoch_start
@@ -344,56 +343,66 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
 
 # (h) CHECKPOINTING
 
-def _fit_checkpoint_temperature(model: nn.Module, arch_name: str, val: SplitData, two_way: bool,
-                                 device: torch.device, batch_size: int = 256) -> float:
-    """Runs the (already best-weights-loaded) model on val and fits a temperature for its output_type."""
-    output_type = get_output_type(arch_name)
+def _run_raw_preds(model: nn.Module, arch_name: str, split: SplitData, device: torch.device,
+                    batch_size: int = 256) -> torch.Tensor:
+    """Runs model over every row of split, returning concatenated raw output."""
     predict_fn = get_predict_fn(arch_name)
     model.eval()
-    idx = np.arange(len(val))
+    idx = np.arange(len(split))
     all_preds = []
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
-            batch = make_batch(val, batch_idx, device)
+            batch = make_batch(split, batch_idx, device)
             all_preds.append(predict_fn(model, batch).cpu())
-    preds = torch.cat(all_preds)
+    return torch.cat(all_preds)
+
+def _fit_checkpoint_calibration(model: nn.Module, arch_name: str, val: SplitData, val_wl: SplitData,
+                                 device: torch.device) -> tuple[float | None, tuple[float, float]]:
+    """Fits calibration for arch_name's output_type: classification fits a 3-way temperature on
+    val plus a probit on val_wl's collapsed expected score; regression fits only a probit, on
+    val_wl directly."""
+    output_type = get_output_type(arch_name)
+    raw_val_wl = _run_raw_preds(model, arch_name, val_wl, device)
 
     if output_type == "classification":
-        targets = remap_targets(val.result_class, two_way).long()
-        return fit_temperature(preds, targets)
-    if not two_way:
-        raise ValueError("Regression-output architectures are only valid for two-way (no-draw) data; "
-                          "got two_way=False, so val.result_cont is not guaranteed to be pure {0.0, 1.0}.")
-    targets = val.result_cont.long()
-    return fit_binary_temperature(preds, targets)
+        raw_val = _run_raw_preds(model, arch_name, val, device)
+        temperature = fit_temperature(raw_val, val.result_class.long())
+
+        expected_score = collapse_to_expected_score(torch.softmax(raw_val_wl, dim=1))
+        probit_params = fit_binary_probit(expected_score, val_wl.result_cont.long().numpy())
+        return temperature, probit_params
+
+    probit_params = fit_binary_probit(raw_val_wl.numpy(), val_wl.result_cont.long().numpy())
+    return None, probit_params
 
 def save_checkpoint(model: nn.Module, arch_name: str, model_cfg: BaseModelConfig, run_result: dict,
-                     val: SplitData, prep_cfg: PrepConfig, two_way: bool, path: str,
+                     val: SplitData, val_wl: SplitData, prep_cfg: PrepConfig, path: str,
                      n_elo_bins: int | None = None, device: torch.device | None = None) -> None:
-    """Loads best_state_dict, fits a temperature on val, and saves everything needed for inference to path."""
+    """Loads best_state_dict, fits calibration on val/val_wl, and saves everything needed for inference to path."""
     device = device or get_device()
     model = model.to(device)
     model.load_state_dict(run_result["best_state_dict"])
 
-    temperature = _fit_checkpoint_temperature(model, arch_name, val, two_way, device)
+    temperature, probit_params = _fit_checkpoint_calibration(model, arch_name, val, val_wl, device)
 
     checkpoint = TrainedModel(
         arch_name=arch_name,
         model_cfg=model_cfg,
         state_dict=run_result["best_state_dict"],
         n_elo_bins=n_elo_bins,
-        two_way=two_way,
         prep_cfg=prep_cfg,
         best_epoch=run_result["best_epoch"],
         best_score=run_result["best_score"],
         temperature=temperature,
+        probit_params=probit_params,
     )
 
     dirname = os.path.dirname(path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
     torch.save(checkpoint, path)
-    print(f"Saved checkpoint ({arch_name}, temperature={temperature:.3f}) to {path}")
+    temp_str = f"T={temperature:.3f}" if temperature is not None else "T=n/a (regression)"
+    print(f"Saved checkpoint ({arch_name}, {temp_str}, probit={probit_params}) to {path}")
 
 ####################
 # CLASSES
@@ -429,8 +438,8 @@ class TrainedModel:
     model_cfg: BaseModelConfig
     state_dict: dict
     n_elo_bins: int | None
-    two_way: bool
     prep_cfg: PrepConfig
     best_epoch: int
     best_score: float
-    temperature: float
+    temperature: float | None
+    probit_params: tuple[float, float]

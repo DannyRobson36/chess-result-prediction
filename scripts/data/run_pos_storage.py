@@ -1,14 +1,16 @@
 """
 run_pos_storage.py
 Builds train/val/test model-ready position CSVs from run_pos_reader.py's output, sampling
-each to a set of target sizes with elo-bin-proportional, game-level selection.
+each to a set of target sizes with elo-bin-proportional, game-level (not position-level)
+selection so smaller datasets are strict subsets of larger ones and long games keep their
+natural over-representation.
 
     python run_pos_storage.py                 normal run
     python run_pos_storage.py --limit 200000   dry run on a row slice
     python run_pos_storage.py --force          rebuild everything
 
 Latest changes: 19/08/26:
-- Initial commit 
+- Removed DuckDB 
 """
 
 import os
@@ -21,7 +23,7 @@ if _REPO_ROOT not in sys.path:
 from scripts.config import POS_DIR
 
 import argparse
-import functools
+import csv
 import gc
 import glob
 import heapq
@@ -31,10 +33,10 @@ import time
 import traceback
 from datetime import datetime
 
-import duckdb
 import numpy as np
 import pandas as pd
-import psutil
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 ####################
 # CONSTANTS
@@ -58,9 +60,13 @@ ELO_GAP_TARGET_SCORE = 0.55
 CONFIDENCE_Z = 3.0
 RANDOM_STATE = 0
 
-_TOTAL_RAM_GB = psutil.virtual_memory().total / (1024 ** 3)
-DUCKDB_MEMORY_LIMIT_GB = float(os.environ.get('DUCKDB_MEMORY_LIMIT_GB', max(2.0, _TOTAL_RAM_GB * 0.7)))
-MIN_FREE_DISK_GB = float(os.environ.get('MIN_FREE_DISK_GB', 60))
+# Cap on games used to fit elo-gap thresholds; train is too large to fit on in full.
+ELO_GAP_FIT_SAMPLE_SIZE = 3_000_000
+
+# Row count per streamed read/write batch, for both CSV and Parquet passes.
+STREAM_BATCH_SIZE = 500_000
+
+MIN_FREE_DISK_GB = 60.0
 
 POS_CSV_FIELDNAMES = [
     'game_id', 'mover', 'opponent', 'mover_elo', 'opponent_elo',
@@ -74,27 +80,35 @@ POS_CSV_FIELDNAMES = [
     'has_history_mover', 'has_history_opponent', 'rematch',
 ]
 
-POS_DUCKDB_TYPES = {
-    'game_id': 'VARCHAR', 'mover': 'VARCHAR', 'opponent': 'VARCHAR',
-    'mover_elo': 'INTEGER', 'opponent_elo': 'INTEGER',
-    'mover_title': 'VARCHAR', 'opponent_title': 'VARCHAR',
-    'mover_rating_diff': 'INTEGER', 'opponent_rating_diff': 'INTEGER',
-    'mover_is_white': 'BOOLEAN',
-    'datetime': 'TIMESTAMP', 'speed': 'VARCHAR', 'time_control': 'VARCHAR',
-    'termination': 'VARCHAR', 'eco': 'VARCHAR', 'ply_count': 'INTEGER',
-    'ply_played': 'INTEGER', 'fen': 'VARCHAR', 'next_move': 'VARCHAR',
-    'mover_clock': 'INTEGER', 'opponent_clock': 'INTEGER', 'mover_result': 'FLOAT',
-    'past_mover': 'FLOAT', 'past_opponent': 'FLOAT', 'prev_mover': 'FLOAT', 'prev_opponent': 'FLOAT',
-    'hours_since_mover': 'FLOAT', 'hours_since_opponent': 'FLOAT',
-    'has_history_mover': 'BOOLEAN', 'has_history_opponent': 'BOOLEAN', 'rematch': 'BOOLEAN',
+# Dtypes applied at CSV-read time. Title/speed/time_control/termination/eco are read as plain
+# strings, not pandas 'category' -- categorical dtype is for in-memory feature prep, not Parquet
+# storage, and Parquet's own dictionary encoding already handles repeated strings efficiently.
+POS_READ_DTYPES = {
+    'game_id': 'string', 'mover': 'string', 'opponent': 'string',
+    'mover_elo': 'int32', 'opponent_elo': 'int32',
+    'mover_title': 'string', 'opponent_title': 'string',
+    'mover_rating_diff': 'Int64', 'opponent_rating_diff': 'Int64',
+    'speed': 'string', 'time_control': 'string', 'termination': 'string',
+    'eco': 'string', 'ply_count': 'int32', 'ply_played': 'int32',
+    'fen': 'string', 'next_move': 'string',
+    'mover_clock': 'int32', 'opponent_clock': 'int32', 'mover_result': 'float32',
+    'past_mover': 'float32', 'past_opponent': 'float32',
+    'prev_mover': 'float32', 'prev_opponent': 'float32',
+    'hours_since_mover': 'float32', 'hours_since_opponent': 'float32',
 }
+POS_BOOL_COLS = ['mover_is_white', 'has_history_mover', 'has_history_opponent', 'rematch']
+POS_PARSE_DATES = ['datetime']
 
-# Title columns needing the no-title sentinel relabeled (see _select_fragment).
+# Title columns needing the no-title sentinel relabeled.
 TITLE_COLS = ('mover_title', 'opponent_title')
 # Raw sentinel run_game_reader.py/run_reader_unfiltered.py write for "no title".
 TITLE_NO_TITLE_RAW = 'None'
 # Relabeled value: avoids colliding with the default NA-string list most CSV/DataFrame readers use.
 TITLE_NO_TITLE_VALUE = 'no_title'
+
+# Columns needed for game-level allocation/threshold decisions; everything else is only ever
+# read again from the position-level Parquet at final-write time.
+GAME_LEVEL_COLS = ['game_id', 'mover_elo', 'opponent_elo', 'mover_result']
 
 IDS_PATH = os.path.join(POS_DIR, 'ids')
 TRAIN_OUT = os.path.join(POS_DIR, 'train')
@@ -107,14 +121,6 @@ TEST_OUT, TEST_OUT_WL = os.path.join(POS_DIR, 'test'), os.path.join(POS_DIR, 'te
 
 # (a) DISK I/O
 
-def get_connection(tmp_dir: str, memory_limit_gb: float) -> duckdb.DuckDBPyConnection:
-    """One DuckDB connection for the run. tmp_dir must be local disk, not Drive."""
-    os.makedirs(tmp_dir, exist_ok=True)
-    con = duckdb.connect()
-    con.execute(f"PRAGMA temp_directory='{tmp_dir}'")
-    con.execute(f"PRAGMA memory_limit='{memory_limit_gb:.1f}GB'")
-    return con
-
 def locate_split_csv(split: str, pos_dir: str) -> str:
     """Finds the single pos_{split}_*.csv written by run_pos_reader.py."""
     matches = sorted(glob.glob(os.path.join(pos_dir, f'pos_{split}_*.csv')))
@@ -123,32 +129,6 @@ def locate_split_csv(split: str, pos_dir: str) -> str:
     if len(matches) > 1:
         sys.exit(f'Expected exactly one pos_{split}_*.csv in {pos_dir}, found {len(matches)}: {matches}')
     return matches[0]
-
-def _select_fragment(col: str) -> str:
-    """Returns one column's SELECT fragment for csv_to_parquet: a plain CAST, except for
-    TITLE_COLS, which first relabel TITLE_NO_TITLE_RAW to TITLE_NO_TITLE_VALUE."""
-    if col in TITLE_COLS:
-        return (f"CAST(CASE WHEN \"{col}\" = '{TITLE_NO_TITLE_RAW}' THEN '{TITLE_NO_TITLE_VALUE}' "
-                f"ELSE \"{col}\" END AS {POS_DUCKDB_TYPES[col]}) AS \"{col}\"")
-    return f'CAST("{col}" AS {POS_DUCKDB_TYPES[col]}) AS "{col}"'
-
-def csv_to_parquet(con: duckdb.DuckDBPyConnection, csv_path: str, parquet_path: str, force: bool = False,
-                    limit_rows: int | None = None) -> str:
-    """Converts a CSV to Parquet on local disk once, skipping if it's already there."""
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f'csv_to_parquet: source CSV not found: {csv_path}')
-
-    if force or not os.path.exists(parquet_path):
-        os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
-        tmp_path = parquet_path + '.tmp'
-        select_expr = ', '.join(_select_fragment(c) for c in POS_CSV_FIELDNAMES)
-        limit_clause = f' LIMIT {int(limit_rows)}' if limit_rows else ''
-        con.execute(f"""
-            COPY (SELECT {select_expr} FROM read_csv_auto('{csv_path}', SAMPLE_SIZE=-1){limit_clause})
-            TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
-        os.replace(tmp_path, parquet_path)
-    return parquet_path
 
 def _check_disk_space(path: str, required_gb: float, label: str = '') -> None:
     """Raises if path's filesystem has less than required_gb free."""
@@ -160,37 +140,78 @@ def _check_disk_space(path: str, required_gb: float, label: str = '') -> None:
             f'{free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
         )
 
-def _files_expr(parquet_paths: list[str]) -> str:
-    paths = ', '.join(f"'{p}'" for p in parquet_paths)
-    return f'read_parquet([{paths}])'
+def _read_csv_chunks(csv_path: str, limit_rows: int | None):
+    """Yields correctly-typed, title-relabeled chunks of csv_path, streamed."""
+    rows_read = 0
+    reader = pd.read_csv(
+        csv_path, dtype=POS_READ_DTYPES, parse_dates=POS_PARSE_DATES,
+        true_values=['True'], false_values=['False'],
+        keep_default_na=False, na_values=[''],
+        chunksize=STREAM_BATCH_SIZE, low_memory=False,
+    )
+    for chunk in reader:
+        chunk = chunk[POS_CSV_FIELDNAMES]
+        for col in TITLE_COLS:
+            chunk[col] = chunk[col].replace(TITLE_NO_TITLE_RAW, TITLE_NO_TITLE_VALUE)
+        for col in POS_BOOL_COLS:
+            chunk[col] = chunk[col].astype('bool')
+        yield chunk
+        rows_read += len(chunk)
+        if limit_rows is not None and rows_read >= limit_rows:
+            return
 
-def game_level_frame(con: duckdb.DuckDBPyConnection, parquet_paths: list[str],
-                      game_id_col: str = 'game_id', agg_cols: list[str] | None = None) -> pd.DataFrame:
-    """One row per game_id via DuckDB; pass agg_cols to limit columns kept."""
-    if agg_cols is None:
-        cols = con.execute(f'DESCRIBE SELECT * FROM {_files_expr(parquet_paths)} LIMIT 0').df()['column_name']
-        agg_cols = [c for c in cols if c != game_id_col]
-    select_cols = ', '.join(f'any_value({c}) AS {c}' for c in agg_cols)
-    return con.execute(f"""
-        SELECT {game_id_col}, {select_cols}, count(*) AS n_positions
-        FROM {_files_expr(parquet_paths)}
-        GROUP BY {game_id_col}
-    """).df()
+def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False,
+                    limit_rows: int | None = None) -> str:
+    """Converts a CSV to Parquet on local disk once, streaming in bounded-size chunks."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f'csv_to_parquet: source CSV not found: {csv_path}')
+    if not force and os.path.exists(parquet_path):
+        return parquet_path
 
-def rows_for_game_ids(con: duckdb.DuckDBPyConnection, parquet_paths: list[str], game_ids,
-                       game_id_col: str = 'game_id') -> pd.DataFrame:
-    """Pulls the full rows for the given game_ids back out of the Parquet files."""
-    con.register('_wanted_game_ids', pd.DataFrame({game_id_col: list(game_ids)}))
+    os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
+    tmp_path = parquet_path + '.tmp'
+
+    writer = None
     try:
-        result = con.execute(f"""
-            SELECT t.* FROM {_files_expr(parquet_paths)} t
-            JOIN _wanted_game_ids w USING ({game_id_col})
-        """).df()
+        for chunk in _read_csv_chunks(csv_path, limit_rows):
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, table.schema, compression='zstd')
+            writer.write_table(table)
     finally:
-        con.unregister('_wanted_game_ids')
-    return result
+        if writer is not None:
+            writer.close()
+    os.replace(tmp_path, parquet_path)
+    return parquet_path
 
-# (b) ELO BINNING / GAP-THRESHOLD FITTING
+# (b) GAME-LEVEL AGGREGATION
+
+def game_level_frame(parquet_path: str, game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Streams parquet_path in batches, aggregating to one row per game_id: elo/result (from
+    the first row seen) plus n_positions (a running count), never materializing the full
+    position-level table."""
+    pf = pq.ParquetFile(parquet_path)
+    agg: dict[str, dict] = {}
+
+    for batch in pf.iter_batches(columns=GAME_LEVEL_COLS, batch_size=STREAM_BATCH_SIZE):
+        chunk = batch.to_pandas()
+        grouped = chunk.groupby(game_id_col, sort=False)
+        first = grouped.first()
+        counts = grouped.size()
+        for gid, row in first.iterrows():
+            entry = agg.get(gid)
+            if entry is None:
+                agg[gid] = {'mover_elo': row['mover_elo'], 'opponent_elo': row['opponent_elo'],
+                            'mover_result': row['mover_result'], 'n_positions': int(counts[gid])}
+            else:
+                entry['n_positions'] += int(counts[gid])
+
+    game_df = pd.DataFrame.from_dict(agg, orient='index')
+    game_df.index.name = game_id_col
+    game_df = game_df.reset_index()
+    return game_df
+
+# (c) ELO BINNING / GAP-THRESHOLD FITTING
 
 def elo_bin_labels(bin_edges: list) -> list[str]:
     labels = []
@@ -205,18 +226,23 @@ def elo_bin_labels(bin_edges: list) -> list[str]:
     return labels
 
 def _dedup_to_game_level(df: pd.DataFrame, game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Returns df unchanged if game_id_col is already unique, else deduplicates and sorts."""
+    if df[game_id_col].is_unique:
+        return df
     n_before = len(df)
     game_df = df.drop_duplicates(subset=game_id_col).sort_values(game_id_col).reset_index(drop=True)
-    if len(game_df) != n_before:
-        print(f'  [_dedup_to_game_level] collapsed {n_before:,} rows -> {len(game_df):,} games')
+    print(f'  [_dedup_to_game_level] collapsed {n_before:,} rows -> {len(game_df):,} games')
     return game_df
 
-def _mean_bin_and_gap(df: pd.DataFrame, lower: int, upper: int, step: int, tails: bool) -> tuple:
+def _mean_bin_gap_and_res_better(df: pd.DataFrame, lower: int, upper: int, step: int, tails: bool) -> tuple:
+    """Adds mean_bin, elo_gap, and res_better in one pass, one copy."""
     edges = list(range(lower, upper + 1, step))
     bin_edges = [-np.inf] + edges + [np.inf] if tails else edges
 
     df = df.copy()
     df['elo_gap'] = (df['mover_elo'] - df['opponent_elo']).abs()
+    df['res_better'] = np.where(df['mover_elo'] >= df['opponent_elo'],
+                                 df['mover_result'], 1 - df['mover_result'])
     mean_elo = (df['mover_elo'] + df['opponent_elo']) / 2
     mean_bin = pd.cut(mean_elo, bins=bin_edges, labels=False, right=False)
 
@@ -226,16 +252,10 @@ def _mean_bin_and_gap(df: pd.DataFrame, lower: int, upper: int, step: int, tails
     df['mean_bin'] = mean_bin[valid].astype(int)
     n_dropped = n_before - len(df)
     if n_dropped > 0:
-        print(f'  [_mean_bin_and_gap] dropped {n_dropped:,} games outside elo range '
+        print(f'  [_mean_bin_gap_and_res_better] dropped {n_dropped:,} games outside elo range '
               f'[{lower}, {upper}) (tails={tails})')
 
     return df, bin_edges
-
-def _res_better(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df['res_better'] = np.where(df['mover_elo'] >= df['opponent_elo'],
-                                 df['mover_result'], 1 - df['mover_result'])
-    return df
 
 def _find_threshold_crossing(bin_centres: list, values: list, target: float) -> float | None:
     pairs = [(c, v) for c, v in zip(bin_centres, values) if v is not None]
@@ -267,15 +287,19 @@ def _compute_gap_threshold(group: pd.DataFrame, target_score: float, gap_bin_wid
 def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, game_id_col: str = 'game_id',
                             lower_elo: int = ELO_LOWER, upper_elo: int = ELO_UPPER, bin_size: int = ELO_STEP,
                             tails: bool = TAILS, gap_bin_width: int = GAP_BIN_WIDTH,
-                            on_missing: str = 'keep_all') -> dict:
-    """Fits a per-elo-bin gap threshold on train only; apply_elo_gap_thresholds reuses this
-    on every other split without refitting."""
+                            on_missing: str = 'keep_all', fit_sample_size: int = ELO_GAP_FIT_SAMPLE_SIZE,
+                            random_state: int = RANDOM_STATE) -> dict:
+    """Fits a per-elo-bin gap threshold on a random sample of up to fit_sample_size games from
+    df_train; apply_elo_gap_thresholds reuses this on every other split without refitting."""
     if on_missing not in ('keep_all', 'drop_all'):
         raise ValueError(f"on_missing must be 'keep_all' or 'drop_all', got {on_missing!r}")
 
     game_df = _dedup_to_game_level(df_train, game_id_col)
-    binned, bin_edges = _mean_bin_and_gap(game_df, lower_elo, upper_elo, bin_size, tails)
-    binned = _res_better(binned)
+    if len(game_df) > fit_sample_size:
+        game_df = game_df.sample(n=fit_sample_size, random_state=random_state).reset_index(drop=True)
+        print(f'  [fit_elo_gap_thresholds] subsampled to {fit_sample_size:,} games for fitting')
+
+    binned, bin_edges = _mean_bin_gap_and_res_better(game_df, lower_elo, upper_elo, bin_size, tails)
     labels = elo_bin_labels(bin_edges)
     n_bins = len(bin_edges) - 1
 
@@ -329,8 +353,8 @@ def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool =
     game_id_col = cfg.get('game_id_col', 'game_id')
 
     game_df = _dedup_to_game_level(df, game_id_col)
-    binned, bin_edges = _mean_bin_and_gap(game_df, cfg['lower_elo'], cfg['upper_elo'],
-                                           cfg['bin_size'], cfg['tails'])
+    binned, bin_edges = _mean_bin_gap_and_res_better(game_df, cfg['lower_elo'], cfg['upper_elo'],
+                                                       cfg['bin_size'], cfg['tails'])
     assert bin_edges == fit_result['bin_edges'], \
         'bin_edges mismatch between fit and apply -- should be impossible; investigate.'
 
@@ -340,20 +364,18 @@ def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool =
 
     if verbose:
         n_games_in = len(game_df)
-        n_games_out_of_range = n_games_in - len(binned)
         n_games_over_gap = int((~keep_mask).sum())
         n_games_kept = len(kept_game_ids)
         n_rows_in = len(df)
         n_rows_kept = int(df[game_id_col].isin(kept_game_ids).sum())
         print(f'apply_elo_gap_thresholds (game level): {n_games_in:,} games in -> '
-              f'{n_games_out_of_range:,} outside elo range, {n_games_over_gap:,} over gap threshold, '
-              f'{n_games_kept:,} games kept')
+              f'{n_games_over_gap:,} over gap threshold, {n_games_kept:,} games kept')
         print(f'  input rows: {n_rows_in:,} -> {n_rows_kept:,} rows would be kept '
               f'({n_rows_in - n_rows_kept:,} dropped) if filtered by this game_id list')
 
     return kept_game_ids
 
-# (c) ELO-BIN BALANCING (val/test only)
+# (d) ELO-BIN BALANCING (val/test only)
 
 def balance_positions_by_lowest_bin(game_level_df: pd.DataFrame, lower: int = ELO_LOWER,
                                      upper: int = ELO_UPPER, step: int = ELO_STEP, tails: bool = TAILS,
@@ -471,7 +493,7 @@ def _allocate_with_caps(total: int, props: dict, caps: dict) -> tuple:
 
     return {k: int(round(v)) for k, v in allocation.items()}, capped_bins
 
-# (d) NESTED, GAME-LEVEL POSITION SAMPLING
+# (e) GAME ORDERING FOR NESTED SIZES
 
 def _proportional_interleave(bin_game_lists: dict, allocation: dict) -> list:
     """Merges each bin's own randomly-ordered game list into one order where any prefix stays
@@ -513,14 +535,12 @@ def _nested_selections(ordered_games: list, pos_counts: dict, sizes: list) -> di
         results[n] = (list(running_games), trim)
     return results
 
-def sample_nested_targets(game_level_df: pd.DataFrame, row_fetcher, sizes: list, lower: int = ELO_LOWER,
-                           upper: int = ELO_UPPER, step: int = ELO_STEP, tails: bool = TAILS,
-                           game_id_col: str = 'game_id', confidence_z: float = CONFIDENCE_Z,
-                           random_state: int | None = RANDOM_STATE, verbose: bool = True) -> dict:
-    """Selects nested position samples for every size in sizes from one elo-bin-proportional,
-    game-level-trimmed pool sized for max(sizes). Returns {size: dataframe}; each is a strict
-    row-level subset of every larger size's dataframe. Games are kept whole wherever possible --
-    only the one boundary game per size gets a (small) random position-level trim."""
+def _compute_ordered_games(game_level_df: pd.DataFrame, sizes: list, lower: int = ELO_LOWER,
+                            upper: int = ELO_UPPER, step: int = ELO_STEP, tails: bool = TAILS,
+                            game_id_col: str = 'game_id', confidence_z: float = CONFIDENCE_Z,
+                            random_state: int | None = RANDOM_STATE, verbose: bool = True) -> tuple[list, dict]:
+    """Selects an elo-bin-proportional, game-level pool sized for max(sizes), then orders it so
+    any prefix approximates the same proportions. Returns (ordered_games, pos_counts)."""
     if not sizes:
         raise ValueError('sizes must be non-empty')
     max_n = max(sizes)
@@ -567,25 +587,126 @@ def sample_nested_targets(game_level_df: pd.DataFrame, row_fetcher, sizes: list,
 
     ordered_games = _proportional_interleave(bin_game_lists, allocation)
     pos_counts = game_df.set_index(game_id_col)['n_positions'].to_dict()
+    return ordered_games, pos_counts
+
+# (f) STREAMED, MULTI-SIZE POSITION WRITING
+
+def _build_tier_lookup(ordered_games: list, pos_counts: dict, sizes: list) -> dict:
+    """Resolves per-tier cutoffs, boundary games, trim counts, and a game_id -> smallest-tier-
+    index map, from one shared nested selection."""
     nested = _nested_selections(ordered_games, pos_counts, sizes)
+    sizes_sorted = sorted(sizes)
+    tier_cutoffs = [len(nested[n][0]) for n in sizes_sorted]
+    boundary_game = [nested[n][0][-1] if nested[n][0] else None for n in sizes_sorted]
+    trim_count = [nested[n][1] for n in sizes_sorted]
 
-    results = {}
+    game_to_min_tier: dict[str, int] = {}
+    tier_ptr = 0
+    for i, g in enumerate(ordered_games):
+        while tier_ptr < len(tier_cutoffs) and i >= tier_cutoffs[tier_ptr]:
+            tier_ptr += 1
+        if tier_ptr >= len(tier_cutoffs):
+            break
+        if g not in game_to_min_tier:
+            game_to_min_tier[g] = tier_ptr
+
+    return {
+        'sizes_sorted': sizes_sorted, 'tier_cutoffs': tier_cutoffs,
+        'boundary_game': boundary_game, 'trim_count': trim_count,
+        'game_to_min_tier': game_to_min_tier,
+    }
+
+def stream_write_nested_sizes(source_parquet_path: str, game_level_df: pd.DataFrame, sizes: list,
+                               out_dir: str, name_prefix: str, variant: str, force: bool,
+                               random_state: int = RANDOM_STATE) -> dict:
+    """Streams source_parquet_path once, writing every size in sizes simultaneously: a game
+    selected for a smaller size is also written to every larger size's file (nested subsets),
+    with a per-tier random position trim on each tier's single boundary game to hit exact
+    target sizes. Returns {size: 'written' | 'skipped'}."""
+    size_tags = {n: _size_tag(n) for n in sizes}
+    out_paths = {}
     for n in sizes:
-        kept, trim = nested[n]
-        rows = row_fetcher(kept)
-        if trim > 0 and kept:
-            boundary_game = kept[-1]
-            boundary_rows = rows[rows[game_id_col] == boundary_game]
-            drop_idx = boundary_rows.sample(n=min(trim, len(boundary_rows)), random_state=random_state).index
-            rows = rows.drop(index=drop_idx)
-        rows = rows.sample(frac=1, random_state=random_state).reset_index(drop=True)
-        results[n] = rows
-        if verbose:
-            print(f'  N={n:,}: {len(kept):,} games -> {len(rows):,} positions')
+        fname = f'{name_prefix}_{size_tags[n]}_{variant}.csv' if variant else f'{name_prefix}_{size_tags[n]}.csv'
+        out_paths[n] = os.path.join(out_dir, fname)
 
-    return results
+    pending_sizes = [n for n in sizes if force or not os.path.exists(out_paths[n])]
+    status = {n: ('written' if n in pending_sizes else 'skipped') for n in sizes}
+    if not pending_sizes:
+        for n in sizes:
+            print(f'  skip (exists): {out_paths[n]}')
+        return status
 
-# (e) LOGGING / PIPELINE HELPERS
+    ordered_games, pos_counts = _compute_ordered_games(game_level_df, pending_sizes, random_state=random_state)
+    lookup = _build_tier_lookup(ordered_games, pos_counts, pending_sizes)
+    sizes_sorted = lookup['sizes_sorted']
+    boundary_game = lookup['boundary_game']
+    trim_count = lookup['trim_count']
+    game_to_min_tier = lookup['game_to_min_tier']
+
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_paths = {n: out_paths[n] + '.tmp' for n in pending_sizes}
+    files = {n: open(tmp_paths[n], 'w', newline='', encoding='utf-8') for n in pending_sizes}
+    writers = {n: csv.DictWriter(files[n], fieldnames=POS_CSV_FIELDNAMES) for n in pending_sizes}
+    for w in writers.values():
+        w.writeheader()
+
+    n_written = {n: 0 for n in pending_sizes}
+    trim_rng_seed = {n: random_state + i for i, n in enumerate(sizes_sorted)}
+
+    def flush_game(gid: str, rows_for_game: list[dict]) -> None:
+        if gid not in game_to_min_tier:
+            return
+        min_tier = game_to_min_tier[gid]
+        for t in range(min_tier, len(sizes_sorted)):
+            size = sizes_sorted[t]
+            if size not in writers:
+                continue
+            rows_to_write = rows_for_game
+            if gid == boundary_game[t] and trim_count[t] > 0:
+                keep_n = max(len(rows_for_game) - trim_count[t], 0)
+                rng = np.random.default_rng(trim_rng_seed[size])
+                idx = rng.choice(len(rows_for_game), size=min(keep_n, len(rows_for_game)), replace=False)
+                rows_to_write = [rows_for_game[i] for i in idx]
+            for row in rows_to_write:
+                writers[size].writerow(row)
+            n_written[size] += len(rows_to_write)
+
+    pf = pq.ParquetFile(source_parquet_path)
+    carry_game_id = None
+    carry_rows: list[dict] = []
+    try:
+        for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
+            chunk = batch.to_pandas()
+            for row in chunk.to_dict('records'):
+                gid = row['game_id']
+                if gid != carry_game_id:
+                    if carry_game_id is not None:
+                        flush_game(carry_game_id, carry_rows)
+                    carry_game_id = gid
+                    carry_rows = []
+                carry_rows.append(row)
+        if carry_game_id is not None:
+            flush_game(carry_game_id, carry_rows)
+    finally:
+        for f in files.values():
+            f.close()
+
+    for n in pending_sizes:
+        os.replace(tmp_paths[n], out_paths[n])
+        print(f'  N={n:,}: wrote {n_written[n]:,} positions -> {out_paths[n]}')
+
+    return status
+
+def _size_tag(n: int) -> str:
+    if n >= 1_000_000:
+        value, unit = n / 1_000_000, 'm'
+    else:
+        value, unit = n / 1_000, 'k'
+    if value == int(value):
+        return f'{int(value)}{unit}'
+    return f'{value:g}'.replace('.', 'p') + unit
+
+# (g) LOGGING / PIPELINE HELPERS
 
 def setup_logging() -> logging.Logger:
     log_dir = os.path.join(LOCAL_DATA_DIR, 'logs')
@@ -641,16 +762,7 @@ def write_csv_safely(df: pd.DataFrame, path: str, force: bool) -> bool:
     log.info(f'  wrote {len(df):,} rows -> {path}')
     return True
 
-# (f) PIPELINE
-
-def _size_tag(n: int) -> str:
-    if n >= 1_000_000:
-        value, unit = n / 1_000_000, 'm'
-    else:
-        value, unit = n / 1_000, 'k'
-    if value == int(value):
-        return f'{int(value)}{unit}'
-    return f'{value:g}'.replace('.', 'p') + unit
+# (h) PIPELINE
 
 def run_pipeline(limit_rows: int | None, force: bool) -> dict:
     _check_disk_space(LOCAL_DATA_DIR, MIN_FREE_DISK_GB, 'LOCAL_DATA_DIR')
@@ -659,35 +771,29 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
     val_csv = locate_split_csv('val', POS_DIR)
     test_csv = locate_split_csv('test', POS_DIR)
 
-    con = get_connection(tmp_dir=os.path.join(LOCAL_DATA_DIR, 'duckdb_tmp'),
-                          memory_limit_gb=DUCKDB_MEMORY_LIMIT_GB)
     if limit_rows:
         log.warning(f'--limit {limit_rows} set: this is a DRY RUN on a row slice, not a real build')
 
     parquet_dir = os.path.join(LOCAL_DATA_DIR, 'parquet')
 
     with Stage('csv_to_parquet: train'):
-        train_pq = csv_to_parquet(con, train_csv, os.path.join(parquet_dir, 'train.parquet'),
+        train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'),
                                    force=force, limit_rows=limit_rows)
     with Stage('csv_to_parquet: val'):
-        val_pq = csv_to_parquet(con, val_csv, os.path.join(parquet_dir, 'val.parquet'),
+        val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'),
                                  force=force, limit_rows=limit_rows)
     with Stage('csv_to_parquet: test'):
-        test_pq = csv_to_parquet(con, test_csv, os.path.join(parquet_dir, 'test.parquet'),
+        test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'),
                                   force=force, limit_rows=limit_rows)
 
-    train_fetch = functools.partial(rows_for_game_ids, con, [train_pq])
-    val_fetch = functools.partial(rows_for_game_ids, con, [val_pq])
-    test_fetch = functools.partial(rows_for_game_ids, con, [test_pq])
-
     with Stage('game_level_frame: train'):
-        gl_train = _dedup_to_game_level(game_level_frame(con, [train_pq]))
+        gl_train = game_level_frame(train_pq)
         log.info(f'  {len(gl_train):,} unique games')
     with Stage('game_level_frame: val'):
-        gl_val = _dedup_to_game_level(game_level_frame(con, [val_pq]))
+        gl_val = game_level_frame(val_pq)
         log.info(f'  {len(gl_val):,} unique games')
     with Stage('game_level_frame: test'):
-        gl_test = _dedup_to_game_level(game_level_frame(con, [test_pq]))
+        gl_test = game_level_frame(test_pq)
         log.info(f'  {len(gl_test):,} unique games')
 
     with Stage('write untouched game_id lists'):
@@ -731,47 +837,42 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
 
     results = {'written': [], 'skipped': [], 'failed': []}
 
-    def sample_and_write(game_level_df: pd.DataFrame, row_fetcher, sizes: list, out_dir: str,
+    def sample_and_write(game_level_df: pd.DataFrame, source_pq: str, sizes: list, out_dir: str,
                           name_prefix: str, variant: str) -> None:
         tag = f'{name_prefix}_{variant}' if variant else name_prefix
         try:
-            with Stage(f'sample_nested_targets: {tag}'):
-                sampled = sample_nested_targets(game_level_df, row_fetcher, sizes)
-                for n, df in sampled.items():
-                    size_tag = _size_tag(n)
-                    fname = f'{name_prefix}_{size_tag}_{variant}.csv' if variant else f'{name_prefix}_{size_tag}.csv'
-                    out_path = os.path.join(out_dir, fname)
-                    wrote = write_csv_safely(df, out_path, force)
-                    label = f'{tag}_{size_tag}'
-                    (results['written'] if wrote else results['skipped']).append(label)
-                    del df
+            with Stage(f'stream_write_nested_sizes: {tag}'):
+                status = stream_write_nested_sizes(source_pq, game_level_df, sizes, out_dir,
+                                                    name_prefix, variant, force)
+                for n, s in status.items():
+                    label = f'{tag}_{_size_tag(n)}'
+                    results[s].append(label)
                 gc.collect()
         except Exception as e:  # noqa: BLE001
             results['failed'].append((tag, str(e)))
             log.error(f'  giving up on {tag}, moving to the next variant: {e}')
 
-    sample_and_write(gl_train, train_fetch, TRAIN_SIZES, TRAIN_OUT, 'train', '')
-    sample_and_write(gl_train_res, train_fetch, TRAIN_SIZES, TRAIN_OUT, 'train', 'res')
+    sample_and_write(gl_train, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', '')
+    sample_and_write(gl_train_res, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', 'res')
 
-    sample_and_write(gl_val, val_fetch, VAL_SIZES, VAL_OUT, 'val', '')
-    sample_and_write(gl_val_res, val_fetch, VAL_SIZES, VAL_OUT, 'val', 'res')
-    sample_and_write(gl_val_bal, val_fetch, VAL_SIZES, VAL_OUT, 'val', 'bal')
-    sample_and_write(gl_val_res_bal, val_fetch, VAL_SIZES, VAL_OUT, 'val', 'res_bal')
-    sample_and_write(gl_val_wl, val_fetch, VAL_SIZES, VAL_OUT_WL, 'val', 'wl')
-    sample_and_write(gl_val_res_wl, val_fetch, VAL_SIZES, VAL_OUT_WL, 'val', 'res_wl')
-    sample_and_write(gl_val_bal_wl, val_fetch, VAL_SIZES, VAL_OUT_WL, 'val', 'bal_wl')
-    sample_and_write(gl_val_res_bal_wl, val_fetch, VAL_SIZES, VAL_OUT_WL, 'val', 'res_bal_wl')
+    sample_and_write(gl_val, val_pq, VAL_SIZES, VAL_OUT, 'val', '')
+    sample_and_write(gl_val_res, val_pq, VAL_SIZES, VAL_OUT, 'val', 'res')
+    sample_and_write(gl_val_bal, val_pq, VAL_SIZES, VAL_OUT, 'val', 'bal')
+    sample_and_write(gl_val_res_bal, val_pq, VAL_SIZES, VAL_OUT, 'val', 'res_bal')
+    sample_and_write(gl_val_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'wl')
+    sample_and_write(gl_val_res_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'res_wl')
+    sample_and_write(gl_val_bal_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'bal_wl')
+    sample_and_write(gl_val_res_bal_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'res_bal_wl')
 
-    sample_and_write(gl_test, test_fetch, TEST_SIZES, TEST_OUT, 'test', '')
-    sample_and_write(gl_test_res, test_fetch, TEST_SIZES, TEST_OUT, 'test', 'res')
-    sample_and_write(gl_test_bal, test_fetch, TEST_SIZES, TEST_OUT, 'test', 'bal')
-    sample_and_write(gl_test_res_bal, test_fetch, TEST_SIZES, TEST_OUT, 'test', 'res_bal')
-    sample_and_write(gl_test_wl, test_fetch, TEST_SIZES, TEST_OUT_WL, 'test', 'wl')
-    sample_and_write(gl_test_res_wl, test_fetch, TEST_SIZES, TEST_OUT_WL, 'test', 'res_wl')
-    sample_and_write(gl_test_bal_wl, test_fetch, TEST_SIZES, TEST_OUT_WL, 'test', 'bal_wl')
-    sample_and_write(gl_test_res_bal_wl, test_fetch, TEST_SIZES, TEST_OUT_WL, 'test', 'res_bal_wl')
+    sample_and_write(gl_test, test_pq, TEST_SIZES, TEST_OUT, 'test', '')
+    sample_and_write(gl_test_res, test_pq, TEST_SIZES, TEST_OUT, 'test', 'res')
+    sample_and_write(gl_test_bal, test_pq, TEST_SIZES, TEST_OUT, 'test', 'bal')
+    sample_and_write(gl_test_res_bal, test_pq, TEST_SIZES, TEST_OUT, 'test', 'res_bal')
+    sample_and_write(gl_test_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'wl')
+    sample_and_write(gl_test_res_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'res_wl')
+    sample_and_write(gl_test_bal_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'bal_wl')
+    sample_and_write(gl_test_res_bal_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'res_bal_wl')
 
-    con.close()
     return results
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -792,8 +893,6 @@ def main(argv: list[str] | None = None) -> None:
 
     log.info(f'POS_DIR (source/output CSVs) = {POS_DIR}')
     log.info(f'LOCAL_DATA_DIR (parquet/tmp)  = {LOCAL_DATA_DIR}')
-    log.info(f'DuckDB memory limit           = {DUCKDB_MEMORY_LIMIT_GB:.1f}GB '
-             f'(of {_TOTAL_RAM_GB:.1f}GB detected total RAM)')
     log.info(f'force={args.force}  limit={args.limit}')
 
     t0 = time.time()

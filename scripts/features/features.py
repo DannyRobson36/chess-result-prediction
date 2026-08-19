@@ -4,7 +4,7 @@ Builds model-ready SplitData from raw dataframes: scaling, elo binning.
 Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
 Latest changes: 19/08/26:
-- Added rematch, has-history/new-player and categorical title
+- Lowered MATE_SCORE_MOVER to 5,000
 """
 
 import json
@@ -75,7 +75,7 @@ BOARD_MODE_REGISTRY: dict[str, tuple[bool, bool]] = {
 WIN_PCT_CONST = 0.00368208
 
 # Sentinel mover-perspective eval for a forced mate (positive if mate favors the mover).
-MATE_SCORE_MOVER = 100_000
+MATE_SCORE_MOVER = 5_000
 
 # Per-engine hash size in MB for stockfish evaluation workers.
 HASH_MB_PER_ENGINE = 16

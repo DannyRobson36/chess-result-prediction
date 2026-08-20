@@ -2,8 +2,8 @@
 model_support.py
 Building blocks for models
 
-Latest changes: 19/08/26:
-- Added shared-embedding categorical feature path for title
+Latest changes: 20/08/26:
+- Added TokenAuxHead and SpatialAuxHead
 """
 
 import torch
@@ -324,3 +324,30 @@ POOL_REGISTRY = {
     "mean": lambda dim, dropout: MeanPool(dim, dropout),
     "attn": lambda dim, dropout: AttentionPool(dim, dropout=dropout),
 }
+
+# (d) AUXILIARY HEADS
+
+class TokenAuxHead(nn.Module):
+    """Per-token linear projection of (b, 64, dim_vit) board-square tokens to a legal_dest/
+    attacked_mover/attacked_opponent auxiliary output.
+    Out: (b, 3, 64).
+    """
+    def __init__(self, dim_vit):
+        super().__init__()
+        self.proj = nn.Linear(dim_vit, 3)
+
+    def forward(self, x):
+        return self.proj(x).transpose(1, 2)
+
+class SpatialAuxHead(nn.Module):
+    """1x1 conv projection of (b, vit_length, 8, 8) CNN output to a legal_dest/attacked_mover/
+    attacked_opponent auxiliary output.
+    Out: (b, 3, 64).
+    """
+    def __init__(self, vit_length):
+        super().__init__()
+        self.proj = nn.Conv2d(vit_length, 3, kernel_size=1)
+
+    def forward(self, x):
+        b = x.size(0)
+        return self.proj(x).view(b, 3, 64)

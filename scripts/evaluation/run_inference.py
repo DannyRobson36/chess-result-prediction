@@ -16,8 +16,8 @@ Run:
         --input-path /content/drive/.../val_900k_res_bal_wl.csv 
         --output-path /content/drive/.../val_predictions_maia2_value_feature_run1.csv
 
-Latest changes: 19/08/26:
-- Removed two_way and --no-calibration, auto-detects w/d/l vs. decisive-only input
+Latest changes: 20/08/26:
+- run_inference_batches unpacks predict_fn's (preds, aux_preds) return
 """
 
 import argparse
@@ -68,7 +68,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def run_inference_batches(model: torch.nn.Module, arch_name: str, split, batch_size: int,
                            device: torch.device) -> torch.Tensor:
-    """Runs model over every row of split, returning concatenated raw model output."""
+    """Runs model over every row of split, returning concatenated raw main-head output."""
     predict_fn = get_predict_fn(arch_name)
     model.eval()
     idx = np.arange(len(split))
@@ -76,7 +76,8 @@ def run_inference_batches(model: torch.nn.Module, arch_name: str, split, batch_s
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
-            all_preds.append(predict_fn(model, batch).cpu())
+            preds, _aux_preds = predict_fn(model, batch)
+            all_preds.append(preds.cpu())
     return torch.cat(all_preds)
 
 

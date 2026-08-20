@@ -1,9 +1,10 @@
 """
 utils_eval.py
-Model-independent evaluation helpers: baselines, per-row metrics, binned accuracy, calibration.
+Model-independent evaluation helpers: baselines, per-row metrics, binned accuracy, calibration,
+display-name mapping.
 
-Latest changes: 19/08/26:
-- Corrected fit_binary_probit
+Latest changes: 20/08/26:
+- Added resolve_display_name/resolve_display_names for legend labels
 """
 
 import numpy as np
@@ -242,9 +243,7 @@ def _binary_probit_probs(preds: torch.Tensor, c: torch.Tensor, sigma: torch.Tens
 
 
 def fit_binary_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 200) -> tuple[float, float]:
-    """Fits a single cutpoint to convert scalar predictions to W/L probabilities. targets must be
-    decisive (hard 0/1 win/loss labels, draws excluded) -- a continuous draw-inclusive target is not
-    a valid input here, since a single scalar cannot distinguish a confident draw from a 50/50 toss-up."""
+    """Fits a single cutpoint to convert scalar predictions to W/L probabilities, on decisive-only targets."""
     preds_t = torch.as_tensor(preds, dtype=torch.float32)
     targets_t = torch.as_tensor(targets, dtype=torch.long)
     target_idx = 1 - targets_t  # TWO_WAY_CLASS_NAMES is loss=0/win=1; probs are win-first
@@ -285,7 +284,7 @@ def collapse_to_expected_score(probs: np.ndarray | torch.Tensor) -> np.ndarray:
 
 def binary_probit_prediction_cols(raw_scores: np.ndarray, probit_params: tuple[float, float]) -> dict:
     """Returns prob_win/prob_draw/prob_loss/predicted_class from raw scalar scores under a fitted
-    binary probit. prob_draw is always 0.0, since a single scalar carries no draw information."""
+    binary probit. prob_draw is always 0.0."""
     probs = apply_binary_probit(raw_scores, probit_params)
     prob_win = probs[:, 0]
     prob_loss = probs[:, 1]
@@ -293,3 +292,15 @@ def binary_probit_prediction_cols(raw_scores: np.ndarray, probit_params: tuple[f
     predicted_class = np.where(prob_win >= 0.5, 'win', 'loss')
     return {'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
             'predicted_class': predicted_class}
+
+
+# (f) DISPLAY NAMES
+
+def resolve_display_name(name: str, display_names: dict[str, str] | None = None) -> str:
+    """Returns name's display label from display_names, falling back to name itself if absent."""
+    return (display_names or {}).get(name, name)
+
+
+def resolve_display_names(names: list[str], display_names: dict[str, str] | None = None) -> dict[str, str]:
+    """Maps each name in names to its display label via resolve_display_name."""
+    return {name: resolve_display_name(name, display_names) for name in names}

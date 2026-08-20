@@ -3,7 +3,7 @@ utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
 Latest changes: 19/08/26:
-- Added mover-perspective auxiliary targets
+- Fixed encode_title_idx
 """
 
 import numpy as np
@@ -419,6 +419,5 @@ def decode_result_class(class_idx: np.ndarray | torch.Tensor | list[int]) -> lis
 # (g) TITLE ENCODING
 
 def encode_title_idx(title: pd.Series) -> np.ndarray:
-    """Maps a title Series to TITLE_TO_IDX indices as a plain int64 array. Any value outside
-    TITLE_TO_IDX, including NaN, falls back to the 'unk' index."""
-    return title.map(TITLE_TO_IDX).fillna(TITLE_TO_IDX['unk']).to_numpy(dtype='int64')
+    """Maps a title Series to TITLE_TO_IDX indices as a plain int64 array."""
+    return title.astype('object').map(TITLE_TO_IDX).fillna(TITLE_TO_IDX['unk']).to_numpy(dtype='int64')

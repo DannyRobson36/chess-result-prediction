@@ -2,8 +2,8 @@
 training_diagnostics.py
 Quick post-training diagnostics at notebook level - history plots and per-elo-bin metrics.
 
-Latest changes: 19/08/26:
-- Removed two_way, history plot and per-elo-bin metrics adapt to whichever keys are present
+Latest changes: 20/08/26:
+- evaluate_by_elo_bin now unpacks predict_fn's (preds, aux_preds) return
 """
 
 import numpy as np
@@ -65,7 +65,7 @@ def evaluate_by_elo_bin(model: nn.Module, arch_name: str, out: dict, split: Spli
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
             targets = get_targets(split, batch_idx, output_type, device)
-            preds = predict_fn(model, batch)
+            preds, _aux_preds = predict_fn(model, batch)
             per_sample = loss_fn(preds, targets)
 
             all_losses.append(per_sample.cpu())

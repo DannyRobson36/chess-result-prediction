@@ -2,8 +2,8 @@
 training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
-Latest changes: 19/08/26:
-- Removed two_way, checkpoints now store temperature + probit_params, fit from val/val_wl
+Latest changes: 20/08/26:
+- make_batch uses legal_dest/attacked_mover/attacked_opponent
 """
 
 import os
@@ -103,6 +103,12 @@ def make_batch(split: SplitData, idx: np.ndarray, device: torch.device) -> dict:
         batch["boards"] = split.boards[idx].to(device).float()
     if split.board_token_ids is not None:
         batch["board_token_ids"] = split.board_token_ids[idx].to(device).long()
+    if split.legal_dest is not None:
+        batch["legal_dest"] = split.legal_dest[idx].to(device).float()
+    if split.attacked_mover is not None:
+        batch["attacked_mover"] = split.attacked_mover[idx].to(device).float()
+    if split.attacked_opponent is not None:
+        batch["attacked_opponent"] = split.attacked_opponent[idx].to(device).float()
     for name, tensor in split.features.items():
         batch[name] = tensor[idx].to(device)
     return batch

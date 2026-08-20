@@ -4,7 +4,7 @@ Reads per-model prediction csvs against a fixed val/test positions df, merges th
 and provides eval-plots across models.
 
 Latest changes: 20/08/26:
-- Added plot_accuracy_by_clock_ratio
+- plot_accuracy_by_clock_ratio bins now driven by step_multiplier/n_bins_per_side
 """
 
 import glob
@@ -286,26 +286,25 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
     plt.show()
 
 
-def _clock_ratio_bin_edges(max_ratio: float, bin_width: float) -> list[float]:
-    """Returns log2-space bin edges from -log2(max_ratio) to +log2(max_ratio) in bin_width steps, with open -inf/+inf tails."""
-    max_log = np.log2(max_ratio)
-    n_steps = max(1, int(np.ceil(max_log / bin_width)))
-    half_edges = [min(i * bin_width, max_log) for i in range(n_steps + 1)]
-    edges = [-e for e in reversed(half_edges)] + half_edges[1:]
+def _clock_ratio_bin_edges(n_bins_per_side: int) -> list[float]:
+    """Returns integer-step bin edges from -n_bins_per_side to +n_bins_per_side, with open -inf/+inf tails."""
+    if n_bins_per_side < 1:
+        raise ValueError(f'n_bins_per_side must be >= 1, got {n_bins_per_side}.')
+    edges = list(range(-n_bins_per_side, n_bins_per_side + 1))
     return [-np.inf] + edges + [np.inf]
 
 
-def _clock_ratio_bin_labels(edges: list[float], max_ratio: float) -> list[str]:
-    """Returns a multiplier display label per bin, e.g. 'x0.1-', 'x0.71-x1', 'x10+'."""
+def _clock_ratio_bin_labels(edges: list[float], step_multiplier: float) -> list[str]:
+    """Returns a multiplier display label per bin, e.g. 'x0.125-', 'x1-x2', 'x8+'."""
     labels = []
     for i in range(len(edges) - 1):
         lo, hi = edges[i], edges[i + 1]
         if lo == -np.inf:
-            labels.append(f'x{1 / max_ratio:.2g}-')
+            labels.append(f'x{step_multiplier ** hi:.3g}-')
         elif hi == np.inf:
-            labels.append(f'x{max_ratio:.2g}+')
+            labels.append(f'x{step_multiplier ** lo:.3g}+')
         else:
-            labels.append(f'x{2 ** lo:.2g}-x{2 ** hi:.2g}')
+            labels.append(f'x{step_multiplier ** lo:.3g}-x{step_multiplier ** hi:.3g}')
     return labels
 
 
@@ -314,8 +313,8 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                   opponent_clock_col: str = 'opponent_clock',
                                   time_control_col: str = 'time_control',
                                   mover_result_col: str = 'mover_result',
-                                  max_ratio: float = 10.0,
-                                  bin_width: float = 0.5,
+                                  step_multiplier: float = 2.0,
+                                  n_bins_per_side: int = 3,
                                   max_clock_seconds: int | None = None,
                                   no_increment_only: bool = False,
                                   ylim: tuple[float, float] = (50, 80),
@@ -323,7 +322,7 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                   show_hist: bool = False,
                                   figsize: tuple[float, float] | None = None,
                                   display_names: dict[str, str] | None = None) -> None:
-    """Plots per-model accuracy against true mover_result, binned by log2(opponent_clock / mover_clock), tail-capped at max_ratio."""
+    """Plots per-model accuracy against true mover_result, binned by opponent_clock / mover_clock in step_multiplier-fold steps out to step_multiplier**n_bins_per_side."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, mover_clock_col, opponent_clock_col]
     if no_increment_only:
         cols_needed.append(time_control_col)
@@ -346,10 +345,10 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
 
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio = df[opponent_clock_col] / df[mover_clock_col]
-        log_ratio = np.log2(ratio)
+        log_ratio = np.log(ratio) / np.log(step_multiplier)
 
-    edges = _clock_ratio_bin_edges(max_ratio, bin_width)
-    labels = _clock_ratio_bin_labels(edges, max_ratio)
+    edges = _clock_ratio_bin_edges(n_bins_per_side)
+    labels = _clock_ratio_bin_labels(edges, step_multiplier)
     ratio_bin = pd.cut(log_ratio, bins=edges, labels=False, right=True, include_lowest=True)
 
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
@@ -403,4 +402,39 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
     classes_to_plot = [positive_class] if positive_class is not None else ['win', 'draw', 'loss']
 
     cols_needed = [f'{name}_prob_{cls}' for name in names for cls in classes_to_plot] + [mover_result_col]
-    df = restrict_to
+    df = restrict_to_common_rows(df, cols_needed)
+
+    if positive_class is None:
+        draw_cols = [f'{name}_prob_draw' for name in names]
+        if (df[draw_cols] == 0).all(axis=None):
+            classes_to_plot = ['win', 'loss']
+            print('plot_roc_auc: all draw probabilities are 0 across every model -- skipping draw panel.')
+
+    panel_width, panel_height = figsize or BASE_FIGSIZE
+    colors = colors_for(names)
+    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
+                              squeeze=False)
+    axes = axes[0]
+    if title:
+        fig.suptitle(title)
+
+    for ax, cls in zip(axes, classes_to_plot):
+        y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
+
+        for name in names:
+            y_score = df[f'{name}_prob_{cls}']
+            fpr, tpr, _ = roc_curve(y_true, y_score)
+            roc_auc = auc(fpr, tpr)
+            label = f'{resolve_display_name(name, display_names)} (AUC = {roc_auc:.3f})'
+            ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=label)
+
+        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Chance')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'{cls.capitalize()} prediction')
+        ax.legend(loc='lower right')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(*ylim)
+
+    plt.tight_layout()
+    plt.show()

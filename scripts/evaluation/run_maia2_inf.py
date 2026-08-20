@@ -16,11 +16,12 @@ CLI:
     --calib-path   Path to val_wl's positions CSV, decisive-only. Same columns plus mover_result.
                    Used only to fit probit calibration.
     --split        Which split --input-path is: val or test. Used to name output files.
-    --output-dir   Folder to write predictions/calibration files into. Default: PREDICTIONS_DIR (config.py).
+    --output-dir   Folder to write predictions into (calibration JSON goes into a calib/
+                   subfolder of this). Default: PREDICTIONS_DIR (config.py).
     --device       "cpu" or "gpu". Default: "cpu".
 
 Latest changes: 19/08/26:
-- Initial commit
+- Calibration JSON now written to output-dir/calib/
 """
 
 import os
@@ -216,9 +217,12 @@ def main(argv: list[str] | None = None) -> None:
     assert list(df_calibrated.columns) == output_cols, 'calibrated output columns do not match output_cols.'
 
     os.makedirs(args.output_dir, exist_ok=True)
+    calib_dir = os.path.join(args.output_dir, 'calib')
+    os.makedirs(calib_dir, exist_ok=True)
+
     raw_path = os.path.join(args.output_dir, f'{args.split}_predictions_maia2_raw.csv')
     calibrated_path = os.path.join(args.output_dir, f'{args.split}_predictions_maia2_calibrated.csv')
-    calib_json_path = os.path.join(args.output_dir, f'{args.split}_predictions_maia2_calibration.json')
+    calib_json_path = os.path.join(calib_dir, f'{args.split}_predictions_maia2_calibration.json')
 
     df_raw.to_csv(raw_path, index=False)
     df_calibrated.to_csv(calibrated_path, index=False)

@@ -9,8 +9,8 @@ natural over-representation.
     python run_pos_storage.py --limit 200000   dry run on a row slice
     python run_pos_storage.py --force          rebuild everything
 
-Latest changes: 19/08/26:
-- Removed DuckDB 
+Latest changes: 20/08/26:
+- tqdm progress bars
 """
 
 import os
@@ -27,16 +27,14 @@ import csv
 import gc
 import glob
 import heapq
-import logging
 import shutil
-import time
-import traceback
-from datetime import datetime
+from typing import IO
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from tqdm import tqdm
 
 ####################
 # CONSTANTS
@@ -140,11 +138,11 @@ def _check_disk_space(path: str, required_gb: float, label: str = '') -> None:
             f'{free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
         )
 
-def _read_csv_chunks(csv_path: str, limit_rows: int | None):
-    """Yields correctly-typed, title-relabeled chunks of csv_path, streamed."""
+def _read_csv_chunks(csv_source: IO[bytes], limit_rows: int | None):
+    """Yields correctly-typed, title-relabeled chunks of csv_source, streamed."""
     rows_read = 0
     reader = pd.read_csv(
-        csv_path, dtype=POS_READ_DTYPES, parse_dates=POS_PARSE_DATES,
+        csv_source, dtype=POS_READ_DTYPES, parse_dates=POS_PARSE_DATES,
         true_values=['True'], false_values=['False'],
         keep_default_na=False, na_values=[''],
         chunksize=STREAM_BATCH_SIZE, low_memory=False,
@@ -170,14 +168,18 @@ def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False,
 
     os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
     tmp_path = parquet_path + '.tmp'
+    file_size = os.path.getsize(csv_path)
 
     writer = None
     try:
-        for chunk in _read_csv_chunks(csv_path, limit_rows):
-            table = pa.Table.from_pandas(chunk, preserve_index=False)
-            if writer is None:
-                writer = pq.ParquetWriter(tmp_path, table.schema, compression='zstd')
-            writer.write_table(table)
+        with open(csv_path, 'rb') as raw_file:
+            with tqdm.wrapattr(raw_file, 'read', total=file_size,
+                                desc=os.path.basename(csv_path)) as tracked_file:
+                for chunk in _read_csv_chunks(tracked_file, limit_rows):
+                    table = pa.Table.from_pandas(chunk, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(tmp_path, table.schema, compression='zstd')
+                    writer.write_table(table)
     finally:
         if writer is not None:
             writer.close()
@@ -229,10 +231,7 @@ def _dedup_to_game_level(df: pd.DataFrame, game_id_col: str = 'game_id') -> pd.D
     """Returns df unchanged if game_id_col is already unique, else deduplicates and sorts."""
     if df[game_id_col].is_unique:
         return df
-    n_before = len(df)
-    game_df = df.drop_duplicates(subset=game_id_col).sort_values(game_id_col).reset_index(drop=True)
-    print(f'  [_dedup_to_game_level] collapsed {n_before:,} rows -> {len(game_df):,} games')
-    return game_df
+    return df.drop_duplicates(subset=game_id_col).sort_values(game_id_col).reset_index(drop=True)
 
 def _mean_bin_gap_and_res_better(df: pd.DataFrame, lower: int, upper: int, step: int, tails: bool) -> tuple:
     """Adds mean_bin, elo_gap, and res_better in one pass, one copy."""
@@ -246,14 +245,9 @@ def _mean_bin_gap_and_res_better(df: pd.DataFrame, lower: int, upper: int, step:
     mean_elo = (df['mover_elo'] + df['opponent_elo']) / 2
     mean_bin = pd.cut(mean_elo, bins=bin_edges, labels=False, right=False)
 
-    n_before = len(df)
     valid = mean_bin.notna()
     df = df[valid].copy()
     df['mean_bin'] = mean_bin[valid].astype(int)
-    n_dropped = n_before - len(df)
-    if n_dropped > 0:
-        print(f'  [_mean_bin_gap_and_res_better] dropped {n_dropped:,} games outside elo range '
-              f'[{lower}, {upper}) (tails={tails})')
 
     return df, bin_edges
 
@@ -297,48 +291,21 @@ def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, game_id_
     game_df = _dedup_to_game_level(df_train, game_id_col)
     if len(game_df) > fit_sample_size:
         game_df = game_df.sample(n=fit_sample_size, random_state=random_state).reset_index(drop=True)
-        print(f'  [fit_elo_gap_thresholds] subsampled to {fit_sample_size:,} games for fitting')
 
     binned, bin_edges = _mean_bin_gap_and_res_better(game_df, lower_elo, upper_elo, bin_size, tails)
     labels = elo_bin_labels(bin_edges)
     n_bins = len(bin_edges) - 1
 
     global_threshold = _compute_gap_threshold(binned, target_score, gap_bin_width)
-    print(f'Global elo-gap threshold (all brackets pooled): {global_threshold}')
-
     fallback_value = np.inf if on_missing == 'keep_all' else -1
-    thresholds = {}
-    used_global_fallback = []
-    used_hardcoded_fallback = []
 
+    thresholds = {}
     for i in range(n_bins):
         group = binned[binned['mean_bin'] == i]
-        n_games = len(group)
         t = _compute_gap_threshold(group, target_score, gap_bin_width)
         if t is None:
-            if global_threshold is not None:
-                t = global_threshold
-                used_global_fallback.append((i, labels[i], n_games))
-            else:
-                t = fallback_value
-                used_hardcoded_fallback.append((i, labels[i], n_games))
+            t = global_threshold if global_threshold is not None else fallback_value
         thresholds[i] = t
-
-    if used_global_fallback:
-        print(f'\n{len(used_global_fallback)} bracket(s) had no own threshold; fell back to global '
-              f'({global_threshold}):')
-        for i, label, n in used_global_fallback:
-            print(f'  bin {i} ({label}): n={n:,} games in bracket')
-
-    if used_hardcoded_fallback:
-        print(f"\n{len(used_hardcoded_fallback)} bracket(s) had NO own threshold AND no usable global "
-              f"fallback; used on_missing='{on_missing}' (threshold={fallback_value}):")
-        for i, label, n in used_hardcoded_fallback:
-            print(f'  bin {i} ({label}): n={n:,} games in bracket')
-
-    print('\nPer-bracket thresholds:')
-    for i in range(n_bins):
-        print(f'  {labels[i]:>12}: gap <= {thresholds[i]}')
 
     return {
         'thresholds': thresholds, 'bin_edges': bin_edges, 'labels': labels,
@@ -346,7 +313,7 @@ def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, game_id_
                         bin_size=bin_size, tails=tails, gap_bin_width=gap_bin_width, game_id_col=game_id_col),
     }
 
-def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool = True) -> list:
+def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict) -> list:
     """Applies an already-fitted set of thresholds to a (possibly different) split."""
     cfg = fit_result['config']
     thresholds = fit_result['thresholds']
@@ -360,34 +327,19 @@ def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool =
 
     row_thresholds = binned['mean_bin'].map(thresholds)
     keep_mask = binned['elo_gap'] <= row_thresholds
-    kept_game_ids = binned.loc[keep_mask, game_id_col].tolist()
-
-    if verbose:
-        n_games_in = len(game_df)
-        n_games_over_gap = int((~keep_mask).sum())
-        n_games_kept = len(kept_game_ids)
-        n_rows_in = len(df)
-        n_rows_kept = int(df[game_id_col].isin(kept_game_ids).sum())
-        print(f'apply_elo_gap_thresholds (game level): {n_games_in:,} games in -> '
-              f'{n_games_over_gap:,} over gap threshold, {n_games_kept:,} games kept')
-        print(f'  input rows: {n_rows_in:,} -> {n_rows_kept:,} rows would be kept '
-              f'({n_rows_in - n_rows_kept:,} dropped) if filtered by this game_id list')
-
-    return kept_game_ids
+    return binned.loc[keep_mask, game_id_col].tolist()
 
 # (d) ELO-BIN BALANCING (val/test only)
 
 def balance_positions_by_lowest_bin(game_level_df: pd.DataFrame, lower: int = ELO_LOWER,
                                      upper: int = ELO_UPPER, step: int = ELO_STEP, tails: bool = TAILS,
-                                     game_id_col: str = 'game_id', verbose: bool = True) -> pd.DataFrame:
+                                     game_id_col: str = 'game_id') -> pd.DataFrame:
     """Restricts every elo bin to the sparsest bin's position count, keeping that bin in full."""
     if 'n_positions' not in game_level_df.columns:
         raise ValueError("game_level_df must have an 'n_positions' column")
     game_df = game_level_df.copy()
 
     if len(game_df) == 0:
-        if verbose:
-            print('NOTE: input has 0 games -- nothing to balance, returning empty result')
         return game_df
 
     game_df = game_df.sort_values(game_id_col).reset_index(drop=True)
@@ -412,7 +364,6 @@ def balance_positions_by_lowest_bin(game_level_df: pd.DataFrame, lower: int = EL
     rng = np.random.default_rng(RANDOM_STATE)
 
     kept_game_ids = []
-    notes = []
     for b in sorted(bin_stats.index):
         bin_games = game_df.loc[game_df['mean_bin'] == b, game_id_col]
         if b == sparsest_bin:
@@ -423,9 +374,6 @@ def balance_positions_by_lowest_bin(game_level_df: pd.DataFrame, lower: int = EL
         n_estimate = _games_needed_for_target(bin_stats.loc[b, 'mean'], bin_stats.loc[b, 'var'],
                                                target_per_bin, CONFIDENCE_Z)
         candidate_n = min(n_estimate, caps[b])
-        if n_estimate > caps[b]:
-            notes.append(f'bin {b}: estimated {n_estimate} games needed but only {caps[b]} '
-                         f'available -- using all of them as the initial pool')
 
         candidate_ids = rng.choice(bin_games.to_numpy(), size=candidate_n, replace=False)
         selected, total = _cumulative_take_head(candidate_ids, pos_lookup, target_per_bin, rng)
@@ -434,22 +382,9 @@ def balance_positions_by_lowest_bin(game_level_df: pd.DataFrame, lower: int = EL
             topped_up, total = _cumulative_take_head(remaining.to_numpy(), pos_lookup,
                                                        target_per_bin - total, rng)
             selected = selected + topped_up
-            notes.append(f'bin {b}: candidate pool fell short, topped up with '
-                         f'{len(topped_up)} more games to reach target')
         kept_game_ids.extend(selected)
 
-    if verbose and notes:
-        print('NOTE: some bins needed extra handling to hit the shared target:')
-        for n in notes:
-            print(f'  {n}')
-
-    final_df = game_level_df[game_level_df[game_id_col].isin(kept_game_ids)].reset_index(drop=True)
-    if verbose:
-        print(f'Target per bin: {target_per_bin:,} positions (sparsest bin, kept in full) '
-              f'x {len(bin_stats)} bins')
-        print(f'Kept {len(kept_game_ids):,} games (~{target_per_bin * len(bin_stats):,} positions '
-              f'across them, not yet fetched)')
-    return final_df
+    return game_level_df[game_level_df[game_id_col].isin(kept_game_ids)].reset_index(drop=True)
 
 def _games_needed_for_target(mean: float, var: float, target: float, confidence_z: float) -> int:
     a, b, c = mean, -confidence_z * np.sqrt(max(var, 0.0)), -target
@@ -538,7 +473,7 @@ def _nested_selections(ordered_games: list, pos_counts: dict, sizes: list) -> di
 def _compute_ordered_games(game_level_df: pd.DataFrame, sizes: list, lower: int = ELO_LOWER,
                             upper: int = ELO_UPPER, step: int = ELO_STEP, tails: bool = TAILS,
                             game_id_col: str = 'game_id', confidence_z: float = CONFIDENCE_Z,
-                            random_state: int | None = RANDOM_STATE, verbose: bool = True) -> tuple[list, dict]:
+                            random_state: int | None = RANDOM_STATE) -> tuple[list, dict]:
     """Selects an elo-bin-proportional, game-level pool sized for max(sizes), then orders it so
     any prefix approximates the same proportions. Returns (ordered_games, pos_counts)."""
     if not sizes:
@@ -568,11 +503,6 @@ def _compute_ordered_games(game_level_df: pd.DataFrame, sizes: list, lower: int 
     weighted_var = sum(props[b] * bin_stats.loc[b, 'var'] for b in props)
     n_total_games = _games_needed_for_target(weighted_mean, weighted_var, max_n, confidence_z)
     allocation, capped_bins = _allocate_with_caps(n_total_games, props, caps)
-
-    if verbose and capped_bins:
-        labels = elo_bin_labels(bin_edges)
-        capped_str = ', '.join(f'{labels[b]} ({caps[b]} avail)' for b in sorted(capped_bins))
-        print(f'NOTE: {len(capped_bins)} bin(s) hit their game cap: {capped_str}')
 
     rng = np.random.default_rng(random_state)
     bin_game_lists = {}
@@ -632,8 +562,6 @@ def stream_write_nested_sizes(source_parquet_path: str, game_level_df: pd.DataFr
     pending_sizes = [n for n in sizes if force or not os.path.exists(out_paths[n])]
     status = {n: ('written' if n in pending_sizes else 'skipped') for n in sizes}
     if not pending_sizes:
-        for n in sizes:
-            print(f'  skip (exists): {out_paths[n]}')
         return status
 
     ordered_games, pos_counts = _compute_ordered_games(game_level_df, pending_sizes, random_state=random_state)
@@ -672,28 +600,30 @@ def stream_write_nested_sizes(source_parquet_path: str, game_level_df: pd.DataFr
             n_written[size] += len(rows_to_write)
 
     pf = pq.ParquetFile(source_parquet_path)
+    desc = f'{name_prefix}_{variant}' if variant else name_prefix
     carry_game_id = None
     carry_rows: list[dict] = []
     try:
-        for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
-            chunk = batch.to_pandas()
-            for row in chunk.to_dict('records'):
-                gid = row['game_id']
-                if gid != carry_game_id:
-                    if carry_game_id is not None:
-                        flush_game(carry_game_id, carry_rows)
-                    carry_game_id = gid
-                    carry_rows = []
-                carry_rows.append(row)
-        if carry_game_id is not None:
-            flush_game(carry_game_id, carry_rows)
+        with tqdm(total=pf.metadata.num_rows, desc=desc, unit='rows', unit_scale=True) as pbar:
+            for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
+                chunk = batch.to_pandas()
+                pbar.update(len(chunk))
+                for row in chunk.to_dict('records'):
+                    gid = row['game_id']
+                    if gid != carry_game_id:
+                        if carry_game_id is not None:
+                            flush_game(carry_game_id, carry_rows)
+                        carry_game_id = gid
+                        carry_rows = []
+                    carry_rows.append(row)
+            if carry_game_id is not None:
+                flush_game(carry_game_id, carry_rows)
     finally:
         for f in files.values():
             f.close()
 
     for n in pending_sizes:
         os.replace(tmp_paths[n], out_paths[n])
-        print(f'  N={n:,}: wrote {n_written[n]:,} positions -> {out_paths[n]}')
 
     return status
 
@@ -706,60 +636,16 @@ def _size_tag(n: int) -> str:
         return f'{int(value)}{unit}'
     return f'{value:g}'.replace('.', 'p') + unit
 
-# (g) LOGGING / PIPELINE HELPERS
-
-def setup_logging() -> logging.Logger:
-    log_dir = os.path.join(LOCAL_DATA_DIR, 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f'run_pos_storage_{datetime.now():%Y%m%d_%H%M%S}.log')
-
-    logger = logging.getLogger('run_pos_storage')
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter('%(asctime)s  %(levelname)-7s  %(message)s', '%H:%M:%S')
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    logger.info(f'Logging to {log_path} (kept even if this session dies)')
-    return logger
-
-log = logging.getLogger('run_pos_storage')
-
-class Stage:
-    """Times a stage and logs start/end/failure with the stage name."""
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def __enter__(self):
-        log.info(f'START  {self.name}')
-        self._t0 = time.time()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        elapsed = time.time() - self._t0
-        if exc_type is not None:
-            log.error(f'FAILED {self.name} after {elapsed:.1f}s: {exc}')
-            log.error(''.join(traceback.format_exception(exc_type, exc, tb)))
-            return False
-        log.info(f'DONE   {self.name} ({elapsed:.1f}s)')
-        return False
+# (g) PIPELINE HELPERS
 
 def write_csv_safely(df: pd.DataFrame, path: str, force: bool) -> bool:
     """Writes df to path, skipping if it exists unless force=True."""
     if os.path.exists(path) and not force:
-        log.info(f'  skip (exists): {path}')
         return False
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + '.tmp'
     df.to_csv(tmp_path, index=False)
     os.replace(tmp_path, path)
-    log.info(f'  wrote {len(df):,} rows -> {path}')
     return True
 
 # (h) PIPELINE
@@ -772,47 +658,35 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
     test_csv = locate_split_csv('test', POS_DIR)
 
     if limit_rows:
-        log.warning(f'--limit {limit_rows} set: this is a DRY RUN on a row slice, not a real build')
+        print(f'--limit {limit_rows} set: this is a DRY RUN on a row slice, not a real build')
 
     parquet_dir = os.path.join(LOCAL_DATA_DIR, 'parquet')
 
-    with Stage('csv_to_parquet: train'):
-        train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'),
-                                   force=force, limit_rows=limit_rows)
-    with Stage('csv_to_parquet: val'):
-        val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'),
-                                 force=force, limit_rows=limit_rows)
-    with Stage('csv_to_parquet: test'):
-        test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'),
-                                  force=force, limit_rows=limit_rows)
+    train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'),
+                               force=force, limit_rows=limit_rows)
+    val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'),
+                             force=force, limit_rows=limit_rows)
+    test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'),
+                              force=force, limit_rows=limit_rows)
 
-    with Stage('game_level_frame: train'):
-        gl_train = game_level_frame(train_pq)
-        log.info(f'  {len(gl_train):,} unique games')
-    with Stage('game_level_frame: val'):
-        gl_val = game_level_frame(val_pq)
-        log.info(f'  {len(gl_val):,} unique games')
-    with Stage('game_level_frame: test'):
-        gl_test = game_level_frame(test_pq)
-        log.info(f'  {len(gl_test):,} unique games')
+    gl_train = game_level_frame(train_pq)
+    gl_val = game_level_frame(val_pq)
+    gl_test = game_level_frame(test_pq)
 
-    with Stage('write untouched game_id lists'):
-        write_csv_safely(gl_train[['game_id']], os.path.join(IDS_PATH, 'unf_train_ids.csv'), force)
-        write_csv_safely(gl_val[['game_id']], os.path.join(IDS_PATH, 'unf_val_ids.csv'), force)
-        write_csv_safely(gl_test[['game_id']], os.path.join(IDS_PATH, 'unf_test_ids.csv'), force)
+    write_csv_safely(gl_train[['game_id']], os.path.join(IDS_PATH, 'unf_train_ids.csv'), force)
+    write_csv_safely(gl_val[['game_id']], os.path.join(IDS_PATH, 'unf_val_ids.csv'), force)
+    write_csv_safely(gl_test[['game_id']], os.path.join(IDS_PATH, 'unf_test_ids.csv'), force)
 
     gl_val_wl = gl_val[gl_val['mover_result'] != 0.5].reset_index(drop=True)
     gl_test_wl = gl_test[gl_test['mover_result'] != 0.5].reset_index(drop=True)
 
-    with Stage('fit_elo_gap_thresholds'):
-        fit_result = fit_elo_gap_thresholds(gl_train, target_score=ELO_GAP_TARGET_SCORE, on_missing='keep_all')
+    fit_result = fit_elo_gap_thresholds(gl_train, target_score=ELO_GAP_TARGET_SCORE, on_missing='keep_all')
 
-    with Stage('apply_elo_gap_thresholds: all splits'):
-        train_kept = apply_elo_gap_thresholds(gl_train, fit_result)
-        val_kept = apply_elo_gap_thresholds(gl_val, fit_result)
-        test_kept = apply_elo_gap_thresholds(gl_test, fit_result)
-        val_kept_wl = apply_elo_gap_thresholds(gl_val_wl, fit_result)
-        test_kept_wl = apply_elo_gap_thresholds(gl_test_wl, fit_result)
+    train_kept = apply_elo_gap_thresholds(gl_train, fit_result)
+    val_kept = apply_elo_gap_thresholds(gl_val, fit_result)
+    test_kept = apply_elo_gap_thresholds(gl_test, fit_result)
+    val_kept_wl = apply_elo_gap_thresholds(gl_val_wl, fit_result)
+    test_kept_wl = apply_elo_gap_thresholds(gl_test_wl, fit_result)
 
     gl_train_res = gl_train[gl_train['game_id'].isin(train_kept)].reset_index(drop=True)
     gl_val_res = gl_val[gl_val['game_id'].isin(val_kept)].reset_index(drop=True)
@@ -820,20 +694,18 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
     gl_val_res_wl = gl_val_wl[gl_val_wl['game_id'].isin(val_kept_wl)].reset_index(drop=True)
     gl_test_res_wl = gl_test_wl[gl_test_wl['game_id'].isin(test_kept_wl)].reset_index(drop=True)
 
-    with Stage('write elo-gap-restricted game_id lists'):
-        write_csv_safely(gl_train_res[['game_id']], os.path.join(IDS_PATH, 'res_train_ids.csv'), force)
-        write_csv_safely(gl_val_res[['game_id']], os.path.join(IDS_PATH, 'res_val_ids.csv'), force)
-        write_csv_safely(gl_test_res[['game_id']], os.path.join(IDS_PATH, 'res_test_ids.csv'), force)
+    write_csv_safely(gl_train_res[['game_id']], os.path.join(IDS_PATH, 'res_train_ids.csv'), force)
+    write_csv_safely(gl_val_res[['game_id']], os.path.join(IDS_PATH, 'res_val_ids.csv'), force)
+    write_csv_safely(gl_test_res[['game_id']], os.path.join(IDS_PATH, 'res_test_ids.csv'), force)
 
-    with Stage('balance_positions_by_lowest_bin: val/test'):
-        gl_val_bal = balance_positions_by_lowest_bin(gl_val)
-        gl_val_bal_wl = balance_positions_by_lowest_bin(gl_val_wl)
-        gl_val_res_bal = balance_positions_by_lowest_bin(gl_val_res)
-        gl_val_res_bal_wl = balance_positions_by_lowest_bin(gl_val_res_wl)
-        gl_test_bal = balance_positions_by_lowest_bin(gl_test)
-        gl_test_bal_wl = balance_positions_by_lowest_bin(gl_test_wl)
-        gl_test_res_bal = balance_positions_by_lowest_bin(gl_test_res)
-        gl_test_res_bal_wl = balance_positions_by_lowest_bin(gl_test_res_wl)
+    gl_val_bal = balance_positions_by_lowest_bin(gl_val)
+    gl_val_bal_wl = balance_positions_by_lowest_bin(gl_val_wl)
+    gl_val_res_bal = balance_positions_by_lowest_bin(gl_val_res)
+    gl_val_res_bal_wl = balance_positions_by_lowest_bin(gl_val_res_wl)
+    gl_test_bal = balance_positions_by_lowest_bin(gl_test)
+    gl_test_bal_wl = balance_positions_by_lowest_bin(gl_test_wl)
+    gl_test_res_bal = balance_positions_by_lowest_bin(gl_test_res)
+    gl_test_res_bal_wl = balance_positions_by_lowest_bin(gl_test_res_wl)
 
     results = {'written': [], 'skipped': [], 'failed': []}
 
@@ -841,16 +713,14 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
                           name_prefix: str, variant: str) -> None:
         tag = f'{name_prefix}_{variant}' if variant else name_prefix
         try:
-            with Stage(f'stream_write_nested_sizes: {tag}'):
-                status = stream_write_nested_sizes(source_pq, game_level_df, sizes, out_dir,
-                                                    name_prefix, variant, force)
-                for n, s in status.items():
-                    label = f'{tag}_{_size_tag(n)}'
-                    results[s].append(label)
-                gc.collect()
+            status = stream_write_nested_sizes(source_pq, game_level_df, sizes, out_dir,
+                                                name_prefix, variant, force)
+            for n, s in status.items():
+                results[s].append(f'{tag}_{_size_tag(n)}')
+            gc.collect()
         except Exception as e:  # noqa: BLE001
             results['failed'].append((tag, str(e)))
-            log.error(f'  giving up on {tag}, moving to the next variant: {e}')
+            print(f'FAILED {tag}: {e} -- continuing with next variant')
 
     sample_and_write(gl_train, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', '')
     sample_and_write(gl_train_res, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', 'res')
@@ -885,31 +755,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 def main(argv: list[str] | None = None) -> None:
-    """Reads args and runs the pipeline, logging progress and failures throughout."""
+    """Reads args and runs the pipeline."""
     args = parse_args(argv)
 
-    global log
-    log = setup_logging()
+    print(f'POS_DIR        = {POS_DIR}')
+    print(f'LOCAL_DATA_DIR = {LOCAL_DATA_DIR}')
+    print(f'force={args.force}  limit={args.limit}')
 
-    log.info(f'POS_DIR (source/output CSVs) = {POS_DIR}')
-    log.info(f'LOCAL_DATA_DIR (parquet/tmp)  = {LOCAL_DATA_DIR}')
-    log.info(f'force={args.force}  limit={args.limit}')
+    results = run_pipeline(limit_rows=args.limit, force=args.force)
 
-    t0 = time.time()
-    try:
-        results = run_pipeline(limit_rows=args.limit, force=args.force)
-    except Exception:
-        log.error('Pipeline aborted -- see traceback above for the failing stage.')
-        raise
-
-    elapsed = time.time() - t0
-    log.info('=' * 60)
-    log.info(f"DONE in {elapsed / 60:.1f} min. {len(results['written'])} written, "
-             f"{len(results['skipped'])} skipped (already existed), {len(results['failed'])} failed.")
+    print(f"\nDone. {len(results['written'])} written, {len(results['skipped'])} skipped, "
+          f"{len(results['failed'])} failed.")
     if results['failed']:
-        log.error('Failed outputs (see log above for each traceback):')
+        print('Failed outputs:')
         for tag, err in results['failed']:
-            log.error(f'  - {tag}: {err}')
+            print(f'  - {tag}: {err}')
         sys.exit(1)
 
 ####################

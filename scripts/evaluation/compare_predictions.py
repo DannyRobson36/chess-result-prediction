@@ -4,7 +4,7 @@ Reads per-model prediction csvs against a fixed val/test positions df, merges th
 and provides eval-plots across models.
 
 Latest changes: 20/08/26:
-- PALETTE/colour assignment moved to utils_plotting
+- Plot functions take an optional figsize override, defaulting to BASE_FIGSIZE
 """
 
 import glob
@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
 from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, RESULT_TO_CLASS, RESULT_CLASS_NAMES
-from scripts.utils.utils_plotting import colors_for
+from scripts.utils.utils_plotting import colors_for, BASE_FIGSIZE
 from scripts.features.features import SEC_MAPPING
 
 ####################
@@ -127,7 +127,8 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
                               cfg: EloBinConfig = ELO_BINS,
                               ylim: tuple[float, float] = (50, 70),
                               title: str = 'Result prediction accuracy by Elo bin',
-                              show_hist: bool = False) -> None:
+                              show_hist: bool = False,
+                              figsize: tuple[float, float] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by mean elo."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, 'mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
@@ -141,7 +142,7 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
     true_class = binned[mover_result_col].map(RESULT_TO_CLASS).map(idx_to_name)
 
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
 
     for name in names:
         pred_class = binned[f'{name}_predicted_class']
@@ -179,7 +180,8 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
                           group_size: int = 20, max_ply: int = 200,
                           ylim: tuple[float, float] = (0, 80),
                           title: str = 'Result-prediction accuracy by plies played',
-                          show_hist: bool = False) -> None:
+                          show_hist: bool = False,
+                          figsize: tuple[float, float] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by plies played."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, ply_played_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -189,7 +191,7 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
 
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
 
     for name in names:
         pred_val = df[f'{name}_predicted_class'].map(class_to_val)
@@ -226,7 +228,8 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
                                      bin_width: float = 0.05,
                                      ylim: tuple[float, float] = (50, 80),
                                      title: str = 'Result-prediction accuracy by time remaining',
-                                     show_hist: bool = False) -> None:
+                                     show_hist: bool = False,
+                                     figsize: tuple[float, float] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by combined proportion of clock time remaining."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
@@ -246,7 +249,7 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
 
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
 
     for name in names:
         pred_val = df[f'{name}_predicted_class'].map(class_to_val)
@@ -280,7 +283,8 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
                   mover_result_col: str = 'mover_result',
                   positive_class: str | None = None,
                   ylim: tuple[float, float] = (0, 1),
-                  title: str | None = None) -> None:
+                  title: str | None = None,
+                  figsize: tuple[float, float] | None = None) -> None:
     """Plots ROC curves (one panel per class, or just positive_class if given) across models."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
@@ -297,8 +301,10 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
             classes_to_plot = ['win', 'loss']
             print('plot_roc_auc: all draw probabilities are 0 across every model -- skipping draw panel.')
 
+    panel_width, panel_height = figsize or BASE_FIGSIZE
     colors = colors_for(names)
-    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(8 * len(classes_to_plot), 8), squeeze=False)
+    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
+                              squeeze=False)
     axes = axes[0]
     if title:
         fig.suptitle(title)

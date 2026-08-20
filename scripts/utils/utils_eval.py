@@ -3,7 +3,7 @@ utils_eval.py
 Model-independent evaluation helpers: baselines, per-row metrics, binned accuracy, calibration.
 
 Latest changes: 19/08/26:
-- Added collapse_to_expected_score and binary_probit_prediction_cols
+- Corrected fit_binary_probit
 """
 
 import numpy as np
@@ -249,8 +249,11 @@ def fit_binary_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 20
     targets_t = torch.as_tensor(targets, dtype=torch.long)
     target_idx = 1 - targets_t  # TWO_WAY_CLASS_NAMES is loss=0/win=1; probs are win-first
 
-    c = torch.tensor(0.5, requires_grad=True)
-    log_sigma = torch.tensor(float(np.log(0.25)), requires_grad=True)
+    c = torch.tensor(float(preds_t.mean()), requires_grad=True)
+    sigma_init = float(preds_t.std())
+    if not np.isfinite(sigma_init) or sigma_init <= 0:
+        sigma_init = 1.0
+    log_sigma = torch.tensor(float(np.log(sigma_init)), requires_grad=True)
     optimizer = torch.optim.LBFGS([c, log_sigma], lr=0.1, max_iter=max_iter)
 
     def closure() -> torch.Tensor:

@@ -7,7 +7,7 @@ applied to train itself) before a random, game-level sample within each bin.
     python run_single_bin_pos_storage.py
 
 Latest changes: 20/08/26:
-- Altered to 500k size due to >=2200 bin limitations
+- One shared streaming pass over train.parquet 
 """
 
 import os
@@ -20,7 +20,7 @@ if _REPO_ROOT not in sys.path:
 from scripts.config import POS_DIR
 
 import argparse
-import gc
+import csv
 import glob
 import shutil
 from collections.abc import Iterator
@@ -154,8 +154,7 @@ def csv_to_parquet(csv_path: str, parquet_path: str) -> str:
     writer = None
     try:
         with open(csv_path, 'rb') as raw_file:
-            with tqdm(total=file_size, desc=os.path.basename(csv_path),
-                      unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+            with tqdm(total=file_size, desc='CSV -> Parquet', unit='B', unit_scale=True, unit_divisor=1024) as pbar:
                 last_pos = 0
                 for chunk in _read_csv_chunks(raw_file):
                     table = pa.Table.from_pandas(chunk, preserve_index=False)
@@ -202,8 +201,7 @@ def game_level_frame_from_parquet(parquet_path: str, columns: list = GAME_LEVEL_
     pf = pq.ParquetFile(parquet_path)
 
     def batches() -> Iterator[pd.DataFrame]:
-        with tqdm(total=pf.metadata.num_rows, desc=os.path.basename(parquet_path),
-                  unit='rows', unit_scale=True) as pbar:
+        with tqdm(total=pf.metadata.num_rows, desc='Aggregating games', unit='rows', unit_scale=True) as pbar:
             for batch in pf.iter_batches(columns=columns, batch_size=STREAM_BATCH_SIZE):
                 chunk = batch.to_pandas()
                 pbar.update(len(chunk))
@@ -349,42 +347,78 @@ def sample_bin_games(bin_pool: pd.DataFrame, target: int, random_state: int,
     rng = np.random.default_rng(random_state)
     return _cumulative_take_head(bin_pool[game_id_col].tolist(), pos_lookup, target, rng)
 
-# (e) POSITION POOL LOADING & WRITING
+# (e) STREAMED, MULTI-BIN POSITION WRITING
 
-def load_pool_positions(parquet_path: str, pool_game_ids: set, game_id_col: str = 'game_id') -> pd.DataFrame:
-    """Streams parquet_path, keeping only rows whose game_id is in pool_game_ids, into one in-memory frame."""
-    pf = pq.ParquetFile(parquet_path)
-    parts = []
-    with tqdm(total=pf.metadata.num_rows, desc='Loading pool positions', unit='rows', unit_scale=True) as pbar:
-        for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
-            chunk = batch.to_pandas()
-            pbar.update(len(chunk))
-            mask = chunk[game_id_col].isin(pool_game_ids)
-            if mask.any():
-                parts.append(chunk[mask])
-    return pd.concat(parts, ignore_index=True)
+def stream_write_single_bin_datasets(source_parquet_path: str, bin_ids: dict[int, list],
+                                      bin_boundary: dict[int, str | None], bin_trim: dict[int, int],
+                                      out_dir: str, size_tag: str) -> dict[int, int]:
+    """Streams source_parquet_path once, writing every bin's positions simultaneously to its own
+    file, applying each bin's own boundary-game trim to hit its exact target size. Returns
+    {bin_idx: n_rows_written}."""
+    game_to_bin: dict[str, int] = {}
+    for bin_idx, ids in bin_ids.items():
+        for gid in ids:
+            game_to_bin[gid] = bin_idx
 
-def write_position_csv_with_ids(df: pd.DataFrame, out_dir: str, filename: str) -> None:
-    """Writes df's positions to out_dir/filename and its unique game_id list to out_dir/ids, both atomically."""
     os.makedirs(out_dir, exist_ok=True)
     ids_dir = os.path.join(out_dir, 'ids')
     os.makedirs(ids_dir, exist_ok=True)
 
-    path = os.path.join(out_dir, filename)
-    tmp_path = path + '.tmp'
-    with tqdm(total=len(df), desc=filename, unit='rows', unit_scale=True) as pbar:
-        with open(tmp_path, 'w', newline='', encoding='utf-8') as f:
-            df.iloc[:0].to_csv(f, index=False)
-            for start in range(0, len(df), STREAM_BATCH_SIZE):
-                chunk = df.iloc[start:start + STREAM_BATCH_SIZE]
-                chunk.to_csv(f, index=False, header=False)
-                pbar.update(len(chunk))
-    os.replace(tmp_path, path)
+    active_bins = [b for b in bin_ids if bin_ids[b]]
+    tmp_paths = {b: os.path.join(out_dir, f'train_bin{b + 1}_{size_tag}.csv.tmp') for b in active_bins}
+    files = {b: open(tmp_paths[b], 'w', newline='', encoding='utf-8') for b in active_bins}
+    writers = {b: csv.DictWriter(files[b], fieldnames=POS_CSV_FIELDNAMES) for b in active_bins}
+    for w in writers.values():
+        w.writeheader()
 
-    ids_path = os.path.join(ids_dir, filename.replace('.csv', '_ids.csv'))
-    ids_tmp_path = ids_path + '.tmp'
-    df[['game_id']].drop_duplicates().to_csv(ids_tmp_path, index=False)
-    os.replace(ids_tmp_path, ids_path)
+    n_written = {b: 0 for b in active_bins}
+    seen_game_ids: dict[int, set] = {b: set() for b in active_bins}
+
+    def flush_game(gid: str, rows_for_game: list[dict]) -> None:
+        bin_idx = game_to_bin.get(gid)
+        if bin_idx is None:
+            return
+        rows_to_write = rows_for_game
+        if gid == bin_boundary.get(bin_idx) and bin_trim.get(bin_idx, 0) > 0:
+            keep_n = max(len(rows_for_game) - bin_trim[bin_idx], 0)
+            rng = np.random.default_rng(RANDOM_STATE + bin_idx + 1000)
+            idx = rng.choice(len(rows_for_game), size=min(keep_n, len(rows_for_game)), replace=False)
+            rows_to_write = [rows_for_game[i] for i in idx]
+        for row in rows_to_write:
+            writers[bin_idx].writerow(row)
+        n_written[bin_idx] += len(rows_to_write)
+        seen_game_ids[bin_idx].add(gid)
+
+    pf = pq.ParquetFile(source_parquet_path)
+    carry_game_id = None
+    carry_rows: list[dict] = []
+    try:
+        with tqdm(total=pf.metadata.num_rows, desc='Writing all bins', unit='rows', unit_scale=True) as pbar:
+            for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
+                chunk = batch.to_pandas()
+                for row in chunk.to_dict('records'):
+                    gid = row['game_id']
+                    if gid != carry_game_id:
+                        if carry_game_id is not None:
+                            flush_game(carry_game_id, carry_rows)
+                        carry_game_id = gid
+                        carry_rows = []
+                    carry_rows.append(row)
+                pbar.update(len(chunk))
+                pbar.set_postfix({f'bin{b + 1}': n_written[b] for b in active_bins}, refresh=False)
+            if carry_game_id is not None:
+                flush_game(carry_game_id, carry_rows)
+    finally:
+        for f in files.values():
+            f.close()
+
+    for bin_idx in active_bins:
+        final_path = os.path.join(out_dir, f'train_bin{bin_idx + 1}_{size_tag}.csv')
+        os.replace(tmp_paths[bin_idx], final_path)
+        ids_path = os.path.join(ids_dir, f'train_bin{bin_idx + 1}_{size_tag}_ids.csv')
+        pd.DataFrame({'game_id': sorted(seen_game_ids[bin_idx])}).to_csv(ids_path, index=False)
+
+    return n_written
 
 def _size_tag(n: int) -> str:
     if n >= 1_000_000:
@@ -417,36 +451,21 @@ def run_pipeline() -> dict[str, int]:
     binned, bin_edges = _mean_bin_gap_and_res_better(gl_train_res, ELO_LOWER, ELO_UPPER, ELO_STEP, TAILS)
     labels = elo_bin_labels(bin_edges)
 
-    summary = {}
-    for bin_idx, label in enumerate(tqdm(labels, desc='Building single-bin datasets', unit='bin')):
+    bin_ids: dict[int, list] = {}
+    bin_boundary: dict[int, str | None] = {}
+    bin_trim: dict[int, int] = {}
+    for bin_idx in range(len(labels)):
         bin_pool = binned[binned['mean_bin'] == bin_idx].reset_index(drop=True)
         kept_ids, total_positions = sample_bin_games(bin_pool, SINGLE_BIN_SIZE, random_state=RANDOM_STATE + bin_idx)
+        bin_ids[bin_idx] = kept_ids
+        bin_boundary[bin_idx] = kept_ids[-1] if kept_ids else None
+        bin_trim[bin_idx] = max(0, total_positions - SINGLE_BIN_SIZE)
 
-        if not kept_ids:
-            summary[label] = 0
-            continue
+    n_written = stream_write_single_bin_datasets(
+        train_pq, bin_ids, bin_boundary, bin_trim, SINGLE_BIN_TRAIN_OUT, _size_tag(SINGLE_BIN_SIZE),
+    )
 
-        rows = load_pool_positions(train_pq, set(kept_ids))
-
-        trim = total_positions - min(total_positions, SINGLE_BIN_SIZE)
-        if trim > 0:
-            boundary_game = kept_ids[-1]
-            boundary_idx = rows.index[rows['game_id'] == boundary_game]
-            keep_n = max(len(boundary_idx) - trim, 0)
-            rng = np.random.default_rng(RANDOM_STATE + bin_idx + 1000)
-            keep_idx = rng.choice(boundary_idx.to_numpy(), size=min(keep_n, len(boundary_idx)), replace=False)
-            drop_idx = boundary_idx.difference(pd.Index(keep_idx))
-            rows = rows.drop(index=drop_idx)
-
-        rows = rows.sample(frac=1, random_state=RANDOM_STATE + bin_idx).reset_index(drop=True)
-
-        fname = f'train_bin{bin_idx + 1}_{_size_tag(SINGLE_BIN_SIZE)}.csv'
-        write_position_csv_with_ids(rows, SINGLE_BIN_TRAIN_OUT, fname)
-        summary[label] = len(rows)
-        del rows
-        gc.collect()
-
-    return summary
+    return {labels[b]: n_written.get(b, 0) for b in range(len(labels))}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """No CLI arguments; parses only for --help consistency with other CLI scripts."""

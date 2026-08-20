@@ -3,7 +3,7 @@ utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
 Latest changes: 19/08/26:
-- Commenting conciseness fix
+- Added mover-perspective auxiliary targets
 """
 
 import numpy as np
@@ -42,7 +42,10 @@ GAP_BIN_WIDTH = 10
 RESULT_TO_CLASS = {0.0: 0, 0.5: 1, 1.0: 2} 
 RESULT_CLASS_NAMES = ['loss', 'draw', 'win']
 
-# Title encoding. Fixed vocabulary matching Lichess's title set 
+# Title encoding. Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
+# lichess.org/qa/4451), rather than fit from train data, since it's a small, effectively
+# closed set. 'no_title' matches the label run_pos_storage.py substitutes for the raw 'None'
+# sentinel; 'unk' is a safety net for any value outside this vocabulary.
 TITLE_TO_IDX = {
     'no_title': 0,
     'GM': 1,
@@ -130,6 +133,26 @@ def fen_to_token_ids(fen: str) -> torch.Tensor:
     """Converts a FEN into a LongTensor of FEN_VOCAB indices."""
     ids = [FEN_VOCAB.get(ch, 0) for ch in fen_to_char_string(fen)]
     return torch.tensor(ids, dtype=torch.long)
+
+
+def fen_to_legal_dest(fen: str) -> torch.Tensor:
+    """Converts a FEN into a (64,) mover-perspective legal-move-destination multi-hot tensor."""
+    board, _ = _mover_perspective_board(fen)
+    arr = np.zeros(64, dtype=np.float32)
+    for move in board.legal_moves:
+        arr[move.to_square] = 1.0
+    return torch.from_numpy(arr)
+
+
+def fen_to_attacked_squares(fen: str) -> torch.Tensor:
+    """Converts a FEN into a (2, 64) mover-perspective attacked-squares tensor: row 0 mover, row 1 opponent."""
+    board, _ = _mover_perspective_board(fen)
+    arr = np.zeros((2, 64), dtype=np.float32)
+    for square, piece in board.piece_map().items():
+        row = 0 if piece.color == chess.WHITE else 1
+        for attacked in board.attacks(square):
+            arr[row, attacked] = 1.0
+    return torch.from_numpy(arr)
 
 
 # (b) COMPUTE GAME PHASE FROM FEN

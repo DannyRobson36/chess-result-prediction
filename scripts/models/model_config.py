@@ -2,8 +2,8 @@
 model_config.py
 Allows for configuration of model's parameters, depends on flexibility allowed in model_arch.py
 
-Latest changes: 18/08/26:
-- Added LogRegBaselineConfig
+Latest changes: 20/08/26:
+- Added AuxHeadConfig
 """
 
 from dataclasses import dataclass, field, asdict
@@ -19,6 +19,12 @@ class BaseModelConfig:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+@dataclass
+class AuxHeadConfig:
+    """Auxiliary legal-move/attacked-square head: on/off flag and combined loss weight."""
+    enabled: bool = False
+    loss_weight: float | None = None
 
 # (a) LOGISTIC REGRESSION (BASELINES) - CONFIG
 
@@ -62,6 +68,8 @@ class Maia2ValueBoardConfig(BaseModelConfig):
     value_activation: str = "relu"
     value_dropout: float = 0.1
 
+    aux_head: AuxHeadConfig = field(default_factory=AuxHeadConfig)
+
 @dataclass
 class Maia2ValueReplicaConfig(BaseModelConfig):
     """Config for Maia2ValueReplica: non-exact replica of Maia2, value head only."""
@@ -93,6 +101,8 @@ class Maia2ValueReplicaConfig(BaseModelConfig):
     value_hidden_dim: int = 64
     value_activation: str = "relu"
     value_dropout: float = 0.1
+
+    aux_head: AuxHeadConfig = field(default_factory=AuxHeadConfig)
 
 @dataclass
 class Maia2ValueFeatureConfig(BaseModelConfig):
@@ -128,6 +138,8 @@ class Maia2ValueFeatureConfig(BaseModelConfig):
     value_activation: str = "relu"
     value_dropout: float = 0.1
 
+    aux_head: AuxHeadConfig = field(default_factory=AuxHeadConfig)
+
 
 # (c) PURE-TRANSFORMER MODELS - CONFIG
 
@@ -157,3 +169,5 @@ class PureTransformerConfig(BaseModelConfig):
     value_hidden_dim: int = 64
     value_activation: str = "relu"
     value_dropout: float = 0.1
+
+    aux_head: AuxHeadConfig = field(default_factory=AuxHeadConfig)

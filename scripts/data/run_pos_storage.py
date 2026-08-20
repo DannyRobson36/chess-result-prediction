@@ -1,15 +1,15 @@
 """
 run_pos_storage.py
-Builds train/val/test model-ready position CSVs from run_pos_reader.py's output, sampling
-each to a set of target sizes with elo-bin-proportional, game-level (not position-level)
-selection so smaller datasets are strict subsets of larger ones and long games keep their
-natural over-representation.
+Builds one split's (train, val, or test) model-ready position CSVs from run_pos_reader.py's
+output, sampling a random game-level pool into memory, then sizing it down with elo-bin-
+proportional, game-level selection so smaller datasets are strict subsets of larger ones.
 
-    python run_pos_storage.py          normal run
-    python run_pos_storage.py --force  rebuild everything
+    python run_pos_storage.py train
+    python run_pos_storage.py val
+    python run_pos_storage.py test
 
 Latest changes: 20/08/26:
-- tqdm progress bars v2
+- One split (t/v/t) per-run and revert to using System-RAM
 """
 
 import os
@@ -22,11 +22,12 @@ if _REPO_ROOT not in sys.path:
 from scripts.config import POS_DIR
 
 import argparse
-import csv
 import gc
 import glob
 import heapq
 import shutil
+from collections.abc import Iterator
+from typing import IO
 
 import numpy as np
 import pandas as pd
@@ -43,8 +44,10 @@ SPLITS = ['train', 'val', 'test']
 LOCAL_DATA_DIR = os.environ.get('LOCAL_DATA_DIR', '/content/local_data')
 
 TRAIN_SIZES = [100_000, 500_000, 2_500_000, 12_500_000, 62_500_000]
-VAL_SIZES = [100_000, 900_000]
-TEST_SIZES = [900_000]
+VAL_TEST_SIZE = 900_000
+
+# Target position count for each split's randomly-sampled in-memory game pool.
+POOL_POSITIONS = {'train': 100_000_000, 'val': 50_000_000, 'test': 50_000_000}
 
 ELO_LOWER = 800
 ELO_UPPER = 2200
@@ -56,10 +59,10 @@ ELO_GAP_TARGET_SCORE = 0.55
 CONFIDENCE_Z = 3.0
 RANDOM_STATE = 0
 
-# Cap on games used to fit elo-gap thresholds; train is too large to fit on in full.
+# Cap on games used to fit elo-gap thresholds, always a random subsample of train.
 ELO_GAP_FIT_SAMPLE_SIZE = 3_000_000
 
-# Row count per streamed read/write batch, for both CSV and Parquet passes.
+# Row count per streamed read/write batch, for CSV, Parquet, and final-write passes.
 STREAM_BATCH_SIZE = 500_000
 
 MIN_FREE_DISK_GB = 60.0
@@ -102,14 +105,14 @@ TITLE_NO_TITLE_RAW = 'None'
 # Relabeled value: avoids colliding with the default NA-string list most CSV/DataFrame readers use.
 TITLE_NO_TITLE_VALUE = 'no_title'
 
-# Columns needed for game-level allocation/threshold decisions; everything else is only ever
-# read again from the position-level Parquet at final-write time.
+# Columns needed for game-level allocation/threshold decisions.
 GAME_LEVEL_COLS = ['game_id', 'mover_elo', 'opponent_elo', 'mover_result']
 
-IDS_PATH = os.path.join(POS_DIR, 'ids')
-TRAIN_OUT = os.path.join(POS_DIR, 'train')
-VAL_OUT, VAL_OUT_WL = os.path.join(POS_DIR, 'val'), os.path.join(POS_DIR, 'val', 'wl')
-TEST_OUT, TEST_OUT_WL = os.path.join(POS_DIR, 'test'), os.path.join(POS_DIR, 'test', 'wl')
+TRAIN_OUT = os.path.join(POS_DIR, 'train_data')
+VAL_OUT = os.path.join(POS_DIR, 'val_data')
+VAL_OUT_WL = os.path.join(VAL_OUT, 'wl')
+TEST_OUT = os.path.join(POS_DIR, 'test_data')
+TEST_OUT_WL = os.path.join(TEST_OUT, 'wl')
 
 ####################
 # FUNCTIONS
@@ -136,7 +139,7 @@ def _check_disk_space(path: str, required_gb: float, label: str = '') -> None:
             f'{free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
         )
 
-def _read_csv_chunks(csv_source):
+def _read_csv_chunks(csv_source: IO[bytes]) -> Iterator[pd.DataFrame]:
     """Yields correctly-typed, title-relabeled chunks of csv_source, streamed."""
     reader = pd.read_csv(
         csv_source, dtype=POS_READ_DTYPES, parse_dates=POS_PARSE_DATES,
@@ -152,12 +155,10 @@ def _read_csv_chunks(csv_source):
             chunk[col] = chunk[col].astype('bool')
         yield chunk
 
-def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False) -> str:
-    """Converts a CSV to Parquet on local disk once, streaming in bounded-size chunks."""
+def csv_to_parquet(csv_path: str, parquet_path: str) -> str:
+    """Converts a CSV to Parquet on local disk, streaming in bounded-size chunks, always overwriting."""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f'csv_to_parquet: source CSV not found: {csv_path}')
-    if not force and os.path.exists(parquet_path):
-        return parquet_path
 
     os.makedirs(os.path.dirname(parquet_path), exist_ok=True)
     tmp_path = parquet_path + '.tmp'
@@ -190,30 +191,60 @@ def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False) -> str
 
 # (b) GAME-LEVEL AGGREGATION
 
-def game_level_frame(parquet_path: str, game_id_col: str = 'game_id') -> pd.DataFrame:
-    """Streams parquet_path in batches, aggregating to one row per game_id: elo/result (from
-    the first row seen) plus n_positions (a running count), never materializing the full
-    position-level table."""
-    pf = pq.ParquetFile(parquet_path)
+def _aggregate_game_level(batches: Iterator[pd.DataFrame], game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Incrementally aggregates streamed batches into one row per game_id with a running n_positions count."""
     agg: dict[str, dict] = {}
-
-    for batch in pf.iter_batches(columns=GAME_LEVEL_COLS, batch_size=STREAM_BATCH_SIZE):
-        chunk = batch.to_pandas()
+    for chunk in batches:
         grouped = chunk.groupby(game_id_col, sort=False)
         first = grouped.first()
         counts = grouped.size()
         for gid, row in first.iterrows():
             entry = agg.get(gid)
             if entry is None:
-                agg[gid] = {'mover_elo': row['mover_elo'], 'opponent_elo': row['opponent_elo'],
-                            'mover_result': row['mover_result'], 'n_positions': int(counts[gid])}
+                agg[gid] = {**row.to_dict(), 'n_positions': int(counts[gid])}
             else:
                 entry['n_positions'] += int(counts[gid])
 
     game_df = pd.DataFrame.from_dict(agg, orient='index')
     game_df.index.name = game_id_col
-    game_df = game_df.reset_index()
-    return game_df
+    return game_df.reset_index()
+
+def game_level_frame_from_parquet(parquet_path: str, columns: list = GAME_LEVEL_COLS,
+                                   game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Streams parquet_path in row-group batches, returning one row per game_id."""
+    pf = pq.ParquetFile(parquet_path)
+
+    def batches() -> Iterator[pd.DataFrame]:
+        with tqdm(total=pf.metadata.num_rows, desc=os.path.basename(parquet_path),
+                  unit='rows', unit_scale=True) as pbar:
+            for batch in pf.iter_batches(columns=columns, batch_size=STREAM_BATCH_SIZE):
+                chunk = batch.to_pandas()
+                pbar.update(len(chunk))
+                yield chunk
+
+    return _aggregate_game_level(batches(), game_id_col)
+
+def game_level_frame_from_csv(csv_path: str, columns: list = GAME_LEVEL_COLS,
+                               game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Streams csv_path directly, without a Parquet conversion, returning one row per game_id."""
+    dtype = {c: POS_READ_DTYPES[c] for c in columns if c in POS_READ_DTYPES}
+    file_size = os.path.getsize(csv_path)
+
+    def batches() -> Iterator[pd.DataFrame]:
+        with open(csv_path, 'rb') as f:
+            reader = pd.read_csv(f, usecols=columns, dtype=dtype, keep_default_na=False,
+                                  na_values=[''], chunksize=STREAM_BATCH_SIZE, low_memory=False)
+            with tqdm(total=file_size, desc=os.path.basename(csv_path),
+                      unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+                last_pos = 0
+                for chunk in reader:
+                    yield chunk
+                    current_pos = f.tell()
+                    if current_pos > last_pos:
+                        pbar.update(current_pos - last_pos)
+                        last_pos = current_pos
+
+    return _aggregate_game_level(batches(), game_id_col)
 
 # (c) ELO BINNING / GAP-THRESHOLD FITTING
 
@@ -285,8 +316,7 @@ def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, game_id_
                             tails: bool = TAILS, gap_bin_width: int = GAP_BIN_WIDTH,
                             on_missing: str = 'keep_all', fit_sample_size: int = ELO_GAP_FIT_SAMPLE_SIZE,
                             random_state: int = RANDOM_STATE) -> dict:
-    """Fits a per-elo-bin gap threshold on a random sample of up to fit_sample_size games from
-    df_train; apply_elo_gap_thresholds reuses this on every other split without refitting."""
+    """Fits a per-elo-bin gap threshold on a random sample of up to fit_sample_size games from df_train."""
     if on_missing not in ('keep_all', 'drop_all'):
         raise ValueError(f"on_missing must be 'keep_all' or 'drop_all', got {on_missing!r}")
 
@@ -430,7 +460,31 @@ def _allocate_with_caps(total: int, props: dict, caps: dict) -> tuple:
 
     return {k: int(round(v)) for k, v in allocation.items()}, capped_bins
 
-# (e) GAME ORDERING FOR NESTED SIZES
+# (e) POSITION POOL SAMPLING
+
+def sample_position_pool(game_level_df: pd.DataFrame, target_positions: int,
+                          random_state: int = RANDOM_STATE) -> pd.DataFrame:
+    """Randomly shuffles game_level_df and returns a prefix whose cumulative n_positions reaches target_positions."""
+    shuffled = game_level_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    cum = shuffled['n_positions'].cumsum()
+    cutoff = int(cum.searchsorted(target_positions)) + 1
+    cutoff = min(cutoff, len(shuffled))
+    return shuffled.iloc[:cutoff].reset_index(drop=True)
+
+def load_pool_positions(parquet_path: str, pool_game_ids: set, game_id_col: str = 'game_id') -> pd.DataFrame:
+    """Streams parquet_path, keeping only rows whose game_id is in pool_game_ids, into one in-memory frame."""
+    pf = pq.ParquetFile(parquet_path)
+    parts = []
+    with tqdm(total=pf.metadata.num_rows, desc='Loading pool positions', unit='rows', unit_scale=True) as pbar:
+        for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
+            chunk = batch.to_pandas()
+            pbar.update(len(chunk))
+            mask = chunk[game_id_col].isin(pool_game_ids)
+            if mask.any():
+                parts.append(chunk[mask])
+    return pd.concat(parts, ignore_index=True)
+
+# (f) GAME ORDERING FOR NESTED SIZES
 
 def _proportional_interleave(bin_game_lists: dict, allocation: dict) -> list:
     """Merges each bin's own randomly-ordered game list into one order where any prefix stays
@@ -521,8 +575,6 @@ def _compute_ordered_games(game_level_df: pd.DataFrame, sizes: list, lower: int 
     pos_counts = game_df.set_index(game_id_col)['n_positions'].to_dict()
     return ordered_games, pos_counts
 
-# (f) STREAMED, MULTI-SIZE POSITION WRITING
-
 def _build_tier_lookup(ordered_games: list, pos_counts: dict, sizes: list) -> dict:
     """Resolves per-tier cutoffs, boundary games, trim counts, and a game_id -> smallest-tier-
     index map, from one shared nested selection."""
@@ -548,86 +600,58 @@ def _build_tier_lookup(ordered_games: list, pos_counts: dict, sizes: list) -> di
         'game_to_min_tier': game_to_min_tier,
     }
 
-def stream_write_nested_sizes(source_parquet_path: str, game_level_df: pd.DataFrame, sizes: list,
-                               out_dir: str, name_prefix: str, variant: str, force: bool,
-                               random_state: int = RANDOM_STATE) -> dict:
-    """Streams source_parquet_path once, writing every size in sizes simultaneously: a game
-    selected for a smaller size is also written to every larger size's file (nested subsets),
-    with a per-tier random position trim on each tier's single boundary game to hit exact
-    target sizes. Returns {size: 'written' | 'skipped'}."""
-    size_tags = {n: _size_tag(n) for n in sizes}
-    out_paths = {}
-    for n in sizes:
-        fname = f'{name_prefix}_{size_tags[n]}_{variant}.csv' if variant else f'{name_prefix}_{size_tags[n]}.csv'
-        out_paths[n] = os.path.join(out_dir, fname)
+# (g) MATERIALIZATION & WRITING
 
-    pending_sizes = [n for n in sizes if force or not os.path.exists(out_paths[n])]
-    status = {n: ('written' if n in pending_sizes else 'skipped') for n in sizes}
-    if not pending_sizes:
-        return status
-
-    ordered_games, pos_counts = _compute_ordered_games(game_level_df, pending_sizes, random_state=random_state)
-    lookup = _build_tier_lookup(ordered_games, pos_counts, pending_sizes)
+def materialize_nested_sizes(pool_df: pd.DataFrame, game_level_df: pd.DataFrame, sizes: list[int],
+                              random_state: int = RANDOM_STATE, game_id_col: str = 'game_id') -> dict[int, pd.DataFrame]:
+    """Slices pool_df into one DataFrame per size in sizes, using game_level_df's elo-bin-
+    proportional game ordering so smaller sizes' rows are subsets of larger sizes' rows."""
+    ordered_games, pos_counts = _compute_ordered_games(game_level_df, sizes, game_id_col=game_id_col,
+                                                         random_state=random_state)
+    lookup = _build_tier_lookup(ordered_games, pos_counts, sizes)
     sizes_sorted = lookup['sizes_sorted']
     boundary_game = lookup['boundary_game']
     trim_count = lookup['trim_count']
     game_to_min_tier = lookup['game_to_min_tier']
 
+    tier_series = pool_df[game_id_col].map(game_to_min_tier)
+
+    results = {}
+    for t, size in enumerate(sizes_sorted):
+        mask = tier_series.notna() & (tier_series <= t)
+        subset = pool_df[mask]
+        trim = trim_count[t]
+        if trim > 0 and boundary_game[t] is not None:
+            boundary_idx = subset.index[subset[game_id_col] == boundary_game[t]]
+            keep_n = max(len(boundary_idx) - trim, 0)
+            rng = np.random.default_rng(random_state + t)
+            keep_idx = rng.choice(boundary_idx.to_numpy(), size=min(keep_n, len(boundary_idx)), replace=False)
+            drop_idx = boundary_idx.difference(pd.Index(keep_idx))
+            subset = subset.drop(index=drop_idx)
+        results[size] = subset.reset_index(drop=True)
+    return results
+
+def write_position_csv_with_ids(df: pd.DataFrame, out_dir: str, filename: str) -> None:
+    """Writes df's positions to out_dir/filename and its unique game_id list to out_dir/ids, both atomically."""
     os.makedirs(out_dir, exist_ok=True)
-    tmp_paths = {n: out_paths[n] + '.tmp' for n in pending_sizes}
-    files = {n: open(tmp_paths[n], 'w', newline='', encoding='utf-8') for n in pending_sizes}
-    writers = {n: csv.DictWriter(files[n], fieldnames=POS_CSV_FIELDNAMES) for n in pending_sizes}
-    for w in writers.values():
-        w.writeheader()
+    ids_dir = os.path.join(out_dir, 'ids')
+    os.makedirs(ids_dir, exist_ok=True)
 
-    n_written = {n: 0 for n in pending_sizes}
-    trim_rng_seed = {n: random_state + i for i, n in enumerate(sizes_sorted)}
-
-    def flush_game(gid: str, rows_for_game: list[dict]) -> None:
-        if gid not in game_to_min_tier:
-            return
-        min_tier = game_to_min_tier[gid]
-        for t in range(min_tier, len(sizes_sorted)):
-            size = sizes_sorted[t]
-            if size not in writers:
-                continue
-            rows_to_write = rows_for_game
-            if gid == boundary_game[t] and trim_count[t] > 0:
-                keep_n = max(len(rows_for_game) - trim_count[t], 0)
-                rng = np.random.default_rng(trim_rng_seed[size])
-                idx = rng.choice(len(rows_for_game), size=min(keep_n, len(rows_for_game)), replace=False)
-                rows_to_write = [rows_for_game[i] for i in idx]
-            for row in rows_to_write:
-                writers[size].writerow(row)
-            n_written[size] += len(rows_to_write)
-
-    pf = pq.ParquetFile(source_parquet_path)
-    desc = f'{name_prefix}_{variant}' if variant else name_prefix
-    carry_game_id = None
-    carry_rows: list[dict] = []
-    try:
-        with tqdm(total=pf.metadata.num_rows, desc=desc, unit='rows', unit_scale=True) as pbar:
-            for batch in pf.iter_batches(columns=POS_CSV_FIELDNAMES, batch_size=STREAM_BATCH_SIZE):
-                chunk = batch.to_pandas()
+    path = os.path.join(out_dir, filename)
+    tmp_path = path + '.tmp'
+    with tqdm(total=len(df), desc=filename, unit='rows', unit_scale=True) as pbar:
+        with open(tmp_path, 'w', newline='', encoding='utf-8') as f:
+            df.iloc[:0].to_csv(f, index=False)
+            for start in range(0, len(df), STREAM_BATCH_SIZE):
+                chunk = df.iloc[start:start + STREAM_BATCH_SIZE]
+                chunk.to_csv(f, index=False, header=False)
                 pbar.update(len(chunk))
-                for row in chunk.to_dict('records'):
-                    gid = row['game_id']
-                    if gid != carry_game_id:
-                        if carry_game_id is not None:
-                            flush_game(carry_game_id, carry_rows)
-                        carry_game_id = gid
-                        carry_rows = []
-                    carry_rows.append(row)
-            if carry_game_id is not None:
-                flush_game(carry_game_id, carry_rows)
-    finally:
-        for f in files.values():
-            f.close()
+    os.replace(tmp_path, path)
 
-    for n in pending_sizes:
-        os.replace(tmp_paths[n], out_paths[n])
-
-    return status
+    ids_path = os.path.join(ids_dir, filename.replace('.csv', '_ids.csv'))
+    ids_tmp_path = ids_path + '.tmp'
+    df[['game_id']].drop_duplicates().to_csv(ids_tmp_path, index=False)
+    os.replace(ids_tmp_path, ids_path)
 
 def _size_tag(n: int) -> str:
     if n >= 1_000_000:
@@ -638,132 +662,105 @@ def _size_tag(n: int) -> str:
         return f'{int(value)}{unit}'
     return f'{value:g}'.replace('.', 'p') + unit
 
-# (g) PIPELINE HELPERS
-
-def write_csv_safely(df: pd.DataFrame, path: str, force: bool) -> bool:
-    """Writes df to path, skipping if it exists unless force=True."""
-    if os.path.exists(path) and not force:
-        return False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = path + '.tmp'
-    df.to_csv(tmp_path, index=False)
-    os.replace(tmp_path, path)
-    return True
-
 # (h) PIPELINE
 
-def run_pipeline(force: bool) -> dict:
+def _write_train_outputs(pool_df: pd.DataFrame, gl_pool: pd.DataFrame,
+                          gl_pool_res: pd.DataFrame) -> list[tuple[str, str]]:
+    """Writes train's raw and elo-gap-restricted variants at every nested size in TRAIN_SIZES."""
+    failures = []
+    for game_level_df, variant in [(gl_pool, ''), (gl_pool_res, 'res')]:
+        sized = materialize_nested_sizes(pool_df, game_level_df, TRAIN_SIZES, random_state=RANDOM_STATE)
+        for size, df in sized.items():
+            tag = _size_tag(size)
+            fname = f'train_{tag}_{variant}.csv' if variant else f'train_{tag}.csv'
+            try:
+                write_position_csv_with_ids(df, TRAIN_OUT, fname)
+            except Exception as e:  # noqa: BLE001
+                failures.append((fname, str(e)))
+            gc.collect()
+    return failures
+
+def _write_val_test_outputs(split: str, pool_df: pd.DataFrame, gl_pool: pd.DataFrame,
+                             gl_pool_res: pd.DataFrame) -> list[tuple[str, str]]:
+    """Writes val or test's raw/restricted/balanced/wl variant combinations at VAL_TEST_SIZE."""
+    base_dir = VAL_OUT if split == 'val' else TEST_OUT
+    wl_dir = VAL_OUT_WL if split == 'val' else TEST_OUT_WL
+
+    gl_pool_wl = gl_pool[gl_pool['mover_result'] != 0.5].reset_index(drop=True)
+    gl_pool_res_wl = gl_pool_res[gl_pool_res['mover_result'] != 0.5].reset_index(drop=True)
+    gl_pool_bal = balance_positions_by_lowest_bin(gl_pool)
+    gl_pool_res_bal = balance_positions_by_lowest_bin(gl_pool_res)
+    gl_pool_bal_wl = balance_positions_by_lowest_bin(gl_pool_wl)
+    gl_pool_res_bal_wl = balance_positions_by_lowest_bin(gl_pool_res_wl)
+
+    variants = [
+        (gl_pool, base_dir, ''),
+        (gl_pool_res, base_dir, 'res'),
+        (gl_pool_bal, base_dir, 'bal'),
+        (gl_pool_res_bal, base_dir, 'res_bal'),
+        (gl_pool_wl, wl_dir, 'wl'),
+        (gl_pool_res_wl, wl_dir, 'res_wl'),
+        (gl_pool_bal_wl, wl_dir, 'bal_wl'),
+        (gl_pool_res_bal_wl, wl_dir, 'res_bal_wl'),
+    ]
+
+    failures = []
+    for game_level_df, out_dir, variant in variants:
+        sized = materialize_nested_sizes(pool_df, game_level_df, [VAL_TEST_SIZE], random_state=RANDOM_STATE)
+        df = sized[VAL_TEST_SIZE]
+        tag = _size_tag(VAL_TEST_SIZE)
+        fname = f'{split}_{tag}_{variant}.csv' if variant else f'{split}_{tag}.csv'
+        try:
+            write_position_csv_with_ids(df, out_dir, fname)
+        except Exception as e:  # noqa: BLE001
+            failures.append((fname, str(e)))
+        gc.collect()
+    return failures
+
+def run_pipeline(split: str) -> list[tuple[str, str]]:
+    """Builds every output CSV and its ids sidecar for one split: train, val, or test."""
     _check_disk_space(LOCAL_DATA_DIR, MIN_FREE_DISK_GB, 'LOCAL_DATA_DIR')
 
-    train_csv = locate_split_csv('train', POS_DIR)
-    val_csv = locate_split_csv('val', POS_DIR)
-    test_csv = locate_split_csv('test', POS_DIR)
-
+    split_csv = locate_split_csv(split, POS_DIR)
     parquet_dir = os.path.join(LOCAL_DATA_DIR, 'parquet')
+    split_pq = csv_to_parquet(split_csv, os.path.join(parquet_dir, f'{split}.parquet'))
 
-    train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'), force=force)
-    val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'), force=force)
-    test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'), force=force)
+    gl_split = game_level_frame_from_parquet(split_pq)
 
-    gl_train = game_level_frame(train_pq)
-    gl_val = game_level_frame(val_pq)
-    gl_test = game_level_frame(test_pq)
+    if split == 'train':
+        gl_train_full = gl_split
+    else:
+        train_csv = locate_split_csv('train', POS_DIR)
+        gl_train_full = game_level_frame_from_csv(train_csv)
 
-    write_csv_safely(gl_train[['game_id']], os.path.join(IDS_PATH, 'unf_train_ids.csv'), force)
-    write_csv_safely(gl_val[['game_id']], os.path.join(IDS_PATH, 'unf_val_ids.csv'), force)
-    write_csv_safely(gl_test[['game_id']], os.path.join(IDS_PATH, 'unf_test_ids.csv'), force)
+    fit_result = fit_elo_gap_thresholds(gl_train_full, target_score=ELO_GAP_TARGET_SCORE,
+                                         fit_sample_size=ELO_GAP_FIT_SAMPLE_SIZE, on_missing='keep_all')
 
-    gl_val_wl = gl_val[gl_val['mover_result'] != 0.5].reset_index(drop=True)
-    gl_test_wl = gl_test[gl_test['mover_result'] != 0.5].reset_index(drop=True)
+    gl_pool = sample_position_pool(gl_split, POOL_POSITIONS[split], random_state=RANDOM_STATE)
+    pool_ids = set(gl_pool['game_id'])
+    pool_df = load_pool_positions(split_pq, pool_ids)
 
-    fit_result = fit_elo_gap_thresholds(gl_train, target_score=ELO_GAP_TARGET_SCORE, on_missing='keep_all')
+    res_ids = apply_elo_gap_thresholds(gl_pool, fit_result)
+    gl_pool_res = gl_pool[gl_pool['game_id'].isin(res_ids)].reset_index(drop=True)
 
-    train_kept = apply_elo_gap_thresholds(gl_train, fit_result)
-    val_kept = apply_elo_gap_thresholds(gl_val, fit_result)
-    test_kept = apply_elo_gap_thresholds(gl_test, fit_result)
-    val_kept_wl = apply_elo_gap_thresholds(gl_val_wl, fit_result)
-    test_kept_wl = apply_elo_gap_thresholds(gl_test_wl, fit_result)
-
-    gl_train_res = gl_train[gl_train['game_id'].isin(train_kept)].reset_index(drop=True)
-    gl_val_res = gl_val[gl_val['game_id'].isin(val_kept)].reset_index(drop=True)
-    gl_test_res = gl_test[gl_test['game_id'].isin(test_kept)].reset_index(drop=True)
-    gl_val_res_wl = gl_val_wl[gl_val_wl['game_id'].isin(val_kept_wl)].reset_index(drop=True)
-    gl_test_res_wl = gl_test_wl[gl_test_wl['game_id'].isin(test_kept_wl)].reset_index(drop=True)
-
-    write_csv_safely(gl_train_res[['game_id']], os.path.join(IDS_PATH, 'res_train_ids.csv'), force)
-    write_csv_safely(gl_val_res[['game_id']], os.path.join(IDS_PATH, 'res_val_ids.csv'), force)
-    write_csv_safely(gl_test_res[['game_id']], os.path.join(IDS_PATH, 'res_test_ids.csv'), force)
-
-    gl_val_bal = balance_positions_by_lowest_bin(gl_val)
-    gl_val_bal_wl = balance_positions_by_lowest_bin(gl_val_wl)
-    gl_val_res_bal = balance_positions_by_lowest_bin(gl_val_res)
-    gl_val_res_bal_wl = balance_positions_by_lowest_bin(gl_val_res_wl)
-    gl_test_bal = balance_positions_by_lowest_bin(gl_test)
-    gl_test_bal_wl = balance_positions_by_lowest_bin(gl_test_wl)
-    gl_test_res_bal = balance_positions_by_lowest_bin(gl_test_res)
-    gl_test_res_bal_wl = balance_positions_by_lowest_bin(gl_test_res_wl)
-
-    results = {'written': [], 'skipped': [], 'failed': []}
-
-    def sample_and_write(game_level_df: pd.DataFrame, source_pq: str, sizes: list, out_dir: str,
-                          name_prefix: str, variant: str) -> None:
-        tag = f'{name_prefix}_{variant}' if variant else name_prefix
-        try:
-            status = stream_write_nested_sizes(source_pq, game_level_df, sizes, out_dir,
-                                                name_prefix, variant, force)
-            for n, s in status.items():
-                results[s].append(f'{tag}_{_size_tag(n)}')
-            gc.collect()
-        except Exception as e:  # noqa: BLE001
-            results['failed'].append((tag, str(e)))
-            print(f'FAILED {tag}: {e} -- continuing with next variant')
-
-    sample_and_write(gl_train, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', '')
-    sample_and_write(gl_train_res, train_pq, TRAIN_SIZES, TRAIN_OUT, 'train', 'res')
-
-    sample_and_write(gl_val, val_pq, VAL_SIZES, VAL_OUT, 'val', '')
-    sample_and_write(gl_val_res, val_pq, VAL_SIZES, VAL_OUT, 'val', 'res')
-    sample_and_write(gl_val_bal, val_pq, VAL_SIZES, VAL_OUT, 'val', 'bal')
-    sample_and_write(gl_val_res_bal, val_pq, VAL_SIZES, VAL_OUT, 'val', 'res_bal')
-    sample_and_write(gl_val_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'wl')
-    sample_and_write(gl_val_res_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'res_wl')
-    sample_and_write(gl_val_bal_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'bal_wl')
-    sample_and_write(gl_val_res_bal_wl, val_pq, VAL_SIZES, VAL_OUT_WL, 'val', 'res_bal_wl')
-
-    sample_and_write(gl_test, test_pq, TEST_SIZES, TEST_OUT, 'test', '')
-    sample_and_write(gl_test_res, test_pq, TEST_SIZES, TEST_OUT, 'test', 'res')
-    sample_and_write(gl_test_bal, test_pq, TEST_SIZES, TEST_OUT, 'test', 'bal')
-    sample_and_write(gl_test_res_bal, test_pq, TEST_SIZES, TEST_OUT, 'test', 'res_bal')
-    sample_and_write(gl_test_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'wl')
-    sample_and_write(gl_test_res_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'res_wl')
-    sample_and_write(gl_test_bal_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'bal_wl')
-    sample_and_write(gl_test_res_bal_wl, test_pq, TEST_SIZES, TEST_OUT_WL, 'test', 'res_bal_wl')
-
-    return results
+    if split == 'train':
+        return _write_train_outputs(pool_df, gl_pool, gl_pool_res)
+    return _write_val_test_outputs(split, pool_df, gl_pool, gl_pool_res)
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parses --force CLI argument."""
+    """Parses the required split positional argument."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--force', action='store_true',
-                         help='Rebuild every Parquet conversion and output CSV, even if it already exists.')
+    parser.add_argument('split', choices=SPLITS, help='Which split to build: train, val, or test.')
     return parser.parse_args(argv)
 
 def main(argv: list[str] | None = None) -> None:
-    """Reads args and runs the pipeline."""
+    """Reads args and runs the pipeline for one split."""
     args = parse_args(argv)
-
-    print(f'POS_DIR        = {POS_DIR}')
-    print(f'LOCAL_DATA_DIR = {LOCAL_DATA_DIR}')
-    print(f'force={args.force}')
-
-    results = run_pipeline(force=args.force)
-
-    print(f"\nDone. {len(results['written'])} written, {len(results['skipped'])} skipped, "
-          f"{len(results['failed'])} failed.")
-    if results['failed']:
+    failures = run_pipeline(args.split)
+    if failures:
         print('Failed outputs:')
-        for tag, err in results['failed']:
-            print(f'  - {tag}: {err}')
+        for fname, err in failures:
+            print(f'  - {fname}: {err}')
         sys.exit(1)
 
 ####################

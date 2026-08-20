@@ -4,7 +4,7 @@ Reads per-model prediction csvs against a fixed val/test positions df, merges th
 and provides eval-plots across models.
 
 Latest changes: 20/08/26:
-- Plot functions take an optional figsize override, defaulting to BASE_FIGSIZE
+- Plot functions take an optional display_names dict, used for legend labels
 """
 
 import glob
@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
 from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, RESULT_TO_CLASS, RESULT_CLASS_NAMES
+from scripts.utils.utils_eval import resolve_display_name
 from scripts.utils.utils_plotting import colors_for, BASE_FIGSIZE
 from scripts.features.features import SEC_MAPPING
 
@@ -128,7 +129,8 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
                               ylim: tuple[float, float] = (50, 70),
                               title: str = 'Result prediction accuracy by Elo bin',
                               show_hist: bool = False,
-                              figsize: tuple[float, float] | None = None) -> None:
+                              figsize: tuple[float, float] | None = None,
+                              display_names: dict[str, str] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by mean elo."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, 'mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
@@ -152,7 +154,8 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
             acc_by_bin.append((pred_class[mask] == true_class[mask]).mean() if mask.sum() else float('nan'))
 
         ax.plot(labels, [a * 100 for a in acc_by_bin], marker='D', markersize=6,
-                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name], label=name)
+                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
 
     ax.set_xlabel('Elo bin (mean)')
     ax.set_ylabel('Accuracy (%)')
@@ -181,7 +184,8 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
                           ylim: tuple[float, float] = (0, 80),
                           title: str = 'Result-prediction accuracy by plies played',
                           show_hist: bool = False,
-                          figsize: tuple[float, float] | None = None) -> None:
+                          figsize: tuple[float, float] | None = None,
+                          display_names: dict[str, str] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by plies played."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, ply_played_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -199,7 +203,8 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
         acc_by_group = correct.groupby(ply_group).mean().sort_index()
 
         ax.plot(acc_by_group.index, acc_by_group.values * 100, marker='D', markersize=6,
-                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name], label=name)
+                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
 
     ax.set_xlabel(f'Plies played (bins of {group_size})')
     ax.set_ylabel('Accuracy (%)')
@@ -229,7 +234,8 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
                                      ylim: tuple[float, float] = (50, 80),
                                      title: str = 'Result-prediction accuracy by time remaining',
                                      show_hist: bool = False,
-                                     figsize: tuple[float, float] | None = None) -> None:
+                                     figsize: tuple[float, float] | None = None,
+                                     display_names: dict[str, str] | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by combined proportion of clock time remaining."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
@@ -257,7 +263,8 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
         acc_by_bin = correct.groupby(time_bin).mean().sort_index()
 
         ax.plot(acc_by_bin.index, acc_by_bin.values * 100, marker='D', markersize=6,
-                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name], label=name)
+                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
 
     ax.set_xlabel('Proportion of total time remaining (both players summed)')
     ax.set_ylabel('Accuracy (%)')
@@ -284,7 +291,8 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
                   positive_class: str | None = None,
                   ylim: tuple[float, float] = (0, 1),
                   title: str | None = None,
-                  figsize: tuple[float, float] | None = None) -> None:
+                  figsize: tuple[float, float] | None = None,
+                  display_names: dict[str, str] | None = None) -> None:
     """Plots ROC curves (one panel per class, or just positive_class if given) across models."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
@@ -316,7 +324,8 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
             y_score = df[f'{name}_prob_{cls}']
             fpr, tpr, _ = roc_curve(y_true, y_score)
             roc_auc = auc(fpr, tpr)
-            ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=f'{name} (AUC = {roc_auc:.3f})')
+            label = f'{resolve_display_name(name, display_names)} (AUC = {roc_auc:.3f})'
+            ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=label)
 
         ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Chance')
         ax.set_xlabel('False Positive Rate')

@@ -5,12 +5,11 @@ each to a set of target sizes with elo-bin-proportional, game-level (not positio
 selection so smaller datasets are strict subsets of larger ones and long games keep their
 natural over-representation.
 
-    python run_pos_storage.py                 normal run
-    python run_pos_storage.py --limit 200000   dry run on a row slice
-    python run_pos_storage.py --force          rebuild everything
+    python run_pos_storage.py          normal run
+    python run_pos_storage.py --force  rebuild everything
 
 Latest changes: 20/08/26:
-- tqdm progress bars
+- tqdm progress bars v2
 """
 
 import os
@@ -28,7 +27,6 @@ import gc
 import glob
 import heapq
 import shutil
-from typing import IO
 
 import numpy as np
 import pandas as pd
@@ -138,9 +136,8 @@ def _check_disk_space(path: str, required_gb: float, label: str = '') -> None:
             f'{free_gb:.1f}GB free, need at least {required_gb:.1f}GB.'
         )
 
-def _read_csv_chunks(csv_source: IO[bytes], limit_rows: int | None):
+def _read_csv_chunks(csv_source):
     """Yields correctly-typed, title-relabeled chunks of csv_source, streamed."""
-    rows_read = 0
     reader = pd.read_csv(
         csv_source, dtype=POS_READ_DTYPES, parse_dates=POS_PARSE_DATES,
         true_values=['True'], false_values=['False'],
@@ -154,12 +151,8 @@ def _read_csv_chunks(csv_source: IO[bytes], limit_rows: int | None):
         for col in POS_BOOL_COLS:
             chunk[col] = chunk[col].astype('bool')
         yield chunk
-        rows_read += len(chunk)
-        if limit_rows is not None and rows_read >= limit_rows:
-            return
 
-def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False,
-                    limit_rows: int | None = None) -> str:
+def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False) -> str:
     """Converts a CSV to Parquet on local disk once, streaming in bounded-size chunks."""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f'csv_to_parquet: source CSV not found: {csv_path}')
@@ -173,13 +166,22 @@ def csv_to_parquet(csv_path: str, parquet_path: str, force: bool = False,
     writer = None
     try:
         with open(csv_path, 'rb') as raw_file:
-            with tqdm.wrapattr(raw_file, 'read', total=file_size,
-                                desc=os.path.basename(csv_path)) as tracked_file:
-                for chunk in _read_csv_chunks(tracked_file, limit_rows):
+            with tqdm(total=file_size, desc=os.path.basename(csv_path),
+                      unit='B', unit_scale=True, unit_divisor=1024) as pbar:
+                last_pos = 0
+                for chunk in _read_csv_chunks(raw_file):
                     table = pa.Table.from_pandas(chunk, preserve_index=False)
                     if writer is None:
                         writer = pq.ParquetWriter(tmp_path, table.schema, compression='zstd')
                     writer.write_table(table)
+
+                    current_pos = raw_file.tell()
+                    if current_pos > last_pos:
+                        pbar.update(current_pos - last_pos)
+                        last_pos = current_pos
+
+                if last_pos < file_size:
+                    pbar.update(file_size - last_pos)
     finally:
         if writer is not None:
             writer.close()
@@ -650,24 +652,18 @@ def write_csv_safely(df: pd.DataFrame, path: str, force: bool) -> bool:
 
 # (h) PIPELINE
 
-def run_pipeline(limit_rows: int | None, force: bool) -> dict:
+def run_pipeline(force: bool) -> dict:
     _check_disk_space(LOCAL_DATA_DIR, MIN_FREE_DISK_GB, 'LOCAL_DATA_DIR')
 
     train_csv = locate_split_csv('train', POS_DIR)
     val_csv = locate_split_csv('val', POS_DIR)
     test_csv = locate_split_csv('test', POS_DIR)
 
-    if limit_rows:
-        print(f'--limit {limit_rows} set: this is a DRY RUN on a row slice, not a real build')
-
     parquet_dir = os.path.join(LOCAL_DATA_DIR, 'parquet')
 
-    train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'),
-                               force=force, limit_rows=limit_rows)
-    val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'),
-                             force=force, limit_rows=limit_rows)
-    test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'),
-                              force=force, limit_rows=limit_rows)
+    train_pq = csv_to_parquet(train_csv, os.path.join(parquet_dir, 'train.parquet'), force=force)
+    val_pq = csv_to_parquet(val_csv, os.path.join(parquet_dir, 'val.parquet'), force=force)
+    test_pq = csv_to_parquet(test_csv, os.path.join(parquet_dir, 'test.parquet'), force=force)
 
     gl_train = game_level_frame(train_pq)
     gl_val = game_level_frame(val_pq)
@@ -746,12 +742,10 @@ def run_pipeline(limit_rows: int | None, force: bool) -> dict:
     return results
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parses --force, --limit CLI arguments."""
+    """Parses --force CLI argument."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--force', action='store_true',
                          help='Rebuild every Parquet conversion and output CSV, even if it already exists.')
-    parser.add_argument('--limit', type=int, default=None,
-                         help='Only read this many rows from each source CSV. Default: None (all).')
     return parser.parse_args(argv)
 
 def main(argv: list[str] | None = None) -> None:
@@ -760,9 +754,9 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f'POS_DIR        = {POS_DIR}')
     print(f'LOCAL_DATA_DIR = {LOCAL_DATA_DIR}')
-    print(f'force={args.force}  limit={args.limit}')
+    print(f'force={args.force}')
 
-    results = run_pipeline(limit_rows=args.limit, force=args.force)
+    results = run_pipeline(force=args.force)
 
     print(f"\nDone. {len(results['written'])} written, {len(results['skipped'])} skipped, "
           f"{len(results['failed'])} failed.")

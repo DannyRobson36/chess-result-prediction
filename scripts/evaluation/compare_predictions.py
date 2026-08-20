@@ -3,8 +3,8 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them,
 and provides eval-plots across models.
 
-Latest changes: 14/08/26:
-- Initial commit
+Latest changes: 20/08/26:
+- PALETTE/colour assignment moved to utils_plotting
 """
 
 import glob
@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
 from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, RESULT_TO_CLASS, RESULT_CLASS_NAMES
+from scripts.utils.utils_plotting import colors_for
 from scripts.features.features import SEC_MAPPING
 
 ####################
@@ -23,7 +24,6 @@ from scripts.features.features import SEC_MAPPING
 ####################
 
 REQUIRED_PRED_COLS = ['game_id', 'fen', 'prob_win', 'prob_draw', 'prob_loss', 'predicted_class']
-PALETTE = plt.cm.tab20.colors
 
 ####################
 # FUNCTIONS
@@ -109,7 +109,7 @@ def combine_predictions(main_df: pd.DataFrame, predictions_dir: str, split: str,
     return df_combined, loaded_names
 
 
-# (b) ROW FILTERING & COLOR ASSIGNMENT
+# (b) ROW FILTERING
 
 def restrict_to_common_rows(df: pd.DataFrame, cols: list[str], verbose: bool = True) -> pd.DataFrame:
     """Returns df restricted to rows with no NaN in any of cols."""
@@ -118,11 +118,6 @@ def restrict_to_common_rows(df: pd.DataFrame, cols: list[str], verbose: bool = T
         print(f'restrict_to_common_rows: dropping {(~mask).sum():,} of {len(df):,} rows '
               f'-- NaN in one or more of {cols}.')
     return df[mask].copy()
-
-
-def _colors_for(names: list[str]) -> dict[str, tuple]:
-    """Assigns each name a stable color from PALETTE, in order, cycling if more names than colors."""
-    return {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(names)}
 
 
 # (c) PLOTS
@@ -145,7 +140,7 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
     idx_to_name = dict(enumerate(RESULT_CLASS_NAMES))
     true_class = binned[mover_result_col].map(RESULT_TO_CLASS).map(idx_to_name)
 
-    colors = _colors_for(names)
+    colors = colors_for(names)
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for name in names:
@@ -193,7 +188,7 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
     ply_group = (df[ply_played_col] // group_size) * group_size + group_size // 2
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
 
-    colors = _colors_for(names)
+    colors = colors_for(names)
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for name in names:
@@ -250,7 +245,7 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
 
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
 
-    colors = _colors_for(names)
+    colors = colors_for(names)
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for name in names:
@@ -302,7 +297,7 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
             classes_to_plot = ['win', 'loss']
             print('plot_roc_auc: all draw probabilities are 0 across every model -- skipping draw panel.')
 
-    colors = _colors_for(names)
+    colors = colors_for(names)
     fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(8 * len(classes_to_plot), 8), squeeze=False)
     axes = axes[0]
     if title:

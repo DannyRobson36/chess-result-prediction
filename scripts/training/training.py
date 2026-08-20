@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 20/08/26:
-- make_batch uses legal_dest/attacked_mover/attacked_opponent
+- Added aux-head loss - get_aux_targets, _resolve_aux_loss_weight, wired into train/eval/run_training
 """
 
 import os
@@ -125,6 +125,14 @@ def get_targets(split: SplitData, batch_idx: np.ndarray, output_type: str, devic
         return split.result_class[batch_idx].to(device).long()
     return split.result_cont[batch_idx].to(device)
 
+def get_aux_targets(split: SplitData, batch_idx: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Stacks legal_dest/attacked_mover/attacked_opponent at batch_idx into a (b, 3, 64) float tensor."""
+    return torch.stack([
+        split.legal_dest[batch_idx],
+        split.attacked_mover[batch_idx],
+        split.attacked_opponent[batch_idx],
+    ], dim=1).to(device).float()
+
 # (c) LOSS & SCHEDULER
 
 def build_loss(loss_name: str, **kwargs) -> nn.Module:
@@ -151,6 +159,25 @@ def build_scheduler(optimizer, schedule_cfg: dict | None, n_epochs: int, mode: s
     if kind == "plateau":
         schedule_cfg.setdefault("mode", mode)
     return SCHEDULER_REGISTRY[kind](optimizer, **schedule_cfg)
+
+def _resolve_aux_loss_weight(model: nn.Module, arch_name: str) -> float | None:
+    """Validates model.cfg.aux_head against the built model.aux_head module, returning the loss
+    weight, or None if this architecture has no aux head or it's configured off."""
+    if not hasattr(model, "aux_head"):
+        aux_head_cfg = getattr(model.cfg, "aux_head", None)
+        if aux_head_cfg is not None and aux_head_cfg.enabled:
+            raise ValueError(f"cfg.aux_head.enabled is True but '{arch_name}' has no aux head support.")
+        return None
+
+    aux_head_cfg = model.cfg.aux_head
+    if model.aux_head is not None:
+        if aux_head_cfg.loss_weight is None:
+            raise ValueError("cfg.aux_head.enabled is True but cfg.aux_head.loss_weight is None.")
+        return aux_head_cfg.loss_weight
+
+    if aux_head_cfg.loss_weight is not None:
+        raise ValueError("cfg.aux_head.loss_weight was set but cfg.aux_head.enabled is False.")
+    return None
 
 # (d) ELO-BIN LOSS WEIGHTING
 
@@ -196,8 +223,10 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
                      seed: int | None = None, device: torch.device | None = None, drop_last: bool = True,
                      bin_weights: torch.Tensor | None = None, grad_clip_norm: float | None = None,
                      warmup_steps: int | None = None, base_lr: float | None = None,
-                     step_counter: list | None = None) -> None:
-    """Runs one training epoch: forward, per-sample loss (optionally elo-bin weighted), backward, step."""
+                     step_counter: list | None = None,
+                     aux_loss_fn: nn.Module | None = None, aux_loss_weight: float | None = None) -> None:
+    """Runs one training epoch: forward, per-sample loss (optionally elo-bin weighted), plus an
+    unweighted-by-sample auxiliary BCE loss whenever aux_loss_weight is not None, backward, step."""
     device = device or get_device()
     predict_fn = get_predict_fn(arch_name)
     model.train()
@@ -209,12 +238,18 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
         targets = get_targets(split, batch_idx, output_type, device)
 
         optimizer.zero_grad()
-        preds = predict_fn(model, batch)
+        preds, aux_preds = predict_fn(model, batch)
         per_sample = loss_fn(preds, targets)
         if bin_weights is not None:
             loss = (per_sample * bin_weights[batch["elo_mean_bin"]]).mean()
         else:
             loss = per_sample.mean()
+
+        if aux_loss_weight is not None:
+            aux_targets = get_aux_targets(split, batch_idx, device)
+            aux_loss = aux_loss_fn(aux_preds, aux_targets).mean()
+            loss = loss + aux_loss_weight * aux_loss
+
         loss.backward()
         if grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
@@ -225,22 +260,31 @@ def train_one_epoch(model: nn.Module, arch_name: str, loss_fn: nn.Module, optimi
 
 def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: np.ndarray, loss_fn: nn.Module,
                         output_type: str, class_names: list[str] | None = None,
-                        batch_size: int = 64, device: torch.device | None = None) -> dict:
-    """Evaluates a model on idx: loss, plus accuracy and macro_f1 for classification only."""
+                        batch_size: int = 64, device: torch.device | None = None,
+                        aux_loss_fn: nn.Module | None = None, aux_loss_weight: float | None = None) -> dict:
+    """Evaluates a model on idx: loss, plus accuracy/macro_f1 for classification, plus an
+    unweighted aux_loss whenever aux_loss_weight is not None."""
     device = device or get_device()
     predict_fn = get_predict_fn(arch_name)
     model.eval()
     total_loss, total_n = 0.0, 0
+    total_aux_loss, total_aux_n = 0.0, 0
     all_preds, all_targets = [], []
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
             targets = get_targets(split, batch_idx, output_type, device)
-            preds = predict_fn(model, batch)
+            preds, aux_preds = predict_fn(model, batch)
             per_sample = loss_fn(preds, targets)
 
             total_loss += per_sample.sum().item()
             total_n += len(batch_idx)
+
+            if aux_loss_weight is not None:
+                aux_targets = get_aux_targets(split, batch_idx, device)
+                aux_per_element = aux_loss_fn(aux_preds, aux_targets)
+                total_aux_loss += aux_per_element.sum().item()
+                total_aux_n += aux_per_element.numel()
 
             if output_type == "classification":
                 all_preds.append(preds.argmax(dim=1).cpu())
@@ -256,6 +300,8 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
                                         target_names=class_names, output_dict=True, zero_division=0)
         metrics["accuracy"] = accuracy_score(targs_arr, preds_arr)
         metrics["macro_f1"] = report["macro avg"]["f1-score"]
+    if aux_loss_weight is not None:
+        metrics["aux_loss"] = total_aux_loss / total_aux_n
     return metrics
 
 # (g) FULL TRAINING LOOP
@@ -274,6 +320,13 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
 
     loss_name = resolve_loss_name(output_type, cfg.loss_name)
     loss_fn = build_loss(loss_name)
+
+    aux_loss_weight = _resolve_aux_loss_weight(model, arch_name)
+    aux_loss_fn = build_loss("bce_logits") if aux_loss_weight is not None else None
+    if aux_loss_weight is not None and (train.legal_dest is None or val.legal_dest is None):
+        raise ValueError(f"{arch_name}'s aux_head is enabled (loss_weight={aux_loss_weight}) but the "
+                          f"train/val SplitData given to run_training wasn't built with aux_targets=True.")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, betas=ADAM_BETAS, eps=ADAM_EPS,
                                   weight_decay=cfg.weight_decay)
     scheduler = build_scheduler(optimizer, cfg.schedule_cfg, cfg.n_epochs, mode)
@@ -281,6 +334,8 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     warmup_steps = _resolve_warmup_steps(cfg.warmup_prop, len(train), cfg.batch_size, cfg.n_epochs)
 
     keys = ["loss", "accuracy", "macro_f1"] if output_type == "classification" else ["loss"]
+    if aux_loss_weight is not None:
+        keys = keys + ["aux_loss"]
     history = {f"{prefix}_{k}": [] for prefix in ("train", "val") for k in keys}
     history["epoch_time"] = []
     history["lr"] = []
@@ -301,12 +356,15 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
         train_one_epoch(model, arch_name, loss_fn, optimizer, train, train_idx, output_type,
                          batch_size=cfg.batch_size, seed=cfg.seed + epoch, device=device,
                          drop_last=True, bin_weights=bin_weights, grad_clip_norm=cfg.grad_clip_norm,
-                         warmup_steps=warmup_steps, base_lr=cfg.lr, step_counter=step_counter)
+                         warmup_steps=warmup_steps, base_lr=cfg.lr, step_counter=step_counter,
+                         aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
 
         train_metrics = evaluate_with_loss(model, arch_name, train, train_probe_idx, loss_fn, output_type,
-                                            batch_size=cfg.batch_size, device=device)
+                                            batch_size=cfg.batch_size, device=device,
+                                            aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
         val_metrics = evaluate_with_loss(model, arch_name, val, val_idx, loss_fn, output_type,
-                                          batch_size=cfg.batch_size, device=device)
+                                          batch_size=cfg.batch_size, device=device,
+                                          aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
 
         _sync_device(device)
         epoch_time = time.time() - epoch_start
@@ -351,7 +409,7 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
 
 def _run_raw_preds(model: nn.Module, arch_name: str, split: SplitData, device: torch.device,
                     batch_size: int = 256) -> torch.Tensor:
-    """Runs model over every row of split, returning concatenated raw output."""
+    """Runs model over every row of split, returning concatenated raw main-head output."""
     predict_fn = get_predict_fn(arch_name)
     model.eval()
     idx = np.arange(len(split))
@@ -359,7 +417,8 @@ def _run_raw_preds(model: nn.Module, arch_name: str, split: SplitData, device: t
     with torch.no_grad():
         for batch_idx in iterate_batches(idx, batch_size, shuffle=False, drop_last=False):
             batch = make_batch(split, batch_idx, device)
-            all_preds.append(predict_fn(model, batch).cpu())
+            preds, _aux_preds = predict_fn(model, batch)
+            all_preds.append(preds.cpu())
     return torch.cat(all_preds)
 
 def _fit_checkpoint_calibration(model: nn.Module, arch_name: str, val: SplitData, val_wl: SplitData,

@@ -1,9 +1,9 @@
 """
 utils_plotting.py
-Shared matplotlib style and per-model colour-assignment helpers for evaluation plots.
+Shared matplotlib style, figure sizing, and per-model colour-assignment helpers for evaluation plots.
 
 Latest changes: 20/08/26:
-- Initial commit
+- Added BASE_FIGSIZE
 """
 
 import matplotlib.pyplot as plt
@@ -21,6 +21,9 @@ PLOT_STYLE = {
     'legend.fontsize': 9.5,
     'figure.dpi': 150,
 }
+
+# Default (width, height) in inches for a single-panel plot; multi-panel plots scale width per panel from this.
+BASE_FIGSIZE = (7, 4.5)
 
 # Colour cycle for per-model plot lines and legend entries.
 PALETTE = plt.cm.tab20.colors

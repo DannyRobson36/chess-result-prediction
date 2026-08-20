@@ -4,7 +4,7 @@ Reads per-model prediction csvs against a fixed val/test positions df, merges th
 and provides eval-plots across models.
 
 Latest changes: 20/08/26:
-- Plot functions take an optional display_names dict, used for legend labels
+- Added plot_accuracy_by_clock_ratio
 """
 
 import glob
@@ -18,7 +18,7 @@ from sklearn.metrics import roc_curve, auc
 from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, RESULT_TO_CLASS, RESULT_CLASS_NAMES
 from scripts.utils.utils_eval import resolve_display_name
 from scripts.utils.utils_plotting import colors_for, BASE_FIGSIZE
-from scripts.features.features import SEC_MAPPING
+from scripts.features.features import SEC_MAPPING, INC_FLAG_MAPPING
 
 ####################
 # CONSTANTS
@@ -286,6 +286,108 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
     plt.show()
 
 
+def _clock_ratio_bin_edges(max_ratio: float, bin_width: float) -> list[float]:
+    """Returns log2-space bin edges from -log2(max_ratio) to +log2(max_ratio) in bin_width steps, with open -inf/+inf tails."""
+    max_log = np.log2(max_ratio)
+    n_steps = max(1, int(np.ceil(max_log / bin_width)))
+    half_edges = [min(i * bin_width, max_log) for i in range(n_steps + 1)]
+    edges = [-e for e in reversed(half_edges)] + half_edges[1:]
+    return [-np.inf] + edges + [np.inf]
+
+
+def _clock_ratio_bin_labels(edges: list[float], max_ratio: float) -> list[str]:
+    """Returns a multiplier display label per bin, e.g. 'x0.1-', 'x0.71-x1', 'x10+'."""
+    labels = []
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        if lo == -np.inf:
+            labels.append(f'x{1 / max_ratio:.2g}-')
+        elif hi == np.inf:
+            labels.append(f'x{max_ratio:.2g}+')
+        else:
+            labels.append(f'x{2 ** lo:.2g}-x{2 ** hi:.2g}')
+    return labels
+
+
+def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
+                                  mover_clock_col: str = 'mover_clock',
+                                  opponent_clock_col: str = 'opponent_clock',
+                                  time_control_col: str = 'time_control',
+                                  mover_result_col: str = 'mover_result',
+                                  max_ratio: float = 10.0,
+                                  bin_width: float = 0.5,
+                                  max_clock_seconds: int | None = None,
+                                  no_increment_only: bool = False,
+                                  ylim: tuple[float, float] = (50, 80),
+                                  title: str = 'Result-prediction accuracy by opponent/mover clock ratio',
+                                  show_hist: bool = False,
+                                  figsize: tuple[float, float] | None = None,
+                                  display_names: dict[str, str] | None = None) -> None:
+    """Plots per-model accuracy against true mover_result, binned by log2(opponent_clock / mover_clock), tail-capped at max_ratio."""
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, mover_clock_col, opponent_clock_col]
+    if no_increment_only:
+        cols_needed.append(time_control_col)
+    df = restrict_to_common_rows(df, cols_needed)
+
+    if max_clock_seconds is not None:
+        n_before = len(df)
+        df = df[(df[mover_clock_col] <= max_clock_seconds) & (df[opponent_clock_col] <= max_clock_seconds)]
+        print(f'plot_accuracy_by_clock_ratio: max_clock_seconds={max_clock_seconds} kept {len(df):,} of {n_before:,} rows.')
+
+    if no_increment_only:
+        n_before = len(df)
+        df = df[df[time_control_col].map(INC_FLAG_MAPPING) == 0]
+        print(f'plot_accuracy_by_clock_ratio: no_increment_only kept {len(df):,} of {n_before:,} rows.')
+
+    both_zero = (df[mover_clock_col] == 0) & (df[opponent_clock_col] == 0)
+    if both_zero.any():
+        print(f'plot_accuracy_by_clock_ratio: dropping {int(both_zero.sum()):,} rows with both clocks at 0.')
+        df = df[~both_zero]
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio = df[opponent_clock_col] / df[mover_clock_col]
+        log_ratio = np.log2(ratio)
+
+    edges = _clock_ratio_bin_edges(max_ratio, bin_width)
+    labels = _clock_ratio_bin_labels(edges, max_ratio)
+    ratio_bin = pd.cut(log_ratio, bins=edges, labels=False, right=True, include_lowest=True)
+
+    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
+    colors = colors_for(names)
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+
+    for name in names:
+        pred_val = df[f'{name}_predicted_class'].map(class_to_val)
+        correct = pred_val == df[mover_result_col]
+        acc_by_bin = []
+        for b in range(len(labels)):
+            mask = ratio_bin == b
+            acc_by_bin.append((correct[mask]).mean() * 100 if mask.sum() else float('nan'))
+
+        ax.plot(labels, acc_by_bin, marker='D', markersize=6, markeredgecolor='white',
+                 markeredgewidth=0.6, linewidth=2, color=colors[name],
+                 label=resolve_display_name(name, display_names))
+
+    ax.set_xlabel('Opponent clock / mover clock')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(title)
+    ax.legend()
+    ax.set_ylim(*ylim)
+    plt.xticks(rotation=45)
+
+    if show_hist:
+        counts = ratio_bin.value_counts().reindex(range(len(labels)), fill_value=0)
+        ax2 = ax.twinx()
+        ax2.bar(labels, counts.values, color='grey', alpha=0.3, zorder=1)
+        ax2.set_ylabel('Number of positions')
+        ax2.set_ylim(0, counts.max() * 1.2)
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_roc_auc(df: pd.DataFrame, names: list[str],
                   mover_result_col: str = 'mover_result',
                   positive_class: str | None = None,
@@ -301,39 +403,4 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
     classes_to_plot = [positive_class] if positive_class is not None else ['win', 'draw', 'loss']
 
     cols_needed = [f'{name}_prob_{cls}' for name in names for cls in classes_to_plot] + [mover_result_col]
-    df = restrict_to_common_rows(df, cols_needed)
-
-    if positive_class is None:
-        draw_cols = [f'{name}_prob_draw' for name in names]
-        if (df[draw_cols] == 0).all(axis=None):
-            classes_to_plot = ['win', 'loss']
-            print('plot_roc_auc: all draw probabilities are 0 across every model -- skipping draw panel.')
-
-    panel_width, panel_height = figsize or BASE_FIGSIZE
-    colors = colors_for(names)
-    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
-                              squeeze=False)
-    axes = axes[0]
-    if title:
-        fig.suptitle(title)
-
-    for ax, cls in zip(axes, classes_to_plot):
-        y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
-
-        for name in names:
-            y_score = df[f'{name}_prob_{cls}']
-            fpr, tpr, _ = roc_curve(y_true, y_score)
-            roc_auc = auc(fpr, tpr)
-            label = f'{resolve_display_name(name, display_names)} (AUC = {roc_auc:.3f})'
-            ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=label)
-
-        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Chance')
-        ax.set_xlabel('False Positive Rate')
-        ax.set_ylabel('True Positive Rate')
-        ax.set_title(f'{cls.capitalize()} prediction')
-        ax.legend(loc='lower right')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(*ylim)
-
-    plt.tight_layout()
-    plt.show()
+    df = restrict_to

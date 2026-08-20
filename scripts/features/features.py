@@ -4,7 +4,7 @@ Builds model-ready SplitData from raw dataframes: scaling, elo binning.
 Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
 Latest changes: 19/08/26:
-- Lowered MATE_SCORE_MOVER to 5,000
+- Added auxiliary targets - legal moves and attacked squares
 """
 
 import json
@@ -28,8 +28,8 @@ from tqdm import tqdm
 from scripts.config import STOCKFISH_PATH
 from scripts.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_edges, elo_bin_labels,
-    fen_to_tensor, fen_to_token_ids, encode_result_class, encode_result_continuous,
-    encode_title_idx, BOARD_SEQ_LEN,
+    fen_to_tensor, fen_to_token_ids, fen_to_legal_dest, fen_to_attacked_squares,
+    encode_result_class, encode_result_continuous, encode_title_idx, BOARD_SEQ_LEN,
 )
 
 ####################
@@ -421,10 +421,11 @@ def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
     return np.lib.format.open_memmap(path, mode='w+', dtype=dtype, shape=shape)
 
 
-def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int,
-                              write_boards: bool, write_tokens: bool) -> None:
-    """Encodes fens row by row directly into preallocated boards/board_token_ids .npy files, flushing silently every chunk_size rows."""
-    if not write_boards and not write_tokens:
+def _write_boards_tokens_and_aux(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int,
+                                  write_boards: bool, write_tokens: bool, aux_targets: bool) -> None:
+    """Encodes fens row by row directly into preallocated boards/board_token_ids/aux-target .npy
+    files, flushing silently every chunk_size rows."""
+    if not write_boards and not write_tokens and not aux_targets:
         return
 
     n_rows = len(fens)
@@ -432,29 +433,46 @@ def _write_boards_and_tokens(split_dir: str, fens: np.ndarray, desc: str, chunk_
                  if write_boards else None)
     token_ids_mm = (_preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
                     if write_tokens else None)
+    legal_dest_mm = (_preallocate_npy(os.path.join(split_dir, 'legal_dest.npy'), (n_rows, 64), np.bool_)
+                      if aux_targets else None)
+    attacked_mover_mm = (_preallocate_npy(os.path.join(split_dir, 'attacked_mover.npy'), (n_rows, 64), np.bool_)
+                          if aux_targets else None)
+    attacked_opponent_mm = (_preallocate_npy(os.path.join(split_dir, 'attacked_opponent.npy'), (n_rows, 64), np.bool_)
+                             if aux_targets else None)
 
     for i in tqdm(range(n_rows), desc=desc, unit='rows'):
         if write_boards:
             boards_mm[i] = fen_to_tensor(fens[i]).numpy().astype(np.bool_)
         if write_tokens:
             token_ids_mm[i] = fen_to_token_ids(fens[i]).numpy().astype(np.uint8)
+        if aux_targets:
+            legal_dest_mm[i] = fen_to_legal_dest(fens[i]).numpy().astype(np.bool_)
+            attacked = fen_to_attacked_squares(fens[i]).numpy().astype(np.bool_)
+            attacked_mover_mm[i] = attacked[0]
+            attacked_opponent_mm[i] = attacked[1]
 
         if (i + 1) % chunk_size == 0 or i + 1 == n_rows:
             if write_boards:
                 boards_mm.flush()
             if write_tokens:
                 token_ids_mm.flush()
+            if aux_targets:
+                legal_dest_mm.flush()
+                attacked_mover_mm.flush()
+                attacked_opponent_mm.flush()
 
     if write_boards:
         del boards_mm
     if write_tokens:
         del token_ids_mm
+    if aux_targets:
+        del legal_dest_mm, attacked_mover_mm, attacked_opponent_mm
 
 
 def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: np.ndarray, elo_oppo_bin: np.ndarray,
                          features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
                          n_elo_bins: int, bin_labels: list, game_id: list, fen: list,
-                         has_boards: bool, has_board_token_ids: bool) -> None:
+                         has_boards: bool, has_board_token_ids: bool, has_aux_targets: bool) -> None:
     """Writes elo bins, features, targets, meta.json, and ids.json (game_id/fen) to split_dir."""
     np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), elo_mean_bin.astype(np.uint8))
     np.save(os.path.join(split_dir, 'elo_self_bin.npy'), elo_self_bin.astype(np.uint8))
@@ -469,7 +487,8 @@ def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: 
 
     with open(os.path.join(split_dir, 'meta.json'), 'w') as f:
         json.dump({'n_elo_bins': n_elo_bins, 'bin_labels': bin_labels,
-                   'has_boards': has_boards, 'has_board_token_ids': has_board_token_ids}, f)
+                   'has_boards': has_boards, 'has_board_token_ids': has_board_token_ids,
+                   'has_aux_targets': has_aux_targets}, f)
 
     with open(os.path.join(split_dir, 'ids.json'), 'w') as f:
         json.dump({'game_id': game_id, 'fen': fen}, f)
@@ -497,9 +516,13 @@ def load_split(split_dir: str) -> 'SplitData':
     with open(os.path.join(split_dir, 'ids.json')) as f:
         ids = json.load(f)
 
+    has_aux = meta.get('has_aux_targets', False)
     return SplitData(
         boards=_mmap('boards') if meta.get('has_boards', True) else None,
         board_token_ids=_mmap('board_token_ids') if meta.get('has_board_token_ids', True) else None,
+        legal_dest=_mmap('legal_dest') if has_aux else None,
+        attacked_mover=_mmap('attacked_mover') if has_aux else None,
+        attacked_opponent=_mmap('attacked_opponent') if has_aux else None,
         elo_mean_bin=_mmap('elo_mean_bin'),
         elo_self_bin=_mmap('elo_self_bin'),
         elo_oppo_bin=_mmap('elo_oppo_bin'),
@@ -528,7 +551,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
                     rematch_cols: list[str] | None = None, rematch_scale: dict | None = None,
                     title_cols: list[str] | None = None, title_scale: dict | None = None,
                     cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
-                    board_mode: str = 'both',
+                    board_mode: str = 'both', aux_targets: bool = False,
                     sf_depth: int | None = None, sf_scale: dict | None = None,
                     ) -> tuple['SplitData', 'SplitData', 'SplitData', 'PrepConfig']:
     """Builds, saves, and memory-maps train/val/val_wl SplitData; returns a PrepConfig for reapplying
@@ -824,8 +847,9 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
         os.makedirs(split_dir, exist_ok=True)
 
         fens = df[fen_col].to_numpy()
-        _write_boards_and_tokens(split_dir, fens, desc=f'{name} boards/tokens', chunk_size=chunk_size,
-                                  write_boards=write_boards, write_tokens=write_tokens)
+        _write_boards_tokens_and_aux(split_dir, fens, desc=f'{name} boards/tokens/aux', chunk_size=chunk_size,
+                                      write_boards=write_boards, write_tokens=write_tokens,
+                                      aux_targets=aux_targets)
 
         elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
         _write_split_arrays(
@@ -835,7 +859,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             encode_result_continuous(df[mover_result_col]),
             n_elo_bins, bin_labels,
             df[game_id_col].astype(str).tolist(), df[fen_col].tolist(),
-            has_boards=write_boards, has_board_token_ids=write_tokens,
+            has_boards=write_boards, has_board_token_ids=write_tokens, has_aux_targets=aux_targets,
         )
         print(f'{name:>7}: {n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
@@ -872,6 +896,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
         title_mover_col=title_mover_col,
         title_opponent_col=title_opponent_col,
         board_mode=board_mode,
+        aux_targets=aux_targets,
         sf_depth=sf_depth,
         scaling_stats=scaling_stats,
     )
@@ -1017,8 +1042,9 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
     os.makedirs(out_dir, exist_ok=True)
 
     fens = df[prep_cfg.fen_col].to_numpy()
-    _write_boards_and_tokens(out_dir, fens, desc='boards/tokens', chunk_size=chunk_size,
-                              write_boards=write_boards, write_tokens=write_tokens)
+    _write_boards_tokens_and_aux(out_dir, fens, desc='boards/tokens/aux', chunk_size=chunk_size,
+                                  write_boards=write_boards, write_tokens=write_tokens,
+                                  aux_targets=prep_cfg.aux_targets)
 
     elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
         df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
@@ -1030,7 +1056,7 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
         encode_result_continuous(df[prep_cfg.mover_result_col]),
         n_elo_bins, bin_labels,
         df[prep_cfg.game_id_col].astype(str).tolist(), df[prep_cfg.fen_col].tolist(),
-        has_boards=write_boards, has_board_token_ids=write_tokens,
+        has_boards=write_boards, has_board_token_ids=write_tokens, has_aux_targets=prep_cfg.aux_targets,
     )
     print(f'{n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
 
@@ -1058,6 +1084,9 @@ class SplitData:
     """Model inputs and targets for one split."""
     boards: torch.Tensor | None
     board_token_ids: torch.Tensor | None
+    legal_dest: torch.Tensor | None
+    attacked_mover: torch.Tensor | None
+    attacked_opponent: torch.Tensor | None
     elo_mean_bin: torch.Tensor
     elo_self_bin: torch.Tensor
     elo_oppo_bin: torch.Tensor
@@ -1100,6 +1129,7 @@ class PrepConfig:
     title_opponent_col: str | None = None
 
     board_mode: str = 'both'
+    aux_targets: bool = False
     sf_depth: int | None = None
 
     scaling_stats: dict = field(default_factory=dict)

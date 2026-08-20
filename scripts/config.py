@@ -3,7 +3,7 @@
 Project-wide hardcoded config for use across scripts.
 
 Latest changes: 14/08/26:
-- Added PREDICTIONS_DIR
+- Added _data to t/v/t
 """
 
 ####################
@@ -15,9 +15,9 @@ RAW_DUMP_DIR = '/content/drive/MyDrive/drive_diss/data/raw_dumps'
 GAME_DIR = '/content/drive/MyDrive/drive_diss/data/game_data'
 POS_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data'
 IDS_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/ids'
-TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train'
-VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val'
-TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test'
+TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train_data'
+VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val_data'
+TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test_data'
 RESULTS_DIR = '/content/drive/MyDrive/drive_diss/data/results'
 CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints'
 PREDICTIONS_DIR = '/content/drive/MyDrive/drive_diss/data/predictions'

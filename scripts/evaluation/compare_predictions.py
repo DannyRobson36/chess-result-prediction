@@ -1,10 +1,9 @@
 """
 compare_predictions.py
-Reads per-model prediction csvs against a fixed val/test positions df, merges them,
-and provides eval-plots across models.
+Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
-Latest changes: 20/08/26:
-- plot_accuracy_by_clock_ratio bins now driven by step_multiplier/n_bins_per_side
+Latest changes: 24/08/26:
+- Added plot_calibration
 """
 
 import glob
@@ -433,6 +432,70 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
         ax.set_ylabel('True Positive Rate')
         ax.set_title(f'{cls.capitalize()} prediction')
         ax.legend(loc='lower right')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(*ylim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_calibration(df: pd.DataFrame, names: list[str],
+                      mover_result_col: str = 'mover_result',
+                      positive_class: str | None = None,
+                      n_bins: int = 10,
+                      ylim: tuple[float, float] = (0, 1),
+                      title: str | None = None,
+                      figsize: tuple[float, float] | None = None,
+                      display_names: dict[str, str] | None = None) -> None:
+    """Plots reliability diagrams (mean predicted probability vs observed frequency, equal-width bins) across models."""
+    class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
+    if positive_class is not None and positive_class not in class_to_result:
+        raise ValueError(f'positive_class must be one of {list(class_to_result)}, got {positive_class!r}')
+
+    classes_to_plot = [positive_class] if positive_class is not None else ['win', 'draw', 'loss']
+
+    cols_needed = [f'{name}_prob_{cls}' for name in names for cls in classes_to_plot] + [mover_result_col]
+    df = restrict_to_common_rows(df, cols_needed)
+
+    if positive_class is None:
+        draw_cols = [f'{name}_prob_draw' for name in names]
+        if (df[draw_cols] == 0).all(axis=None):
+            classes_to_plot = ['win', 'loss']
+            print('plot_calibration: all draw probabilities are 0 across every model -- skipping draw panel.')
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+
+    panel_width, panel_height = figsize or BASE_FIGSIZE
+    colors = colors_for(names)
+    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
+                              squeeze=False)
+    axes = axes[0]
+    if title:
+        fig.suptitle(title)
+
+    for ax, cls in zip(axes, classes_to_plot):
+        y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
+
+        for name in names:
+            y_score = df[f'{name}_prob_{cls}']
+            prob_bin = pd.cut(y_score, bins=bin_edges, labels=False, right=True, include_lowest=True)
+
+            mean_pred, observed_rate = [], []
+            for b in range(n_bins):
+                mask = prob_bin == b
+                if mask.sum():
+                    mean_pred.append(y_score[mask].mean())
+                    observed_rate.append(y_true[mask].mean())
+
+            ax.plot(mean_pred, observed_rate, marker='D', markersize=6, markeredgecolor='white',
+                    markeredgewidth=0.6, linewidth=2, color=colors[name],
+                    label=resolve_display_name(name, display_names))
+
+        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Perfectly calibrated')
+        ax.set_xlabel('Mean predicted probability')
+        ax.set_ylabel('Observed frequency')
+        ax.set_title(f'{cls.capitalize()} calibration')
+        ax.legend(loc='upper left')
         ax.set_xlim(0, 1)
         ax.set_ylim(*ylim)
 

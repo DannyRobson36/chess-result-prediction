@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 24/08/26:
-- Added optional elo_bins two-panel split to plots
+- Added stockfish agreement plotters 
 """
 
 import glob
@@ -646,6 +646,183 @@ def plot_calibration(df: pd.DataFrame, names: list[str],
             _draw_calibration_panel(axes[row_idx][col_idx], row_df, names, mover_result_col, cls,
                                      class_to_result, bin_edges, n_bins, colors, ylim, panel_title,
                                      display_names)
+
+    plt.tight_layout()
+    plt.show()
+
+# (e) SHARED PLOT HELPERS
+
+def _true_class_series(df: pd.DataFrame, mover_result_col: str) -> pd.Series:
+    """Maps mover_result_col's continuous 0/0.5/1 values to RESULT_CLASS_NAMES strings."""
+    idx_to_name = dict(enumerate(RESULT_CLASS_NAMES))
+    return df[mover_result_col].map(RESULT_TO_CLASS).map(idx_to_name)
+
+
+def _agreement_mask(df: pd.DataFrame, name: str, baseline: str) -> pd.Series:
+    """Returns a boolean Series, True where name's predicted_class matches baseline's predicted_class."""
+    return df[f'{name}_predicted_class'] == df[f'{baseline}_predicted_class']
+
+
+# (f) AGREEMENT PLOTS
+
+def plot_agreement_rate(df: pd.DataFrame, names: list[str], baseline: str,
+                         ylim: tuple[float, float] = (0, 100),
+                         title: str | None = None,
+                         figsize: tuple[float, float] | None = None,
+                         display_names: dict[str, str] | None = None) -> None:
+    """Plots each model's predicted_class agreement rate (%) with baseline's predicted_class, as one bar per model."""
+    cols_needed = [f'{name}_predicted_class' for name in names] + [f'{baseline}_predicted_class']
+    df = restrict_to_common_rows(df, cols_needed)
+
+    colors = colors_for(names)
+    agreement_pct = [_agreement_mask(df, name, baseline).mean() * 100 for name in names]
+    bar_labels = [resolve_display_name(name, display_names) for name in names]
+    bar_colors = [colors[name] for name in names]
+
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    ax.bar(bar_labels, agreement_pct, color=bar_colors)
+    ax.set_ylabel('Agreement rate (%)')
+    ax.set_title(title or f'Agreement rate with {resolve_display_name(baseline, display_names)}')
+    ax.set_ylim(*ylim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_agreement_rate_by_elo_bin(df: pd.DataFrame, names: list[str], baseline: str,
+                                    cfg: EloBinConfig = ELO_BINS,
+                                    ylim: tuple[float, float] = (0, 100),
+                                    title: str | None = None,
+                                    show_hist: bool = False,
+                                    figsize: tuple[float, float] | None = None,
+                                    display_names: dict[str, str] | None = None) -> None:
+    """Plots each model's predicted_class agreement rate (%) with baseline's predicted_class, binned by mean elo."""
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [f'{baseline}_predicted_class', 'mover_elo', 'opponent_elo'])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    binned, edges = elo_bin_by_mover(df, cfg, method='mean')
+    labels = elo_bin_labels(edges)
+    n_elo_bins = len(edges) - 1
+    elo_mean_bin = binned['elo_bin'].to_numpy()
+
+    colors = colors_for(names)
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+
+    for name in names:
+        agree = _agreement_mask(binned, name, baseline)
+        agree_by_bin = []
+        for b in range(n_elo_bins):
+            mask = elo_mean_bin == b
+            agree_by_bin.append(agree[mask].mean() * 100 if mask.sum() else float('nan'))
+
+        ax.plot(labels, agree_by_bin, marker='D', markersize=6, markeredgecolor='white',
+                markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
+
+    ax.set_xlabel('Elo bin (mean)')
+    ax.set_ylabel('Agreement rate (%)')
+    ax.set_title(title or f'Agreement rate with {resolve_display_name(baseline, display_names)} by Elo bin')
+    ax.legend()
+    ax.set_ylim(*ylim)
+    plt.xticks(rotation=45)
+
+    if show_hist:
+        counts = np.bincount(elo_mean_bin, minlength=n_elo_bins)
+        ax2 = ax.twinx()
+        ax2.bar(labels, counts, color='grey', alpha=0.3, zorder=1)
+        ax2.set_ylabel('Number of positions')
+        ax2.set_ylim(0, counts.max() * 1.2)
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_accuracy_by_agreement(df: pd.DataFrame, names: list[str], baseline: str,
+                                mover_result_col: str = 'mover_result',
+                                ylim: tuple[float, float] = (0, 100),
+                                title: str | None = None,
+                                figsize: tuple[float, float] | None = None,
+                                display_names: dict[str, str] | None = None) -> None:
+    """Plots each model's accuracy against true mover_result, split into agreeing-with-baseline vs disagreeing-with-baseline bars."""
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [f'{baseline}_predicted_class', mover_result_col])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    true_class = _true_class_series(df, mover_result_col)
+
+    agree_acc, disagree_acc = [], []
+    for name in names:
+        agree_mask = _agreement_mask(df, name, baseline)
+        correct = df[f'{name}_predicted_class'] == true_class
+        agree_acc.append(correct[agree_mask].mean() * 100 if agree_mask.sum() else float('nan'))
+        disagree_acc.append(correct[~agree_mask].mean() * 100 if (~agree_mask).sum() else float('nan'))
+
+    bar_labels = [resolve_display_name(name, display_names) for name in names]
+    x = np.arange(len(names))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    ax.bar(x - width / 2, agree_acc, width, color='tab:green',
+           label=f'Agrees with {resolve_display_name(baseline, display_names)}')
+    ax.bar(x + width / 2, disagree_acc, width, color='tab:red',
+           label=f'Disagrees with {resolve_display_name(baseline, display_names)}')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(bar_labels)
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(title or f'Accuracy by agreement with {resolve_display_name(baseline, display_names)}')
+    ax.legend()
+    ax.set_ylim(*ylim)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_accuracy_by_agreement_elo_bin(df: pd.DataFrame, names: list[str], baseline: str,
+                                        mover_result_col: str = 'mover_result',
+                                        cfg: EloBinConfig = ELO_BINS,
+                                        ylim: tuple[float, float] = (0, 100),
+                                        title: str | None = None,
+                                        figsize: tuple[float, float] | None = None,
+                                        display_names: dict[str, str] | None = None) -> None:
+    """Plots each model's accuracy against true mover_result, split by agreement with baseline, binned by mean elo."""
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [f'{baseline}_predicted_class', mover_result_col, 'mover_elo', 'opponent_elo'])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    binned, edges = elo_bin_by_mover(df, cfg, method='mean')
+    labels = elo_bin_labels(edges)
+    n_elo_bins = len(edges) - 1
+    elo_mean_bin = binned['elo_bin'].to_numpy()
+    true_class = _true_class_series(binned, mover_result_col)
+
+    colors = colors_for(names)
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+
+    for name in names:
+        pred_class = binned[f'{name}_predicted_class']
+        correct = pred_class == true_class
+        agree_mask = _agreement_mask(binned, name, baseline).to_numpy()
+
+        for condition_mask, condition_label, linestyle in [(agree_mask, 'agree', '-'), (~agree_mask, 'disagree', '--')]:
+            acc_by_bin = []
+            for b in range(n_elo_bins):
+                mask = (elo_mean_bin == b) & condition_mask
+                acc_by_bin.append(correct[mask].mean() * 100 if mask.sum() else float('nan'))
+
+            ax.plot(labels, acc_by_bin, marker='D', markersize=6, markeredgecolor='white', markeredgewidth=0.6,
+                    linewidth=2, linestyle=linestyle, color=colors[name],
+                    label=f'{resolve_display_name(name, display_names)} ({condition_label})')
+
+    ax.set_xlabel('Elo bin (mean)')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(title or f'Accuracy by agreement with {resolve_display_name(baseline, display_names)}, by Elo bin')
+    ax.legend()
+    ax.set_ylim(*ylim)
+    plt.xticks(rotation=45)
 
     plt.tight_layout()
     plt.show()

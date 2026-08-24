@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 24/08/26:
-- Added plot_calibration
+- Added optional elo_bins two-panel split to plots
 """
 
 import glob
@@ -120,7 +120,44 @@ def restrict_to_common_rows(df: pd.DataFrame, cols: list[str], verbose: bool = T
     return df[mask].copy()
 
 
-# (c) PLOTS
+# (c) ELO-BIN SPLITTING
+
+def _validate_elo_bins(elo_bins) -> tuple[int, int]:
+    """Validates elo_bins as exactly two integers, without checking against the available bin count yet."""
+    if not isinstance(elo_bins, (tuple, list)):
+        raise ValueError(f'elo_bins must be a tuple or list of 2 integers, got {elo_bins!r}.')
+    elo_bins = tuple(elo_bins)
+    if len(elo_bins) != 2:
+        raise ValueError(f'elo_bins must contain exactly 2 bin numbers, got {len(elo_bins)}.')
+    for b in elo_bins:
+        if not isinstance(b, int) or isinstance(b, bool):
+            raise ValueError(f'elo_bins values must be integers, got {b!r}.')
+    return elo_bins
+
+
+def _split_by_elo_bin(df: pd.DataFrame, elo_bins: tuple[int, int],
+                       cfg: EloBinConfig) -> tuple[list[pd.DataFrame], list[str]]:
+    """Splits df into two subsets by mover mean-elo bin membership, returns (subsets, panel_labels)."""
+    b1, b2 = _validate_elo_bins(elo_bins)
+    binned, edges = elo_bin_by_mover(df, cfg, method='mean')
+    n_available_bins = len(edges) - 1
+    for b in (b1, b2):
+        if not (1 <= b <= n_available_bins):
+            raise ValueError(f'elo_bins values must be in [1, {n_available_bins}], got {b}.')
+
+    labels = elo_bin_labels(edges)
+    subsets, panel_labels = [], []
+    for b in (b1, b2):
+        mask = binned['elo_bin'].to_numpy() == (b - 1)
+        subset = binned[mask].copy()
+        if len(subset) == 0:
+            print(f'_split_by_elo_bin: elo bin {b} has 0 rows in the given data.')
+        subsets.append(subset)
+        panel_labels.append(f'elo bin {b} ({labels[b - 1]})')
+    return subsets, panel_labels
+
+
+# (d) PLOTS
 
 def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
                               mover_result_col: str = 'mover_result',
@@ -176,6 +213,37 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
     plt.show()
 
 
+def _draw_accuracy_by_ply(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str,
+                           group_size: int, colors: dict[str, str], ylim: tuple[float, float],
+                           panel_title: str, show_hist: bool, display_names: dict[str, str] | None) -> None:
+    """Draws one accuracy-by-ply panel onto ax, using the precomputed '_ply_group' column."""
+    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
+
+    for name in names:
+        pred_val = df[f'{name}_predicted_class'].map(class_to_val)
+        correct = pred_val == df[mover_result_col]
+        acc_by_group = correct.groupby(df['_ply_group']).mean().sort_index()
+
+        ax.plot(acc_by_group.index, acc_by_group.values * 100, marker='D', markersize=6,
+                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
+
+    ax.set_xlabel(f'Plies played (bins of {group_size})')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(panel_title)
+    ax.legend()
+    ax.set_ylim(*ylim)
+
+    if show_hist:
+        counts = df['_ply_group'].value_counts().sort_index()
+        ax2 = ax.twinx()
+        ax2.bar(counts.index, counts.values, width=group_size * 0.9, color='grey', alpha=0.3, zorder=1)
+        ax2.set_ylabel('Number of positions')
+        ax2.set_ylim(0, counts.max() * 1.2)
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+
+
 def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
                           ply_played_col: str = 'ply_played',
                           mover_result_col: str = 'mover_result',
@@ -184,44 +252,66 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
                           title: str = 'Result-prediction accuracy by plies played',
                           show_hist: bool = False,
                           figsize: tuple[float, float] | None = None,
-                          display_names: dict[str, str] | None = None) -> None:
-    """Plots per-model accuracy against true mover_result, binned by plies played."""
+                          display_names: dict[str, str] | None = None,
+                          elo_bins: tuple[int, int] | None = None,
+                          elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
+    """Plots per-model accuracy against true mover_result, binned by plies played, as one panel or two elo-bin-restricted panels."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, ply_played_col]
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
-    df = df[df[ply_played_col] <= max_ply]
-
-    ply_group = (df[ply_played_col] // group_size) * group_size + group_size // 2
-    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
+    df = df[df[ply_played_col] <= max_ply].copy()
+    df['_ply_group'] = (df[ply_played_col] // group_size) * group_size + group_size // 2
 
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    panel_width, panel_height = figsize or BASE_FIGSIZE
+
+    if elo_bins is None:
+        fig, ax = plt.subplots(figsize=(panel_width, panel_height))
+        _draw_accuracy_by_ply(ax, df, names, mover_result_col, group_size, colors, ylim,
+                               title, show_hist, display_names)
+    else:
+        subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        fig, axes = plt.subplots(1, 2, figsize=(panel_width * 2, panel_height), sharey=True)
+        for ax, sub_df, panel_label in zip(axes, subsets, panel_labels):
+            _draw_accuracy_by_ply(ax, sub_df, names, mover_result_col, group_size, colors, ylim,
+                                   f'{title} -- {panel_label}', show_hist, display_names)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def _draw_accuracy_by_combined_clock(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str,
+                                      bin_width: float, colors: dict[str, str], ylim: tuple[float, float],
+                                      panel_title: str, show_hist: bool,
+                                      display_names: dict[str, str] | None) -> None:
+    """Draws one accuracy-by-combined-clock panel onto ax, using the precomputed '_time_bin' column."""
+    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
 
     for name in names:
         pred_val = df[f'{name}_predicted_class'].map(class_to_val)
         correct = pred_val == df[mover_result_col]
-        acc_by_group = correct.groupby(ply_group).mean().sort_index()
+        acc_by_bin = correct.groupby(df['_time_bin']).mean().sort_index()
 
-        ax.plot(acc_by_group.index, acc_by_group.values * 100, marker='D', markersize=6,
+        ax.plot(acc_by_bin.index, acc_by_bin.values * 100, marker='D', markersize=6,
                 markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
                 label=resolve_display_name(name, display_names))
 
-    ax.set_xlabel(f'Plies played (bins of {group_size})')
+    ax.set_xlabel('Proportion of total time remaining (both players summed)')
     ax.set_ylabel('Accuracy (%)')
-    ax.set_title(title)
+    ax.set_title(panel_title)
     ax.legend()
     ax.set_ylim(*ylim)
+    ax.invert_xaxis()
 
     if show_hist:
-        counts = ply_group.value_counts().sort_index()
+        counts = df['_time_bin'].value_counts().sort_index()
         ax2 = ax.twinx()
-        ax2.bar(counts.index, counts.values, width=group_size * 0.9, color='grey', alpha=0.3, zorder=1)
+        ax2.bar(counts.index, counts.values, width=bin_width * 0.9, color='grey', alpha=0.3, zorder=1)
         ax2.set_ylabel('Number of positions')
         ax2.set_ylim(0, counts.max() * 1.2)
         ax.set_zorder(ax2.get_zorder() + 1)
         ax.patch.set_visible(False)
-
-    plt.tight_layout()
-    plt.show()
 
 
 def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
@@ -234,10 +324,14 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
                                      title: str = 'Result-prediction accuracy by time remaining',
                                      show_hist: bool = False,
                                      figsize: tuple[float, float] | None = None,
-                                     display_names: dict[str, str] | None = None) -> None:
-    """Plots per-model accuracy against true mover_result, binned by combined proportion of clock time remaining."""
+                                     display_names: dict[str, str] | None = None,
+                                     elo_bins: tuple[int, int] | None = None,
+                                     elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
+    """Plots per-model accuracy against true mover_result, binned by proportion of clock time remaining, as one panel or two elo-bin-restricted panels."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
 
     game_time = df[time_control_col].map(SEC_MAPPING)
@@ -248,38 +342,23 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
     if len(df) != n_before:
         print(f'plot_accuracy_by_combined_clock: dropped {n_before - len(df):,} rows with unmapped {time_control_col}.')
 
+    df = df.copy()
     time_left_prop = ((df[mover_clock_col] + df[opponent_clock_col]) / (2 * game_time)).clip(0, 1)
-    time_bin = ((time_left_prop // bin_width) * bin_width + bin_width / 2).round(4)
-
-    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
+    df['_time_bin'] = ((time_left_prop // bin_width) * bin_width + bin_width / 2).round(4)
 
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    panel_width, panel_height = figsize or BASE_FIGSIZE
 
-    for name in names:
-        pred_val = df[f'{name}_predicted_class'].map(class_to_val)
-        correct = pred_val == df[mover_result_col]
-        acc_by_bin = correct.groupby(time_bin).mean().sort_index()
-
-        ax.plot(acc_by_bin.index, acc_by_bin.values * 100, marker='D', markersize=6,
-                markeredgecolor='white', markeredgewidth=0.6, linewidth=2, color=colors[name],
-                label=resolve_display_name(name, display_names))
-
-    ax.set_xlabel('Proportion of total time remaining (both players summed)')
-    ax.set_ylabel('Accuracy (%)')
-    ax.set_title(title)
-    ax.legend()
-    ax.set_ylim(*ylim)
-    ax.invert_xaxis()
-
-    if show_hist:
-        counts = time_bin.value_counts().sort_index()
-        ax2 = ax.twinx()
-        ax2.bar(counts.index, counts.values, width=bin_width * 0.9, color='grey', alpha=0.3, zorder=1)
-        ax2.set_ylabel('Number of positions')
-        ax2.set_ylim(0, counts.max() * 1.2)
-        ax.set_zorder(ax2.get_zorder() + 1)
-        ax.patch.set_visible(False)
+    if elo_bins is None:
+        fig, ax = plt.subplots(figsize=(panel_width, panel_height))
+        _draw_accuracy_by_combined_clock(ax, df, names, mover_result_col, bin_width, colors, ylim,
+                                          title, show_hist, display_names)
+    else:
+        subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        fig, axes = plt.subplots(1, 2, figsize=(panel_width * 2, panel_height), sharey=True)
+        for ax, sub_df, panel_label in zip(axes, subsets, panel_labels):
+            _draw_accuracy_by_combined_clock(ax, sub_df, names, mover_result_col, bin_width, colors, ylim,
+                                              f'{title} -- {panel_label}', show_hist, display_names)
 
     plt.tight_layout()
     plt.show()
@@ -307,6 +386,42 @@ def _clock_ratio_bin_labels(edges: list[float], step_multiplier: float) -> list[
     return labels
 
 
+def _draw_accuracy_by_clock_ratio(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str,
+                                   labels: list[str], colors: dict[str, str], ylim: tuple[float, float],
+                                   panel_title: str, show_hist: bool,
+                                   display_names: dict[str, str] | None) -> None:
+    """Draws one accuracy-by-clock-ratio panel onto ax, using the precomputed '_ratio_bin' column."""
+    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
+
+    for name in names:
+        pred_val = df[f'{name}_predicted_class'].map(class_to_val)
+        correct = pred_val == df[mover_result_col]
+        acc_by_bin = []
+        for b in range(len(labels)):
+            mask = df['_ratio_bin'] == b
+            acc_by_bin.append((correct[mask]).mean() * 100 if mask.sum() else float('nan'))
+
+        ax.plot(labels, acc_by_bin, marker='D', markersize=6, markeredgecolor='white',
+                markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
+
+    ax.set_xlabel('Opponent clock / mover clock')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(panel_title)
+    ax.legend()
+    ax.set_ylim(*ylim)
+    ax.tick_params(axis='x', rotation=45)
+
+    if show_hist:
+        counts = df['_ratio_bin'].value_counts().reindex(range(len(labels)), fill_value=0)
+        ax2 = ax.twinx()
+        ax2.bar(labels, counts.values, color='grey', alpha=0.3, zorder=1)
+        ax2.set_ylabel('Number of positions')
+        ax2.set_ylim(0, counts.max() * 1.2)
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+
+
 def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                   mover_clock_col: str = 'mover_clock',
                                   opponent_clock_col: str = 'opponent_clock',
@@ -320,11 +435,15 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                   title: str = 'Result-prediction accuracy by opponent/mover clock ratio',
                                   show_hist: bool = False,
                                   figsize: tuple[float, float] | None = None,
-                                  display_names: dict[str, str] | None = None) -> None:
-    """Plots per-model accuracy against true mover_result, binned by opponent_clock / mover_clock in step_multiplier-fold steps out to step_multiplier**n_bins_per_side."""
+                                  display_names: dict[str, str] | None = None,
+                                  elo_bins: tuple[int, int] | None = None,
+                                  elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
+    """Plots per-model accuracy against true mover_result, binned by opponent/mover clock ratio, as one panel or two elo-bin-restricted panels."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, mover_clock_col, opponent_clock_col]
     if no_increment_only:
         cols_needed.append(time_control_col)
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
 
     if max_clock_seconds is not None:
@@ -348,42 +467,47 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
 
     edges = _clock_ratio_bin_edges(n_bins_per_side)
     labels = _clock_ratio_bin_labels(edges, step_multiplier)
-    ratio_bin = pd.cut(log_ratio, bins=edges, labels=False, right=True, include_lowest=True)
+    df = df.copy()
+    df['_ratio_bin'] = pd.cut(log_ratio, bins=edges, labels=False, right=True, include_lowest=True)
 
-    class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
     colors = colors_for(names)
-    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    panel_width, panel_height = figsize or BASE_FIGSIZE
 
-    for name in names:
-        pred_val = df[f'{name}_predicted_class'].map(class_to_val)
-        correct = pred_val == df[mover_result_col]
-        acc_by_bin = []
-        for b in range(len(labels)):
-            mask = ratio_bin == b
-            acc_by_bin.append((correct[mask]).mean() * 100 if mask.sum() else float('nan'))
-
-        ax.plot(labels, acc_by_bin, marker='D', markersize=6, markeredgecolor='white',
-                 markeredgewidth=0.6, linewidth=2, color=colors[name],
-                 label=resolve_display_name(name, display_names))
-
-    ax.set_xlabel('Opponent clock / mover clock')
-    ax.set_ylabel('Accuracy (%)')
-    ax.set_title(title)
-    ax.legend()
-    ax.set_ylim(*ylim)
-    plt.xticks(rotation=45)
-
-    if show_hist:
-        counts = ratio_bin.value_counts().reindex(range(len(labels)), fill_value=0)
-        ax2 = ax.twinx()
-        ax2.bar(labels, counts.values, color='grey', alpha=0.3, zorder=1)
-        ax2.set_ylabel('Number of positions')
-        ax2.set_ylim(0, counts.max() * 1.2)
-        ax.set_zorder(ax2.get_zorder() + 1)
-        ax.patch.set_visible(False)
+    if elo_bins is None:
+        fig, ax = plt.subplots(figsize=(panel_width, panel_height))
+        _draw_accuracy_by_clock_ratio(ax, df, names, mover_result_col, labels, colors, ylim,
+                                       title, show_hist, display_names)
+    else:
+        subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        fig, axes = plt.subplots(1, 2, figsize=(panel_width * 2, panel_height), sharey=True)
+        for ax, sub_df, panel_label in zip(axes, subsets, panel_labels):
+            _draw_accuracy_by_clock_ratio(ax, sub_df, names, mover_result_col, labels, colors, ylim,
+                                           f'{title} -- {panel_label}', show_hist, display_names)
 
     plt.tight_layout()
     plt.show()
+
+
+def _draw_roc_panel(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str, cls: str,
+                     class_to_result: dict[str, float], colors: dict[str, str], ylim: tuple[float, float],
+                     panel_title: str, display_names: dict[str, str] | None) -> None:
+    """Draws one ROC-curve panel (one result class, all models) onto ax."""
+    y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
+
+    for name in names:
+        y_score = df[f'{name}_prob_{cls}']
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc = auc(fpr, tpr)
+        label = f'{resolve_display_name(name, display_names)} (AUC = {roc_auc:.3f})'
+        ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=label)
+
+    ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Chance')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
+    ax.set_title(panel_title)
+    ax.legend(loc='lower right')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(*ylim)
 
 
 def plot_roc_auc(df: pd.DataFrame, names: list[str],
@@ -392,8 +516,10 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
                   ylim: tuple[float, float] = (0, 1),
                   title: str | None = None,
                   figsize: tuple[float, float] | None = None,
-                  display_names: dict[str, str] | None = None) -> None:
-    """Plots ROC curves (one panel per class, or just positive_class if given) across models."""
+                  display_names: dict[str, str] | None = None,
+                  elo_bins: tuple[int, int] | None = None,
+                  elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
+    """Plots ROC curves (one panel per class, or just positive_class if given) across models, as one row or two elo-bin-restricted rows."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
         raise ValueError(f'positive_class must be one of {list(class_to_result)}, got {positive_class!r}')
@@ -401,6 +527,8 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
     classes_to_plot = [positive_class] if positive_class is not None else ['win', 'draw', 'loss']
 
     cols_needed = [f'{name}_prob_{cls}' for name in names for cls in classes_to_plot] + [mover_result_col]
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
 
     if positive_class is None:
@@ -409,34 +537,61 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str],
             classes_to_plot = ['win', 'loss']
             print('plot_roc_auc: all draw probabilities are 0 across every model -- skipping draw panel.')
 
+    if elo_bins is None:
+        row_data = [(df, None)]
+    else:
+        subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        row_data = list(zip(subsets, panel_labels))
+
     panel_width, panel_height = figsize or BASE_FIGSIZE
     colors = colors_for(names)
-    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
+    fig, axes = plt.subplots(len(row_data), len(classes_to_plot),
+                              figsize=(panel_width * len(classes_to_plot), panel_height * len(row_data)),
                               squeeze=False)
-    axes = axes[0]
     if title:
         fig.suptitle(title)
 
-    for ax, cls in zip(axes, classes_to_plot):
-        y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
-
-        for name in names:
-            y_score = df[f'{name}_prob_{cls}']
-            fpr, tpr, _ = roc_curve(y_true, y_score)
-            roc_auc = auc(fpr, tpr)
-            label = f'{resolve_display_name(name, display_names)} (AUC = {roc_auc:.3f})'
-            ax.plot(fpr, tpr, color=colors[name], linewidth=2, label=label)
-
-        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Chance')
-        ax.set_xlabel('False Positive Rate')
-        ax.set_ylabel('True Positive Rate')
-        ax.set_title(f'{cls.capitalize()} prediction')
-        ax.legend(loc='lower right')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(*ylim)
+    for row_idx, (row_df, panel_label) in enumerate(row_data):
+        for col_idx, cls in enumerate(classes_to_plot):
+            panel_title = f'{cls.capitalize()} prediction'
+            if panel_label is not None:
+                panel_title += f' -- {panel_label}'
+            _draw_roc_panel(axes[row_idx][col_idx], row_df, names, mover_result_col, cls,
+                             class_to_result, colors, ylim, panel_title, display_names)
 
     plt.tight_layout()
     plt.show()
+
+
+def _draw_calibration_panel(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str, cls: str,
+                             class_to_result: dict[str, float], bin_edges: np.ndarray, n_bins: int,
+                             colors: dict[str, str], ylim: tuple[float, float], panel_title: str,
+                             display_names: dict[str, str] | None) -> None:
+    """Draws one reliability-diagram panel (one result class, all models) onto ax."""
+    y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
+
+    for name in names:
+        y_score = df[f'{name}_prob_{cls}']
+        prob_bin = pd.cut(y_score, bins=bin_edges, labels=False, right=True, include_lowest=True)
+
+        mean_pred, observed_rate = [], []
+        for b in range(n_bins):
+            mask = prob_bin == b
+            if mask.sum():
+                mean_pred.append(y_score[mask].mean())
+                observed_rate.append(y_true[mask].mean())
+
+        ax.plot(mean_pred, observed_rate, marker='D', markersize=6, markeredgecolor='white',
+                markeredgewidth=0.6, linewidth=2, color=colors[name],
+                label=resolve_display_name(name, display_names))
+
+    ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Perfectly calibrated')
+    ax.set_xlabel('Mean predicted probability')
+    ax.set_ylabel('Observed frequency')
+    ax.set_title(panel_title)
+    ax.legend(loc='upper left')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(*ylim)
 
 
 def plot_calibration(df: pd.DataFrame, names: list[str],
@@ -446,8 +601,10 @@ def plot_calibration(df: pd.DataFrame, names: list[str],
                       ylim: tuple[float, float] = (0, 1),
                       title: str | None = None,
                       figsize: tuple[float, float] | None = None,
-                      display_names: dict[str, str] | None = None) -> None:
-    """Plots reliability diagrams (mean predicted probability vs observed frequency, equal-width bins) across models."""
+                      display_names: dict[str, str] | None = None,
+                      elo_bins: tuple[int, int] | None = None,
+                      elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
+    """Plots reliability diagrams (mean predicted probability vs observed frequency, equal-width bins) across models, as one row or two elo-bin-restricted rows."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
         raise ValueError(f'positive_class must be one of {list(class_to_result)}, got {positive_class!r}')
@@ -455,6 +612,8 @@ def plot_calibration(df: pd.DataFrame, names: list[str],
     classes_to_plot = [positive_class] if positive_class is not None else ['win', 'draw', 'loss']
 
     cols_needed = [f'{name}_prob_{cls}' for name in names for cls in classes_to_plot] + [mover_result_col]
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
 
     if positive_class is None:
@@ -465,39 +624,28 @@ def plot_calibration(df: pd.DataFrame, names: list[str],
 
     bin_edges = np.linspace(0, 1, n_bins + 1)
 
+    if elo_bins is None:
+        row_data = [(df, None)]
+    else:
+        subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        row_data = list(zip(subsets, panel_labels))
+
     panel_width, panel_height = figsize or BASE_FIGSIZE
     colors = colors_for(names)
-    fig, axes = plt.subplots(1, len(classes_to_plot), figsize=(panel_width * len(classes_to_plot), panel_height),
+    fig, axes = plt.subplots(len(row_data), len(classes_to_plot),
+                              figsize=(panel_width * len(classes_to_plot), panel_height * len(row_data)),
                               squeeze=False)
-    axes = axes[0]
     if title:
         fig.suptitle(title)
 
-    for ax, cls in zip(axes, classes_to_plot):
-        y_true = (df[mover_result_col] == class_to_result[cls]).astype(int)
-
-        for name in names:
-            y_score = df[f'{name}_prob_{cls}']
-            prob_bin = pd.cut(y_score, bins=bin_edges, labels=False, right=True, include_lowest=True)
-
-            mean_pred, observed_rate = [], []
-            for b in range(n_bins):
-                mask = prob_bin == b
-                if mask.sum():
-                    mean_pred.append(y_score[mask].mean())
-                    observed_rate.append(y_true[mask].mean())
-
-            ax.plot(mean_pred, observed_rate, marker='D', markersize=6, markeredgecolor='white',
-                    markeredgewidth=0.6, linewidth=2, color=colors[name],
-                    label=resolve_display_name(name, display_names))
-
-        ax.plot([0, 1], [0, 1], color='grey', linestyle='--', linewidth=1, label='Perfectly calibrated')
-        ax.set_xlabel('Mean predicted probability')
-        ax.set_ylabel('Observed frequency')
-        ax.set_title(f'{cls.capitalize()} calibration')
-        ax.legend(loc='upper left')
-        ax.set_xlim(0, 1)
-        ax.set_ylim(*ylim)
+    for row_idx, (row_df, panel_label) in enumerate(row_data):
+        for col_idx, cls in enumerate(classes_to_plot):
+            panel_title = f'{cls.capitalize()} calibration'
+            if panel_label is not None:
+                panel_title += f' -- {panel_label}'
+            _draw_calibration_panel(axes[row_idx][col_idx], row_df, names, mover_result_col, cls,
+                                     class_to_result, bin_edges, n_bins, colors, ylim, panel_title,
+                                     display_names)
 
     plt.tight_layout()
     plt.show()

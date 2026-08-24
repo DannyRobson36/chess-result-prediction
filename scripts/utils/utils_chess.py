@@ -2,8 +2,8 @@
 utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
-Latest changes: 19/08/26:
-- Fixed encode_title_idx
+Latest changes: 24/08/26:
+- Added material and title-strength helpers
 """
 
 import numpy as np
@@ -28,6 +28,21 @@ TOTAL_PHASE = (PAWN_PHASE * 16 + KNIGHT_PHASE * 4 + BISHOP_PHASE * 4
 
 OPENING_MAX_PHASE = 64
 MIDDLEGAME_MAX_PHASE = 192
+
+# Material values (pawns included, kings excluded)
+PAWN_VALUE = 1
+KNIGHT_VALUE = 3
+BISHOP_VALUE = 3
+ROOK_VALUE = 5
+QUEEN_VALUE = 9
+
+PIECE_VALUES = {
+    chess.PAWN: PAWN_VALUE,
+    chess.KNIGHT: KNIGHT_VALUE,
+    chess.BISHOP: BISHOP_VALUE,
+    chess.ROOK: ROOK_VALUE,
+    chess.QUEEN: QUEEN_VALUE,
+}
 
 # Fen handling
 FEN_PAD = '.'
@@ -63,6 +78,11 @@ TITLE_TO_IDX = {
     'unk': 13,
 }
 TITLE_VOCAB_SIZE = len(TITLE_TO_IDX)
+
+# Title strength, within-track only -- open and women's titles are separate scales and are
+# never compared directly. Higher = stronger. LM has no women's-track counterpart.
+OPEN_TITLE_STRENGTH = {'GM': 6, 'IM': 5, 'FM': 4, 'CM': 3, 'NM': 2, 'LM': 1}
+WOMENS_TITLE_STRENGTH = {'WGM': 6, 'WIM': 5, 'WFM': 4, 'WCM': 3, 'WNM': 2}
 
 ####################
 # FUNCTIONS
@@ -155,7 +175,7 @@ def fen_to_attacked_squares(fen: str) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
-# (b) COMPUTE GAME PHASE FROM FEN
+# (b) COMPUTE GAME PHASE & MATERIAL FROM FEN
 
 def game_phase(fen: str) -> int:
     """Computes a material-based game phase score from a FEN (0 = full material, 256 = bare endgame)."""
@@ -177,6 +197,22 @@ def phase_label(phase: int) -> str:
     elif phase <= MIDDLEGAME_MAX_PHASE:
         return 'middlegame'
     return 'endgame'
+
+
+def total_material(fen: str) -> int:
+    """Sums standard piece values (pawns included, kings excluded) for both sides from a FEN."""
+    board = chess.Board(fen)
+    return sum(PIECE_VALUES.get(piece.piece_type, 0) for piece in board.piece_map().values())
+
+
+def material_diff(fen: str) -> int:
+    """Mover-perspective signed material difference (mover minus opponent), standard values, pawns included."""
+    board, _ = _mover_perspective_board(fen)
+    diff = 0
+    for piece in board.piece_map().values():
+        value = PIECE_VALUES.get(piece.piece_type, 0)
+        diff += value if piece.color == chess.WHITE else -value
+    return diff
 
 # (c) GENERAL CONVERSION FROM WHITE-MOVER PERSPECTIVE
 
@@ -421,3 +457,19 @@ def decode_result_class(class_idx: np.ndarray | torch.Tensor | list[int]) -> lis
 def encode_title_idx(title: pd.Series) -> np.ndarray:
     """Maps a title Series to TITLE_TO_IDX indices as a plain int64 array."""
     return title.astype('object').map(TITLE_TO_IDX).fillna(TITLE_TO_IDX['unk']).to_numpy(dtype='int64')
+
+
+def title_track(title: str) -> str | None:
+    """Returns 'open', 'womens', or None (untitled/BOT/unrecognized) for a title string."""
+    if title in OPEN_TITLE_STRENGTH:
+        return 'open'
+    if title in WOMENS_TITLE_STRENGTH:
+        return 'womens'
+    return None
+
+
+def title_strength(title: str) -> int | None:
+    """Returns the within-track strength rank for title, or None if untitled/unrecognized."""
+    if title in OPEN_TITLE_STRENGTH:
+        return OPEN_TITLE_STRENGTH[title]
+    return WOMENS_TITLE_STRENGTH.get(title)

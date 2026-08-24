@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 24/08/26:
-- Added material/phase/hours-since/title plots, mover-clock and clock-diff plots
+- Added add_material_and_phase_cols, material/phase precomputed 
 """
 
 import glob
@@ -111,6 +111,16 @@ def combine_predictions(main_df: pd.DataFrame, predictions_dir: str, split: str,
           f'{len(df_combined):,} rows x {len(df_combined.columns)} cols -- {loaded_names}')
 
     return df_combined, loaded_names
+
+
+def add_material_and_phase_cols(df: pd.DataFrame, fen_col: str = 'fen',
+                                 material_col: str = 'material', phase_col: str = 'phase') -> pd.DataFrame:
+    """Adds material_col (total board material) and phase_col (0-256 game phase score), computed once per fen."""
+    df = df.copy()
+    df[material_col] = df[fen_col].apply(total_material)
+    df[phase_col] = df[fen_col].apply(game_phase)
+    print(f'add_material_and_phase_cols: computed {material_col!r} and {phase_col!r} for {len(df):,} rows.')
+    return df
 
 
 # (b) ROW FILTERING
@@ -715,7 +725,7 @@ def _draw_accuracy_by_material(ax: plt.Axes, df: pd.DataFrame, names: list[str],
 
 
 def plot_accuracy_by_material(df: pd.DataFrame, names: list[str],
-                               fen_col: str = 'fen',
+                               material_col: str = 'material',
                                mover_result_col: str = 'mover_result',
                                bin_width: int = 4,
                                min_material: int | None = None,
@@ -726,14 +736,17 @@ def plot_accuracy_by_material(df: pd.DataFrame, names: list[str],
                                display_names: dict[str, str] | None = None,
                                elo_bins: tuple[int, int] | None = None,
                                elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
-    """Plots per-model accuracy against true mover_result, binned by total material on board (both sides, pawns included), as one panel or two elo-bin-restricted panels."""
-    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, fen_col]
+    """Plots per-model accuracy against true mover_result, binned by total material on board (both sides, pawns included, from a precomputed material_col), as one panel or two elo-bin-restricted panels."""
+    if material_col not in df.columns:
+        raise ValueError(f'{material_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
+
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, material_col]
     if elo_bins is not None:
         cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
     df = df.copy()
 
-    material_raw = df[fen_col].apply(total_material)
+    material_raw = df[material_col]
     if min_material is not None:
         n_before = len(df)
         keep = material_raw >= min_material
@@ -871,7 +884,7 @@ def _draw_accuracy_by_phase(ax: plt.Axes, df: pd.DataFrame, names: list[str], mo
 
 
 def plot_accuracy_by_phase(df: pd.DataFrame, names: list[str],
-                            fen_col: str = 'fen',
+                            phase_col: str = 'phase',
                             mover_result_col: str = 'mover_result',
                             bin_width: int = 16,
                             max_phase: int | None = None,
@@ -882,14 +895,17 @@ def plot_accuracy_by_phase(df: pd.DataFrame, names: list[str],
                             display_names: dict[str, str] | None = None,
                             elo_bins: tuple[int, int] | None = None,
                             elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
-    """Plots per-model accuracy against true mover_result, binned by continuous game phase score, as one panel or two elo-bin-restricted panels."""
-    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, fen_col]
+    """Plots per-model accuracy against true mover_result, binned by continuous game phase score (from a precomputed phase_col), as one panel or two elo-bin-restricted panels."""
+    if phase_col not in df.columns:
+        raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
+
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, phase_col]
     if elo_bins is not None:
         cols_needed += ['mover_elo', 'opponent_elo']
     df = restrict_to_common_rows(df, cols_needed)
     df = df.copy()
 
-    phase_raw = df[fen_col].apply(game_phase)
+    phase_raw = df[phase_col]
     if max_phase is not None:
         n_before = len(df)
         keep = phase_raw <= max_phase
@@ -917,17 +933,20 @@ def plot_accuracy_by_phase(df: pd.DataFrame, names: list[str],
 
 
 def plot_accuracy_by_phase_simple(df: pd.DataFrame, names: list[str],
-                                   fen_col: str = 'fen',
+                                   phase_col: str = 'phase',
                                    mover_result_col: str = 'mover_result',
                                    ylim: tuple[float, float] = (0, 80),
                                    title: str = 'Result-prediction accuracy by simplified game phase',
                                    figsize: tuple[float, float] | None = None,
                                    display_names: dict[str, str] | None = None) -> None:
-    """Plots per-model accuracy against true mover_result, grouped into opening/middlegame/endgame."""
-    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, fen_col]
+    """Plots per-model accuracy against true mover_result, grouped into opening/middlegame/endgame (derived from a precomputed phase_col)."""
+    if phase_col not in df.columns:
+        raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
+
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, phase_col]
     df = restrict_to_common_rows(df, cols_needed)
     df = df.copy()
-    df['_phase_label'] = df[fen_col].apply(game_phase).apply(phase_label)
+    df['_phase_label'] = df[phase_col].apply(phase_label)
 
     class_to_val = {'loss': 0.0, 'draw': 0.5, 'win': 1.0}
     colors = colors_for(names)

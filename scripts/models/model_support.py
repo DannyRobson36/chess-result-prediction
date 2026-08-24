@@ -3,7 +3,7 @@ model_support.py
 Building blocks for models
 
 Latest changes: 20/08/26:
-- Added TokenAuxHead and SpatialAuxHead
+- Altered positioning in TokenAuxHead
 """
 
 import torch
@@ -328,16 +328,18 @@ POOL_REGISTRY = {
 # (d) AUXILIARY HEADS
 
 class TokenAuxHead(nn.Module):
-    """Per-token linear projection of (b, 64, dim_vit) board-square tokens to a legal_dest/
-    attacked_mover/attacked_opponent auxiliary output.
+    """Per-token linear projection of (b, 64, dim_vit) FEN-order board-square tokens to a
+    legal_dest/attacked_mover/attacked_opponent auxiliary output.
     Out: (b, 3, 64).
     """
     def __init__(self, dim_vit):
         super().__init__()
         self.proj = nn.Linear(dim_vit, 3)
+        perm = torch.tensor([(7 - i // 8) * 8 + (i % 8) for i in range(64)])
+        self.register_buffer('perm', perm)
 
     def forward(self, x):
-        return self.proj(x).transpose(1, 2)
+        return self.proj(x).transpose(1, 2)[:, :, self.perm]
 
 class SpatialAuxHead(nn.Module):
     """1x1 conv projection of (b, vit_length, 8, 8) CNN output to a legal_dest/attacked_mover/

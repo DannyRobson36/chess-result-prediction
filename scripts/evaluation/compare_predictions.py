@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 24/08/26:
-- Added stockfish agreement plotters 
+- Altered combined clock plotter
 """
 
 import glob
@@ -326,8 +326,12 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
                                      figsize: tuple[float, float] | None = None,
                                      display_names: dict[str, str] | None = None,
                                      elo_bins: tuple[int, int] | None = None,
-                                     elo_bin_cfg: EloBinConfig = ELO_BINS) -> None:
-    """Plots per-model accuracy against true mover_result, binned by proportion of clock time remaining, as one panel or two elo-bin-restricted panels."""
+                                     elo_bin_cfg: EloBinConfig = ELO_BINS,
+                                     split_by_increment: bool = False) -> None:
+    """Plots per-model accuracy against true mover_result, binned by proportion of clock time remaining, as one panel, two elo-bin-restricted panels, or two increment/no-increment panels."""
+    if elo_bins is not None and split_by_increment:
+        raise ValueError('elo_bins and split_by_increment cannot both be set -- choose one panel split.')
+
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
     if elo_bins is not None:
@@ -349,12 +353,24 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
     colors = colors_for(names)
     panel_width, panel_height = figsize or BASE_FIGSIZE
 
-    if elo_bins is None:
+    if elo_bins is None and not split_by_increment:
         fig, ax = plt.subplots(figsize=(panel_width, panel_height))
         _draw_accuracy_by_combined_clock(ax, df, names, mover_result_col, bin_width, colors, ylim,
                                           title, show_hist, display_names)
-    else:
+    elif elo_bins is not None:
         subsets, panel_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+        fig, axes = plt.subplots(1, 2, figsize=(panel_width * 2, panel_height), sharey=True)
+        for ax, sub_df, panel_label in zip(axes, subsets, panel_labels):
+            _draw_accuracy_by_combined_clock(ax, sub_df, names, mover_result_col, bin_width, colors, ylim,
+                                              f'{title} -- {panel_label}', show_hist, display_names)
+    else:
+        inc_flag = df[time_control_col].map(INC_FLAG_MAPPING)
+        n_unmapped = int(inc_flag.isna().sum())
+        if n_unmapped:
+            print(f'plot_accuracy_by_combined_clock: {n_unmapped:,} rows have unmapped {time_control_col} '
+                  f'for increment split -- excluded from both panels.')
+        subsets = [df[inc_flag == 1], df[inc_flag == 0]]
+        panel_labels = ['with increment', 'no increment']
         fig, axes = plt.subplots(1, 2, figsize=(panel_width * 2, panel_height), sharey=True)
         for ax, sub_df, panel_label in zip(axes, subsets, panel_labels):
             _draw_accuracy_by_combined_clock(ax, sub_df, names, mover_result_col, bin_width, colors, ylim,
@@ -362,7 +378,6 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
 
     plt.tight_layout()
     plt.show()
-
 
 def _clock_ratio_bin_edges(n_bins_per_side: int) -> list[float]:
     """Returns integer-step bin edges from -n_bins_per_side to +n_bins_per_side, with open -inf/+inf tails."""

@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 27/08/26:
-- Removed print message
+- profile_time toggle added to run_training - tracks training time usage
 """
 
 import os
@@ -309,7 +309,8 @@ def evaluate_with_loss(model: nn.Module, arch_name: str, split: SplitData, idx: 
 
 def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitData, cfg: "TrainConfig",
                   train_probe_idx: np.ndarray | None = None,
-                  val_probe_idx: np.ndarray | None = None, device: torch.device | None = None) -> dict:
+                  val_probe_idx: np.ndarray | None = None, device: torch.device | None = None,
+                  profile_time: bool = False) -> dict:
     """Trains with early stopping on cfg.primary_metric; returns history and best epoch (1-indexed) weights."""
     device = device or get_device()
     model = model.to(device)
@@ -359,16 +360,25 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
                          drop_last=True, bin_weights=bin_weights, grad_clip_norm=cfg.grad_clip_norm,
                          warmup_steps=warmup_steps, base_lr=cfg.lr, step_counter=step_counter,
                          aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
+        if profile_time:
+            _sync_device(device)
+            train_elapsed = time.time() - epoch_start
 
         train_metrics = evaluate_with_loss(model, arch_name, train, train_probe_idx, loss_fn, output_type,
                                             batch_size=cfg.batch_size, device=device,
                                             aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
+        if profile_time:
+            _sync_device(device)
+            train_eval_elapsed = time.time() - epoch_start - train_elapsed
+
         val_metrics = evaluate_with_loss(model, arch_name, val, val_idx, loss_fn, output_type,
                                           batch_size=cfg.batch_size, device=device,
                                           aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
 
         _sync_device(device)
         epoch_time = time.time() - epoch_start
+        if profile_time:
+            val_eval_elapsed = epoch_time - train_elapsed - train_eval_elapsed
 
         for key in keys:
             history[f"train_{key}"].append(train_metrics[key])
@@ -383,6 +393,10 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
                 parts.append(f"val_{key}={val_metrics[key]:.4f}")
             parts.append(f"time={epoch_time:.2f}s")
             print("  ".join(parts))
+            if profile_time:
+                other_elapsed = time.time() - epoch_start - train_elapsed - train_eval_elapsed - val_eval_elapsed
+                print(f"  time breakdown: train={train_elapsed:.2f}s  train_eval={train_eval_elapsed:.2f}s  "
+                      f"val_eval={val_eval_elapsed:.2f}s  other={other_elapsed:.2f}s")
 
         score = val_metrics[cfg.primary_metric]
         if best_score is None or is_better(score, best_score, mode):

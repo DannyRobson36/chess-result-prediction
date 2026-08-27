@@ -2,8 +2,8 @@
 model_arch.py
 Contains all models using PyTorch
 
-Latest changes: 20/08/26:
-- Maia2ValueFeature/PureTransformer gained an aux_head, predict_fn now returns (preds, aux_preds)
+Latest changes: 27/08/26:
+- Dropout organisation changed, transformer's meta tokens embedded with board (not features)
 """
 
 import torch
@@ -94,13 +94,13 @@ class Maia2ValueBoard(nn.Module):
             nn.LayerNorm(cfg.dim_vit),
         )
         self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        self.embed_dropout = nn.Dropout(cfg.embed_dropout)
+        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
 
         ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
         self.attn_blocks = nn.ModuleList([
             nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.attn_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.ff_dropout),
+                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
+                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
             ])
             for _ in range(cfg.n_vit_layer)
         ])
@@ -119,7 +119,7 @@ class Maia2ValueBoard(nn.Module):
         feats = feats.view(b, feats.size(1), 8 * 8)
         x = self.to_patch_embedding(feats)
         x = x + self.pos_embedding
-        x = self.embed_dropout(x)
+        x = self.board_embed_dropout(x)
 
         for attn, ff in self.attn_blocks:
             x = attn(x) + x
@@ -143,14 +143,14 @@ class Maia2ValueReplica(nn.Module):
             nn.LayerNorm(cfg.dim_vit),
         )
         self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        self.embed_dropout = nn.Dropout(cfg.embed_dropout)
+        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
 
         self.elo_embedding = nn.Embedding(n_elo_bins, cfg.elo_dim)
         ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
         self.attn_blocks = nn.ModuleList([
             nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, elo_dim=cfg.elo_dim * 2, dropout=cfg.attn_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.ff_dropout),
+                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, elo_dim=cfg.elo_dim * 2, dropout=cfg.trunk_dropout),
+                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
             ])
             for _ in range(cfg.n_vit_layer)
         ])
@@ -169,7 +169,7 @@ class Maia2ValueReplica(nn.Module):
         feats = feats.view(b, feats.size(1), 8 * 8)
         x = self.to_patch_embedding(feats)
         x = x + self.pos_embedding
-        x = self.embed_dropout(x)
+        x = self.board_embed_dropout(x)
 
         elo_emb = torch.cat([self.elo_embedding(elo_self_bin), self.elo_embedding(elo_oppo_bin)], dim=1)
 
@@ -200,7 +200,7 @@ class Maia2ValueFeature(nn.Module):
         )
         self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
         self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-        self.aux_embed_dropout = nn.Dropout(cfg.aux_embed_dropout)
+        self.feat_embed_dropout = nn.Dropout(cfg.feat_embed_dropout)
 
         self.feature_embeds = build_feature_embeds(self.feature_names, cfg.dim_vit)
         self.feature_pos = nn.Parameter(torch.randn(1, len(self.feature_names), cfg.dim_vit))
@@ -208,8 +208,8 @@ class Maia2ValueFeature(nn.Module):
         ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
         self.attn_blocks = nn.ModuleList([
             nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.attn_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.ff_dropout),
+                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
+                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
             ])
             for _ in range(cfg.n_vit_layer)
         ])
@@ -238,7 +238,7 @@ class Maia2ValueFeature(nn.Module):
             for name in self.feature_names
         ], dim=1)
         feature_tokens = feature_tokens + self.feature_pos
-        feature_tokens = self.aux_embed_dropout(feature_tokens)
+        feature_tokens = self.feat_embed_dropout(feature_tokens)
 
         x = torch.cat([board_tokens, feature_tokens], dim=1)
 
@@ -274,7 +274,7 @@ class PureTransformer(nn.Module):
 
         self.token_embedding = nn.Embedding(len(FEN_VOCAB), cfg.dim_vit)
         self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-        self.aux_embed_dropout = nn.Dropout(cfg.aux_embed_dropout)
+        self.feat_embed_dropout = nn.Dropout(cfg.feat_embed_dropout)
 
         self.feature_embeds = build_feature_embeds(self.feature_names, cfg.dim_vit)
 
@@ -287,16 +287,16 @@ class PureTransformer(nn.Module):
         if cfg.pos_embed_type == "learned":
             self.blocks = nn.ModuleList([
                 nn.ModuleList([
-                    Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.attn_dropout),
-                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.ff_dropout),
+                    Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
+                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
                 ])
                 for _ in range(cfg.n_vit_layer)
             ])
         else:
             self.blocks = nn.ModuleList([
                 nn.ModuleList([
-                    RotaryAttention(cfg.dim_vit, cfg.heads, cfg.dim_head, n_rotary=64, dropout=cfg.attn_dropout),
-                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.ff_dropout),
+                    RotaryAttention(cfg.dim_vit, cfg.heads, cfg.dim_head, n_rotary=64, dropout=cfg.trunk_dropout),
+                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
                 ])
                 for _ in range(cfg.n_vit_layer)
             ])
@@ -321,14 +321,14 @@ class PureTransformer(nn.Module):
         board_tok = self.board_embed_dropout(board_tok)
 
         meta_tok = meta_tok + self.meta_pos
-        meta_tok = self.aux_embed_dropout(meta_tok)
+        meta_tok = self.board_embed_dropout(meta_tok)
 
         feature_tokens = torch.cat([
             embed_feature(self.feature_embeds, name, features[name])
             for name in self.feature_names
         ], dim=1)
         feature_tokens = feature_tokens + self.feature_pos
-        feature_tokens = self.aux_embed_dropout(feature_tokens)
+        feature_tokens = self.feat_embed_dropout(feature_tokens)
 
         x = torch.cat([board_tok, meta_tok, feature_tokens], dim=1)
 

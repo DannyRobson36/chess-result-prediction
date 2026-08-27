@@ -3,7 +3,7 @@
 Project-wide hardcoded config for use across scripts.
 
 Latest changes: 14/08/26:
-- Added _data to t/v/t
+- Updated to final checkpoint/prediction dirs
 """
 
 ####################
@@ -19,8 +19,8 @@ TRAIN_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/train_data'
 VAL_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/val_data'
 TEST_DIR = '/content/drive/MyDrive/drive_diss/data/pos_data/test_data'
 RESULTS_DIR = '/content/drive/MyDrive/drive_diss/data/results'
-CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints'
-PREDICTIONS_DIR = '/content/drive/MyDrive/drive_diss/data/predictions'
+CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints/final'
+PREDICTIONS_DIR = '/content/drive/MyDrive/drive_diss/data/predictions/final'
 
 ####################
 # Local Disk - Colab session 

@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 27/08/26:
-- _resolve_warmup_steps now caps warmup_steps at one epoch's worth of batches
+- Removed print message
 """
 
 import os
@@ -209,19 +209,13 @@ def apply_warmup_lr(optimizer, base_lr: float, step: int, warmup_steps: int) -> 
         group["lr"] = base_lr * scale
 
 def _resolve_warmup_steps(warmup_prop: float | None, n_train: int, batch_size: int, n_epochs: int) -> int | None:
-    """Converts warmup_prop (fraction of total training batches) into an absolute warmup_steps
-    count, capped to one epoch's worth of batches. The cap prevents warmup from still being
-    active when the epoch-level scheduler.step() call fires, which would otherwise overwrite
-    the warmup ramp with the scheduler's own epoch-indexed lr value."""
+    """Converts warmup_prop (fraction of total training batches) into an absolute warmup_steps count, capped to one epoch's worth of batches."""
     if warmup_prop is None:
         return None
     batches_per_epoch = n_train // batch_size
     total_steps = batches_per_epoch * n_epochs
     requested_steps = max(1, round(warmup_prop * total_steps))
-    warmup_steps = min(requested_steps, batches_per_epoch)
-    if warmup_steps < requested_steps:
-        print(f"warmup_steps capped at {warmup_steps} (one epoch) instead of requested {requested_steps}")
-    return warmup_steps
+    return min(requested_steps, batches_per_epoch)
 
 # (f) TRAIN & EVALUATE ONE EPOCH
 

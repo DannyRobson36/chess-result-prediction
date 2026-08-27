@@ -2,8 +2,8 @@
 model_config.py
 Allows for configuration of model's parameters, depends on flexibility allowed in model_arch.py
 
-Latest changes: 20/08/26:
-- Added AuxHeadConfig
+Latest changes: 27/08/26:
+- Alterations to dropout organisation - effects notebook-level
 """
 
 from dataclasses import dataclass, field, asdict
@@ -26,7 +26,7 @@ class AuxHeadConfig:
     enabled: bool = False
     loss_weight: float | None = None
 
-# (a) LOGISTIC REGRESSION (BASELINES) - CONFIG
+# (a) LOGISTIC REGRESSION (BASELINE) - CONFIG
 
 @dataclass
 class LogRegBaselineConfig(BaseModelConfig):
@@ -51,15 +51,14 @@ class Maia2ValueBoardConfig(BaseModelConfig):
 
     vit_length: int = 8
     dim_vit: int = 64
-    embed_dropout: float = 0.1
+    board_embed_dropout: float = 0.1
 
     n_vit_layer: int = 1
     heads: int = 4
     dim_head: int = 16
     ff_hidden_dim: int | None = None
     ff_activation: str = "gelu"
-    attn_dropout: float = 0.1
-    ff_dropout: float = 0.1
+    trunk_dropout: float = 0.1
 
     pool_type: str = "mean"
     pool_dropout: float | None = None
@@ -84,7 +83,7 @@ class Maia2ValueReplicaConfig(BaseModelConfig):
 
     vit_length: int = 8
     dim_vit: int = 64
-    embed_dropout: float = 0.1
+    board_embed_dropout: float = 0.1
 
     n_vit_layer: int = 1
     heads: int = 4
@@ -92,8 +91,7 @@ class Maia2ValueReplicaConfig(BaseModelConfig):
     elo_dim: int = 32
     ff_hidden_dim: int | None = None
     ff_activation: str = "gelu"
-    attn_dropout: float = 0.1
-    ff_dropout: float = 0.1
+    trunk_dropout: float = 0.1
 
     pool_type: str = "mean"
     pool_dropout: float | None = None
@@ -119,7 +117,7 @@ class Maia2ValueFeatureConfig(BaseModelConfig):
     vit_length: int = 8
     dim_vit: int = 64
     board_embed_dropout: float = 0.1
-    aux_embed_dropout: float = 0.1
+    feat_embed_dropout: float = 0.1
 
     features: dict = field(default_factory=dict)
 
@@ -128,8 +126,7 @@ class Maia2ValueFeatureConfig(BaseModelConfig):
     dim_head: int = 16
     ff_hidden_dim: int | None = None
     ff_activation: str = "gelu"
-    attn_dropout: float = 0.1
-    ff_dropout: float = 0.1
+    trunk_dropout: float = 0.1
 
     pool_type: str = "mean"
     pool_dropout: float | None = None
@@ -150,7 +147,7 @@ class PureTransformerConfig(BaseModelConfig):
 
     dim_vit: int = 64
     board_embed_dropout: float = 0.1
-    aux_embed_dropout: float = 0.1
+    feat_embed_dropout: float = 0.1
 
     features: dict = field(default_factory=dict)
     pos_embed_type: str = "rope"
@@ -160,8 +157,7 @@ class PureTransformerConfig(BaseModelConfig):
     dim_head: int = 16
     ff_hidden_dim: int | None = None
     ff_activation: str = "gelu"
-    attn_dropout: float = 0.1
-    ff_dropout: float = 0.1
+    trunk_dropout: float = 0.1
 
     pool_type: str = "mean"
     pool_dropout: float | None = None

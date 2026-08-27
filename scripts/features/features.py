@@ -3,8 +3,8 @@ features.py
 Builds model-ready SplitData from raw dataframes: scaling, elo binning.
 Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
 
-Latest changes: 19/08/26:
-- Added auxiliary targets - legal moves and attacked squares
+Latest changes: 27/08/26:
+- clip-then-power(0.3) transform option applied to clock/hours_since
 """
 
 import json
@@ -38,15 +38,19 @@ from scripts.utils.utils_chess import (
 
 _ELO_TRANS = {'raw': 'raw', 'normal': 'normal'}
 _PLY_TRANS = {'raw': 'raw', 'normal': 'normal'}
-_PAST_TRANS = {'raw': 'raw', 'normal': 'normal'}
+_PAST_TRANS = {'raw': 'raw', 'normal': 'normal', 'centered': 'centered'}
 _LAST_RESULT_TRANS = {'raw': 'raw', 'normal': 'normal'}
-_HOURS_TRANS = {'raw': 'raw', 'symmetric_prop': 'centered', 'symmetric_prop_log': 'log_centered'}
+_HOURS_TRANS = {
+    'raw': 'raw', 'symmetric_prop': 'centered', 'symmetric_prop_log': 'log_centered',
+    'hours_since_pow': 'pow_hours',
+}
 _CLOCK_TRANS = {
     'raw': 'raw',
     'clock_prop_norm': 'normal',
     'clock_prop_centred': 'centered',
     'clock_prop_log_norm': 'log_norm',
     'clock_prop_log_centred': 'log_centered',
+    'clock_prop_pow': 'pow_clock',
 }
 _FLAG_TRANS = {'raw': 'raw'}
 _SF_TRANS = {'raw': 'raw', 'normal': 'normal', 'centered': 'centered'}
@@ -85,6 +89,9 @@ ATTEMPT_TIMEOUT_SECONDS = 120
 
 # Starting Elo rating for a new Lichess account.
 NEW_USER_STARTING_ELO = 1500
+
+# Exponent for the clip-then-power clock/hours-since transforms.
+POW_EXPONENT = 0.3
 
 ####################
 # FUNCTIONS
@@ -153,12 +160,34 @@ def _apply_log_centered(vals: np.ndarray, stats: dict) -> np.ndarray:
     return (2 * ((np.log1p(vals) - stats['lo']) / span) - 1).astype('float32')
 
 
+def _fit_pow_clock(pooled_train: np.ndarray) -> dict:
+    """Empty stats for the clip-then-power clock transform."""
+    return {}
+
+
+def _apply_pow_clock(vals: np.ndarray, stats: dict) -> np.ndarray:
+    """Clips vals to [0, 1], then raises to POW_EXPONENT."""
+    return (np.clip(vals, 0.0, 1.0) ** POW_EXPONENT).astype('float32')
+
+
+def _fit_pow_hours(pooled_train: np.ndarray) -> dict:
+    """Empty stats for the clip-then-power hours-since transform."""
+    return {}
+
+
+def _apply_pow_hours(vals: np.ndarray, stats: dict) -> np.ndarray:
+    """Clips vals to [0, 1], then raises to POW_EXPONENT."""
+    return (np.clip(vals, 0.0, 1.0) ** POW_EXPONENT).astype('float32')
+
+
 _TRANS_FIT_APPLY = {
     'raw': (_fit_raw, _apply_raw),
     'normal': (_fit_normal, _apply_normal),
     'log_norm': (_fit_log_norm, _apply_log_norm),
     'centered': (_fit_centered, _apply_centered),
     'log_centered': (_fit_log_centered, _apply_log_centered),
+    'pow_clock': (_fit_pow_clock, _apply_pow_clock),
+    'pow_hours': (_fit_pow_hours, _apply_pow_hours),
 }
 
 
@@ -231,6 +260,14 @@ def _resolve_clock_cols(clock_cols: list[str]) -> tuple[str, str, str]:
     return mover_col, opponent_col, remaining[0]
 
 
+def _clock_props(df: pd.DataFrame, mover_col: str, opponent_col: str, time_control_col: str) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (mover, opponent) clock time remaining as a proportion of total game time."""
+    game_time = df[time_control_col].map(SEC_MAPPING).to_numpy(dtype='float64')
+    mover = df[mover_col].to_numpy(dtype='float64') / game_time
+    opponent = df[opponent_col].to_numpy(dtype='float64') / game_time
+    return mover, opponent
+
+
 def _resolve_past_cols(past_cols: list[str]) -> dict[str, str]:
     """Resolves past_cols to a dict of named columns."""
     if len(past_cols) not in (2, 4, 6):
@@ -255,6 +292,18 @@ def _resolve_past_cols(past_cols: list[str]) -> dict[str, str]:
         out['last_result_mover'] = _match_one(result_group, 'mover', 'past_cols (result)')
         out['last_result_opponent'] = _match_one(result_group, 'opponent', 'past_cols (result)')
     return out
+
+
+def _has_history_mask(df: pd.DataFrame, hours_since_col: str) -> np.ndarray:
+    """Boolean mask of rows with a non-missing hours-since value."""
+    return pd.to_numeric(df[hours_since_col], errors='coerce').notna().to_numpy()
+
+
+def _hours_since_props(df: pd.DataFrame, mover_col: str, opponent_col: str, max_hours: float) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (mover, opponent) hours-since-last-game as a proportion of max_hours, missing values filled to max_hours."""
+    mover = pd.to_numeric(df[mover_col], errors='coerce').fillna(max_hours).to_numpy(dtype='float64') / max_hours
+    opponent = pd.to_numeric(df[opponent_col], errors='coerce').fillna(max_hours).to_numpy(dtype='float64') / max_hours
+    return mover, opponent
 
 
 def _resolve_color_cols(color_cols: list[str]) -> str:
@@ -599,17 +648,12 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
         for df in dfs.values():
             _validate_time_control(df[time_control_col], SEC_MAPPING.keys())
 
-        def _clock_prop(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-            game_time = df[time_control_col].map(SEC_MAPPING).to_numpy(dtype='float64')
-            m = df[mover_clock_col].to_numpy(dtype='float64') / game_time
-            o = df[opponent_clock_col].to_numpy(dtype='float64') / game_time
-            return m, o
-
-        train_mover_prop, train_opponent_prop = _clock_prop(df_train)
         per_split_prop = {}
         for name, df in dfs.items():
-            m, o = _clock_prop(df)
+            m, o = _clock_props(df, mover_clock_col, opponent_clock_col, time_control_col)
             per_split_prop[name] = {'mover': m, 'opponent': o}
+        train_mover_prop = per_split_prop['train']['mover']
+        train_opponent_prop = per_split_prop['train']['opponent']
 
         trans_name, base_trans = _resolve_trans_name(clock_scale, 'pooled_clock', _CLOCK_TRANS, 'clock_scale')
         scaled, stats = _fit_apply_pooled(train_mover_prop, train_opponent_prop, per_split_prop,
@@ -645,15 +689,37 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
         _validate_scale_keys(past_scale, expected_scale_keys, 'past_scale')
         resolved = _resolve_past_cols(past_cols)
         past_cols_resolved = resolved
+        has_hours = len(past_cols) >= 4
+
+        has_history = None
+        if has_hours:
+            has_history = {name: {'mover': _has_history_mask(df, resolved['hours_since_mover']),
+                                   'opponent': _has_history_mask(df, resolved['hours_since_opponent'])}
+                            for name, df in dfs.items()}
 
         trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_past', _PAST_TRANS, 'past_scale')
-        train_mover_raw = df_train[resolved['past_mover']].to_numpy(dtype='float64')
-        train_opponent_raw = df_train[resolved['past_opponent']].to_numpy(dtype='float64')
         per_split_raw = {name: {'mover': df[resolved['past_mover']].to_numpy(dtype='float64'),
                                  'opponent': df[resolved['past_opponent']].to_numpy(dtype='float64')}
                           for name, df in dfs.items()}
-        scaled, stats = _fit_apply_pooled(train_mover_raw, train_opponent_raw, per_split_raw,
+
+        no_history_fill = None
+        fit_raw = per_split_raw
+        if has_hours:
+            train_has_history_vals = np.concatenate([
+                per_split_raw['train']['mover'][has_history['train']['mover']],
+                per_split_raw['train']['opponent'][has_history['train']['opponent']],
+            ])
+            no_history_fill = float(train_has_history_vals.mean())
+            fit_raw = {
+                name: {'mover': np.where(has_history[name]['mover'], vals['mover'], no_history_fill),
+                       'opponent': np.where(has_history[name]['opponent'], vals['opponent'], no_history_fill)}
+                for name, vals in per_split_raw.items()
+            }
+
+        scaled, stats = _fit_apply_pooled(fit_raw['train']['mover'], fit_raw['train']['opponent'], fit_raw,
                                            trans_name, base_trans, 'past_scale')
+        if no_history_fill is not None:
+            stats['no_history_fill'] = no_history_fill
         scaling_stats['pooled_past'] = stats
         for name in dfs:
             features[name]['past_mover_unscaled'] = per_split_raw[name]['mover'].astype('float32')
@@ -661,7 +727,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             features[name]['past_mover_scaled'] = scaled[name]['mover']
             features[name]['past_opponent_scaled'] = scaled[name]['opponent']
 
-        if len(past_cols) >= 4:
+        if has_hours:
             hist_trans_name, hist_base_trans = _resolve_trans_name(
                 past_scale, 'pooled_has_history', _FLAG_TRANS, 'past_scale')
             new_trans_name, new_base_trans = _resolve_trans_name(
@@ -669,16 +735,12 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             hist_apply_fn = _TRANS_FIT_APPLY[hist_base_trans][1]
             new_apply_fn = _TRANS_FIT_APPLY[new_base_trans][1]
 
-            has_history = {}
             for name, df in dfs.items():
-                m_notna = pd.to_numeric(df[resolved['hours_since_mover']], errors='coerce').notna().to_numpy()
-                o_notna = pd.to_numeric(df[resolved['hours_since_opponent']], errors='coerce').notna().to_numpy()
-                has_history[name] = {'mover': m_notna, 'opponent': o_notna}
-
                 m_elo = df[mover_elo_col].to_numpy(dtype='float64')
                 o_elo = df[opponent_elo_col].to_numpy(dtype='float64')
 
-                for side, notna, elo in (('mover', m_notna, m_elo), ('opponent', o_notna, o_elo)):
+                for side, notna, elo in (('mover', has_history[name]['mover'], m_elo),
+                                          ('opponent', has_history[name]['opponent'], o_elo)):
                     hist_raw = notna.astype('float64')
                     features[name][f'has_history_{side}_unscaled'] = hist_raw.astype('float32')
                     features[name][f'has_history_{side}_scaled'] = hist_apply_fn(hist_raw, {})
@@ -695,447 +757,18 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
                 pd.to_numeric(df_train[resolved['hours_since_opponent']], errors='coerce').max(skipna=True),
             )
 
-            def _hours_prop(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-                m = (pd.to_numeric(df[resolved['hours_since_mover']], errors='coerce')
-                     .fillna(train_max_hours).to_numpy(dtype='float64'))
-                o = (pd.to_numeric(df[resolved['hours_since_opponent']], errors='coerce')
-                     .fillna(train_max_hours).to_numpy(dtype='float64'))
-                return m / train_max_hours, o / train_max_hours
-
-            train_mover_prop, train_opponent_prop = _hours_prop(df_train)
             per_split_prop = {}
             for name, df in dfs.items():
-                m, o = _hours_prop(df)
+                m, o = _hours_since_props(df, resolved['hours_since_mover'], resolved['hours_since_opponent'],
+                                           train_max_hours)
                 per_split_prop[name] = {'mover': m, 'opponent': o}
 
             trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_hours_since', _HOURS_TRANS, 'past_scale')
-            scaled, stats = _fit_apply_pooled(train_mover_prop, train_opponent_prop, per_split_prop,
-                                               trans_name, base_trans, 'past_scale')
+            scaled, stats = _fit_apply_pooled(per_split_prop['train']['mover'], per_split_prop['train']['opponent'],
+                                               per_split_prop, trans_name, base_trans, 'past_scale')
             stats['max_hours'] = float(train_max_hours)
             scaling_stats['pooled_hours_since'] = stats
             for name in dfs:
                 features[name]['hours_since_mover_unscaled'] = per_split_prop[name]['mover'].astype('float32')
                 features[name]['hours_since_opponent_unscaled'] = per_split_prop[name]['opponent'].astype('float32')
-                features[name]['hours_since_mover_scaled'] = scaled[name]['mover']
-                features[name]['hours_since_opponent_scaled'] = scaled[name]['opponent']
-        else:
-            print("past_cols has 2 entries, has_history_mover/opponent not created "
-                  "(no NaN signal survives in past_mover/past_opponent to derive it from).")
-
-        if len(past_cols) == 6:
-            trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_last_result',
-                                                           _LAST_RESULT_TRANS, 'past_scale')
-
-            def _last_result_filled(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-                m = pd.to_numeric(df[resolved['last_result_mover']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
-                o = pd.to_numeric(df[resolved['last_result_opponent']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
-                return m, o
-
-            train_mover_raw, train_opponent_raw = _last_result_filled(df_train)
-            per_split_raw = {}
-            for name, df in dfs.items():
-                m, o = _last_result_filled(df)
-                per_split_raw[name] = {'mover': m, 'opponent': o}
-
-            scaled, stats = _fit_apply_pooled(train_mover_raw, train_opponent_raw, per_split_raw,
-                                               trans_name, base_trans, 'past_scale')
-            scaling_stats['pooled_last_result'] = stats
-            for name in dfs:
-                features[name]['last_result_mover_unscaled'] = per_split_raw[name]['mover'].astype('float32')
-                features[name]['last_result_opponent_unscaled'] = per_split_raw[name]['opponent'].astype('float32')
-                features[name]['last_result_mover_scaled'] = scaled[name]['mover']
-                features[name]['last_result_opponent_scaled'] = scaled[name]['opponent']
-
-    # Color
-    color_col = None
-    if color_cols is not None:
-        if color_scale is None:
-            raise ValueError('color_scale is required whenever color_cols is given.')
-        _validate_scale_keys(color_scale, {'mover_is_white'}, 'color_scale')
-        color_col = _resolve_color_cols(color_cols)
-        trans_name, base_trans = _resolve_trans_name(color_scale, 'mover_is_white', _FLAG_TRANS, 'color_scale')
-        apply_fn = _TRANS_FIT_APPLY[base_trans][1]
-        for name, df in dfs.items():
-            raw = df[color_col].to_numpy(dtype='float64')
-            features[name]['mover_is_white_unscaled'] = raw.astype('float32')
-            features[name]['mover_is_white_scaled'] = apply_fn(raw, {})
-        scaling_stats['mover_is_white'] = {'trans_name': trans_name}
-
-    # Ply
-    ply_col = None
-    if ply_cols is not None:
-        if ply_scale is None:
-            raise ValueError('ply_scale is required whenever ply_cols is given.')
-        _validate_scale_keys(ply_scale, {'ply_played'}, 'ply_scale')
-        ply_col = _resolve_ply_cols(ply_cols)
-        trans_name, base_trans = _resolve_trans_name(ply_scale, 'ply_played', _PLY_TRANS, 'ply_scale')
-        fit_fn, apply_fn = _TRANS_FIT_APPLY[base_trans]
-        train_raw = df_train[ply_col].to_numpy(dtype='float64')
-        stats = fit_fn(train_raw)
-        scaling_stats['ply_played'] = {'trans_name': trans_name, **stats}
-        for name, df in dfs.items():
-            raw = df[ply_col].to_numpy(dtype='float64')
-            features[name]['ply_played_unscaled'] = raw.astype('float32')
-            features[name]['ply_played_scaled'] = apply_fn(raw, stats)
-
-    # Rematch
-    rematch_flag_col = rematch_prev_col = None
-    if rematch_cols is not None:
-        if rematch_scale is None:
-            raise ValueError('rematch_scale is required whenever rematch_cols is given.')
-        _validate_scale_keys(rematch_scale, {'rematch_prev_result'}, 'rematch_scale')
-        rematch_flag_col, rematch_prev_col = _resolve_rematch_cols(rematch_cols)
-        trans_name, base_trans = _resolve_trans_name(rematch_scale, 'rematch_prev_result', _FLAG_TRANS, 'rematch_scale')
-        apply_fn = _TRANS_FIT_APPLY[base_trans][1]
-        for name, df in dfs.items():
-            is_rematch = df[rematch_flag_col].to_numpy()
-            prev = df[rematch_prev_col].to_numpy(dtype='float64')
-            raw = np.where(is_rematch, (prev - 0.5) * 2.0, 0.0)
-            features[name]['rematch_prev_result_unscaled'] = raw.astype('float32')
-            features[name]['rematch_prev_result_scaled'] = apply_fn(raw, {})
-        scaling_stats['rematch_prev_result'] = {'trans_name': trans_name}
-
-    # Title
-    title_mover_col = title_opponent_col = None
-    if title_cols is not None:
-        if title_scale is None:
-            raise ValueError('title_scale is required whenever title_cols is given.')
-        _validate_scale_keys(title_scale, {'pooled_title'}, 'title_scale')
-        if 'pooled_title' not in title_scale:
-            raise ValueError("title_scale must include 'pooled_title': 'cat'.")
-        if title_scale['pooled_title'] != 'cat':
-            raise ValueError(f"title_scale['pooled_title'] must be 'cat', got {title_scale['pooled_title']!r}.")
-        title_mover_col, title_opponent_col = _resolve_title_cols(title_cols)
-        for name, df in dfs.items():
-            m_idx = encode_title_idx(df[title_mover_col]).astype('float32')
-            o_idx = encode_title_idx(df[title_opponent_col]).astype('float32')
-            features[name]['mover_title_unscaled'] = m_idx
-            features[name]['opponent_title_unscaled'] = o_idx
-            features[name]['mover_title_scaled'] = m_idx
-            features[name]['opponent_title_scaled'] = o_idx
-        scaling_stats['pooled_title'] = {'trans_name': 'cat'}
-
-    # Stockfish
-    if sf_depth is not None and sf_scale is None:
-        raise ValueError('sf_scale is required whenever sf_depth is given.')
-    if sf_scale is not None and sf_depth is None:
-        raise ValueError('sf_depth is required whenever sf_scale is given.')
-
-    if sf_depth is not None:
-        _validate_scale_keys(sf_scale, {'stockfish_eval'}, 'sf_scale')
-        trans_name, base_trans = _resolve_trans_name(sf_scale, 'stockfish_eval', _SF_TRANS, 'sf_scale')
-        fit_fn, apply_fn = _TRANS_FIT_APPLY[base_trans]
-
-        sf_raw = {name: _stockfish_eval_fens(df[fen_col].to_numpy(), sf_depth) for name, df in dfs.items()}
-        stats = fit_fn(sf_raw['train'])
-        scaling_stats['stockfish_eval'] = {'trans_name': trans_name, **stats}
-        for name in dfs:
-            winprob = cp_to_mover_winprob(sf_raw[name])
-            features[name]['stockfish_eval_unscaled'] = sf_raw[name].astype('float32')
-            features[name]['stockfish_eval_scaled'] = apply_fn(sf_raw[name], stats)
-            features[name]['stockfish_winprob_unscaled'] = winprob.astype('float32')
-            features[name]['stockfish_winprob_scaled'] = winprob.astype('float32')
-
-    print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
-
-    # Assemble, save, memory-map
-    splits = {}
-    for name, df in dfs.items():
-        t0 = time.time()
-        n_rows = len(df)
-        split_dir = os.path.join(out_dir, name)
-        os.makedirs(split_dir, exist_ok=True)
-
-        fens = df[fen_col].to_numpy()
-        _write_boards_tokens_and_aux(split_dir, fens, desc=f'{name} boards/tokens/aux', chunk_size=chunk_size,
-                                      write_boards=write_boards, write_tokens=write_tokens,
-                                      aux_targets=aux_targets)
-
-        elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
-        _write_split_arrays(
-            split_dir, elo_mean_bin, elo_self_bin, elo_oppo_bin,
-            {k: torch.tensor(v, dtype=torch.float32) for k, v in features[name].items()},
-            encode_result_class(df[mover_result_col]).to(torch.uint8),
-            encode_result_continuous(df[mover_result_col]),
-            n_elo_bins, bin_labels,
-            df[game_id_col].astype(str).tolist(), df[fen_col].tolist(),
-            has_boards=write_boards, has_board_token_ids=write_tokens, has_aux_targets=aux_targets,
-        )
-        print(f'{name:>7}: {n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
-
-        splits[name] = load_split(split_dir)
-        print(f'{name:>7}: saved and memory-mapped from {split_dir}. RSS: {_rss_gb():.2f} GB')
-
-    train_out = splits['train']
-
-    base_names = sorted({k.rsplit('_', 1)[0] for k in train_out.features})
-    print('Features:')
-    for i in range(0, len(base_names), 6):
-        print('  ' + ', '.join(base_names[i:i + 6]))
-    print(f'Elo bins: {train_out.n_elo_bins} ({train_out.bin_labels[0]} ... {train_out.bin_labels[-1]})')
-
-    class_counts = torch.bincount(train_out.result_class).tolist()
-    print(f'Target distribution (train, by class index): {class_counts}')
-    print(f'prepare_splits done. RSS: {_rss_gb():.2f} GB')
-
-    prep_cfg = PrepConfig(
-        mover_result_col=mover_result_col,
-        fen_col=fen_col,
-        game_id_col=game_id_col,
-        cfg=cfg,
-        mover_elo_col=mover_elo_col,
-        opponent_elo_col=opponent_elo_col,
-        mover_clock_col=mover_clock_col,
-        opponent_clock_col=opponent_clock_col,
-        time_control_col=time_control_col,
-        past_cols_resolved=past_cols_resolved,
-        color_col=color_col,
-        ply_col=ply_col,
-        rematch_flag_col=rematch_flag_col,
-        rematch_prev_col=rematch_prev_col,
-        title_mover_col=title_mover_col,
-        title_opponent_col=title_opponent_col,
-        board_mode=board_mode,
-        aux_targets=aux_targets,
-        sf_depth=sf_depth,
-        scaling_stats=scaling_stats,
-    )
-
-    return train_out, splits['val'], splits['val_wl'], prep_cfg
-
-
-def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str,
-                           chunk_size: int = CHUNK_SIZE) -> 'SplitData':
-    """Applies an already-fitted PrepConfig to new raw data, returning a memory-mapped SplitData."""
-    required = [prep_cfg.mover_result_col, prep_cfg.fen_col, prep_cfg.game_id_col,
-                prep_cfg.mover_elo_col, prep_cfg.opponent_elo_col]
-    if prep_cfg.mover_clock_col is not None:
-        required += [prep_cfg.mover_clock_col, prep_cfg.opponent_clock_col, prep_cfg.time_control_col]
-    if prep_cfg.past_cols_resolved is not None:
-        required += list(prep_cfg.past_cols_resolved.values())
-    if prep_cfg.color_col is not None:
-        required.append(prep_cfg.color_col)
-    if prep_cfg.ply_col is not None:
-        required.append(prep_cfg.ply_col)
-    if prep_cfg.rematch_flag_col is not None:
-        required += [prep_cfg.rematch_flag_col, prep_cfg.rematch_prev_col]
-    if prep_cfg.title_mover_col is not None:
-        required += [prep_cfg.title_mover_col, prep_cfg.title_opponent_col]
-
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f'apply_prepared_splits: df is missing required column(s) {missing}.')
-
-    write_boards, write_tokens = _resolve_board_mode(prep_cfg.board_mode)
-
-    stats = prep_cfg.scaling_stats
-    features = {}
-
-    # Elo
-    mover_raw = df[prep_cfg.mover_elo_col].to_numpy(dtype='float64')
-    opponent_raw = df[prep_cfg.opponent_elo_col].to_numpy(dtype='float64')
-    features['mover_elo_unscaled'] = mover_raw.astype('float32')
-    features['opponent_elo_unscaled'] = opponent_raw.astype('float32')
-    features['mover_elo_scaled'] = _apply_stored_stats(mover_raw, stats['pooled_elo'])
-    features['opponent_elo_scaled'] = _apply_stored_stats(opponent_raw, stats['pooled_elo'])
-
-    # Clock
-    if prep_cfg.mover_clock_col is not None:
-        _validate_time_control(df[prep_cfg.time_control_col], SEC_MAPPING.keys())
-        game_time = df[prep_cfg.time_control_col].map(SEC_MAPPING).to_numpy(dtype='float64')
-        mover_prop = df[prep_cfg.mover_clock_col].to_numpy(dtype='float64') / game_time
-        opponent_prop = df[prep_cfg.opponent_clock_col].to_numpy(dtype='float64') / game_time
-        features['mover_clock_unscaled'] = mover_prop.astype('float32')
-        features['opponent_clock_unscaled'] = opponent_prop.astype('float32')
-        features['mover_clock_scaled'] = _apply_stored_stats(mover_prop, stats['pooled_clock'])
-        features['opponent_clock_scaled'] = _apply_stored_stats(opponent_prop, stats['pooled_clock'])
-
-        for flag_name, mapping in (('inc_flag', INC_FLAG_MAPPING), ('total_length_flag', TOTAL_LENGTH_FLAG_MAPPING)):
-            raw = df[prep_cfg.time_control_col].map(mapping).to_numpy(dtype='float64')
-            features[f'{flag_name}_unscaled'] = raw.astype('float32')
-            features[f'{flag_name}_scaled'] = _apply_stored_stats(raw, stats[flag_name])
-
-    # Past
-    if prep_cfg.past_cols_resolved is not None:
-        resolved = prep_cfg.past_cols_resolved
-        mover_raw = df[resolved['past_mover']].to_numpy(dtype='float64')
-        opponent_raw = df[resolved['past_opponent']].to_numpy(dtype='float64')
-        features['past_mover_unscaled'] = mover_raw.astype('float32')
-        features['past_opponent_unscaled'] = opponent_raw.astype('float32')
-        features['past_mover_scaled'] = _apply_stored_stats(mover_raw, stats['pooled_past'])
-        features['past_opponent_scaled'] = _apply_stored_stats(opponent_raw, stats['pooled_past'])
-
-        if 'hours_since_mover' in resolved:
-            for side in ('mover', 'opponent'):
-                notna = pd.to_numeric(df[resolved[f'hours_since_{side}']], errors='coerce').notna().to_numpy()
-                hist_raw = notna.astype('float64')
-                features[f'has_history_{side}_unscaled'] = hist_raw.astype('float32')
-                features[f'has_history_{side}_scaled'] = _apply_stored_stats(hist_raw, stats['pooled_has_history'])
-
-                side_elo_col = prep_cfg.mover_elo_col if side == 'mover' else prep_cfg.opponent_elo_col
-                elo = df[side_elo_col].to_numpy(dtype='float64')
-                new_player_raw = ((~notna) & (elo == NEW_USER_STARTING_ELO)).astype('float64')
-                features[f'new_player_{side}_unscaled'] = new_player_raw.astype('float32')
-                features[f'new_player_{side}_scaled'] = _apply_stored_stats(new_player_raw, stats['pooled_new_player'])
-
-            max_hours = stats['pooled_hours_since']['max_hours']
-            m_hours = (pd.to_numeric(df[resolved['hours_since_mover']], errors='coerce')
-                       .fillna(max_hours).to_numpy(dtype='float64')) / max_hours
-            o_hours = (pd.to_numeric(df[resolved['hours_since_opponent']], errors='coerce')
-                       .fillna(max_hours).to_numpy(dtype='float64')) / max_hours
-            features['hours_since_mover_unscaled'] = m_hours.astype('float32')
-            features['hours_since_opponent_unscaled'] = o_hours.astype('float32')
-            features['hours_since_mover_scaled'] = _apply_stored_stats(m_hours, stats['pooled_hours_since'])
-            features['hours_since_opponent_scaled'] = _apply_stored_stats(o_hours, stats['pooled_hours_since'])
-
-        if 'last_result_mover' in resolved:
-            m_res = pd.to_numeric(df[resolved['last_result_mover']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
-            o_res = pd.to_numeric(df[resolved['last_result_opponent']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
-            features['last_result_mover_unscaled'] = m_res.astype('float32')
-            features['last_result_opponent_unscaled'] = o_res.astype('float32')
-            features['last_result_mover_scaled'] = _apply_stored_stats(m_res, stats['pooled_last_result'])
-            features['last_result_opponent_scaled'] = _apply_stored_stats(o_res, stats['pooled_last_result'])
-
-    # Color
-    if prep_cfg.color_col is not None:
-        raw = df[prep_cfg.color_col].to_numpy(dtype='float64')
-        features['mover_is_white_unscaled'] = raw.astype('float32')
-        features['mover_is_white_scaled'] = _apply_stored_stats(raw, stats['mover_is_white'])
-
-    # Ply
-    if prep_cfg.ply_col is not None:
-        raw = df[prep_cfg.ply_col].to_numpy(dtype='float64')
-        features['ply_played_unscaled'] = raw.astype('float32')
-        features['ply_played_scaled'] = _apply_stored_stats(raw, stats['ply_played'])
-
-    # Rematch
-    if prep_cfg.rematch_flag_col is not None:
-        is_rematch = df[prep_cfg.rematch_flag_col].to_numpy()
-        prev = df[prep_cfg.rematch_prev_col].to_numpy(dtype='float64')
-        raw = np.where(is_rematch, (prev - 0.5) * 2.0, 0.0)
-        features['rematch_prev_result_unscaled'] = raw.astype('float32')
-        features['rematch_prev_result_scaled'] = _apply_stored_stats(raw, stats['rematch_prev_result'])
-
-    # Title
-    if prep_cfg.title_mover_col is not None:
-        m_idx = encode_title_idx(df[prep_cfg.title_mover_col]).astype('float32')
-        o_idx = encode_title_idx(df[prep_cfg.title_opponent_col]).astype('float32')
-        features['mover_title_unscaled'] = m_idx
-        features['opponent_title_unscaled'] = o_idx
-        features['mover_title_scaled'] = m_idx
-        features['opponent_title_scaled'] = o_idx
-
-    # Stockfish
-    if prep_cfg.sf_depth is not None:
-        raw = _stockfish_eval_fens(df[prep_cfg.fen_col].to_numpy(), prep_cfg.sf_depth)
-        winprob = cp_to_mover_winprob(raw)
-        features['stockfish_eval_unscaled'] = raw.astype('float32')
-        features['stockfish_eval_scaled'] = _apply_stored_stats(raw, stats['stockfish_eval'])
-        features['stockfish_winprob_unscaled'] = winprob.astype('float32')
-        features['stockfish_winprob_scaled'] = winprob.astype('float32')
-
-    print(f'Feature prep done, RSS: {_rss_gb():.2f} GB')
-
-    # Assemble, save, memory-map
-    t0 = time.time()
-    n_rows = len(df)
-    os.makedirs(out_dir, exist_ok=True)
-
-    fens = df[prep_cfg.fen_col].to_numpy()
-    _write_boards_tokens_and_aux(out_dir, fens, desc='boards/tokens/aux', chunk_size=chunk_size,
-                                  write_boards=write_boards, write_tokens=write_tokens,
-                                  aux_targets=prep_cfg.aux_targets)
-
-    elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
-        df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
-
-    _write_split_arrays(
-        out_dir, elo_mean_bin, elo_self_bin, elo_oppo_bin,
-        {k: torch.tensor(v, dtype=torch.float32) for k, v in features.items()},
-        encode_result_class(df[prep_cfg.mover_result_col]).to(torch.uint8),
-        encode_result_continuous(df[prep_cfg.mover_result_col]),
-        n_elo_bins, bin_labels,
-        df[prep_cfg.game_id_col].astype(str).tolist(), df[prep_cfg.fen_col].tolist(),
-        has_boards=write_boards, has_board_token_ids=write_tokens, has_aux_targets=prep_cfg.aux_targets,
-    )
-    print(f'{n_rows:>9,} rows prepared in {time.time() - t0:.2f}s')
-
-    split = load_split(out_dir)
-    print(f'saved and memory-mapped from {out_dir}. RSS: {_rss_gb():.2f} GB')
-
-    base_names = sorted({k.rsplit('_', 1)[0] for k in split.features})
-    print('Features:')
-    for i in range(0, len(base_names), 6):
-        print('  ' + ', '.join(base_names[i:i + 6]))
-
-    class_counts = torch.bincount(split.result_class).tolist()
-    print(f'Target distribution (by class index): {class_counts}')
-
-    return split
-
-####################
-# CLASSES
-####################
-
-# (a) DATA CONTAINERS
-
-@dataclass
-class SplitData:
-    """Model inputs and targets for one split."""
-    boards: torch.Tensor | None
-    board_token_ids: torch.Tensor | None
-    legal_dest: torch.Tensor | None
-    attacked_mover: torch.Tensor | None
-    attacked_opponent: torch.Tensor | None
-    elo_mean_bin: torch.Tensor
-    elo_self_bin: torch.Tensor
-    elo_oppo_bin: torch.Tensor
-    features: dict
-    result_class: torch.Tensor
-    result_cont: torch.Tensor
-    n_elo_bins: int
-    bin_labels: list
-    game_id: list
-    fen: list
-
-    def __len__(self) -> int:
-        return len(self.result_class)
-
-
-@dataclass
-class PrepConfig:
-    """Resolved column names, transform choices, and fitted scaling stats needed to reapply prepare_splits to new data."""
-    mover_result_col: str
-    fen_col: str
-    game_id_col: str
-    cfg: EloBinConfig
-
-    mover_elo_col: str
-    opponent_elo_col: str
-
-    mover_clock_col: str | None = None
-    opponent_clock_col: str | None = None
-    time_control_col: str | None = None
-
-    past_cols_resolved: dict[str, str] | None = None
-
-    color_col: str | None = None
-    ply_col: str | None = None
-
-    rematch_flag_col: str | None = None
-    rematch_prev_col: str | None = None
-
-    title_mover_col: str | None = None
-    title_opponent_col: str | None = None
-
-    board_mode: str = 'both'
-    aux_targets: bool = False
-    sf_depth: int | None = None
-
-    scaling_stats: dict = field(default_factory=dict)
-
-
-# (b) STOCKFISH INTERNAL CONTROL FLOW
-
-class _StockfishTimeout(Exception):
-    """Raised when a single position's stockfish analysis exceeds ATTEMPT_TIMEOUT_SECONDS."""
+                features[name]['hours_since_mover_scaled'] =

@@ -3,7 +3,7 @@ training.py
 Batches a SplitData, runs one training loop with early stopping, saves a checkpoint for inference.
 
 Latest changes: 27/08/26:
-- profile_time toggle added to run_training - tracks training time usage
+- Train probe up to 100k, eval runs on higher batch size
 """
 
 import os
@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report
@@ -47,6 +48,9 @@ SCHEDULER_REGISTRY: dict[str, type] = {
 
 ELO_WEIGHT_DEFAULT_ALPHA = 0.5
 ELO_WEIGHT_MAX_RATIO = 5.0
+
+# Default row count for the random train-loss probe evaluated each epoch in run_training.
+TRAIN_PROBE_SIZE = 100_000
 
 ADAM_BETAS = (0.9, 0.999)
 ADAM_EPS = 1e-8
@@ -311,7 +315,8 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
                   train_probe_idx: np.ndarray | None = None,
                   val_probe_idx: np.ndarray | None = None, device: torch.device | None = None,
                   profile_time: bool = False) -> dict:
-    """Trains with early stopping on cfg.primary_metric; returns history and best epoch (1-indexed) weights."""
+    """Trains with early stopping on cfg.primary_metric; returns history, best epoch (1-indexed)
+    weights, and the full train/val metrics dict and lr at the best epoch."""
     device = device or get_device()
     model = model.to(device)
     output_type = get_output_type(arch_name)
@@ -343,11 +348,12 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
     history["lr"] = []
 
     if train_probe_idx is None:
-        train_probe_idx = probe_idx(train, n=min(5000, len(train)), seed=cfg.seed)
+        train_probe_idx = probe_idx(train, n=min(TRAIN_PROBE_SIZE, len(train)), seed=cfg.seed)
     val_idx = val_probe_idx if val_probe_idx is not None else np.arange(len(val))
     train_idx = np.arange(len(train))
 
     best_score, best_epoch, best_state_dict = None, None, None
+    best_train_metrics, best_val_metrics, best_lr = None, None, None
     epochs_without_improvement = 0
     step_counter = [0]
 
@@ -365,14 +371,14 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
             train_elapsed = time.time() - epoch_start
 
         train_metrics = evaluate_with_loss(model, arch_name, train, train_probe_idx, loss_fn, output_type,
-                                            batch_size=cfg.batch_size, device=device,
+                                            batch_size=cfg.eval_batch_size, device=device,
                                             aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
         if profile_time:
             _sync_device(device)
             train_eval_elapsed = time.time() - epoch_start - train_elapsed
 
         val_metrics = evaluate_with_loss(model, arch_name, val, val_idx, loss_fn, output_type,
-                                          batch_size=cfg.batch_size, device=device,
+                                          batch_size=cfg.eval_batch_size, device=device,
                                           aux_loss_fn=aux_loss_fn, aux_loss_weight=aux_loss_weight)
 
         _sync_device(device)
@@ -402,6 +408,9 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
         if best_score is None or is_better(score, best_score, mode):
             best_score, best_epoch = score, epoch + 1
             best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_train_metrics = dict(train_metrics)
+            best_val_metrics = dict(val_metrics)
+            best_lr = history["lr"][-1]
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -418,7 +427,8 @@ def run_training(model: nn.Module, arch_name: str, train: SplitData, val: SplitD
                 scheduler.step()
 
     return {"history": history, "best_epoch": best_epoch, "best_score": best_score,
-            "best_state_dict": best_state_dict}
+            "best_state_dict": best_state_dict, "best_train_metrics": best_train_metrics,
+            "best_val_metrics": best_val_metrics, "best_lr": best_lr}
 
 # (h) CHECKPOINTING
 
@@ -455,24 +465,36 @@ def _fit_checkpoint_calibration(model: nn.Module, arch_name: str, val: SplitData
     probit_params = fit_binary_probit(raw_val_wl.numpy(), val_wl.result_cont.long().numpy())
     return None, probit_params
 
-def save_checkpoint(model: nn.Module, arch_name: str, model_cfg: BaseModelConfig, run_result: dict,
-                     val: SplitData, val_wl: SplitData, prep_cfg: PrepConfig, path: str,
+def _history_to_dataframe(history: dict) -> pd.DataFrame:
+    """Converts run_training's per-metric history dict into a one-row-per-epoch DataFrame with a leading epoch column."""
+    n_epochs = len(history["epoch_time"])
+    return pd.DataFrame({"epoch": range(1, n_epochs + 1), **history})
+
+def save_checkpoint(model: nn.Module, arch_name: str, model_cfg: BaseModelConfig, train_cfg: "TrainConfig",
+                     run_result: dict, val: SplitData, val_wl: SplitData, prep_cfg: PrepConfig, path: str,
                      n_elo_bins: int | None = None, device: torch.device | None = None) -> None:
-    """Loads best_state_dict, fits calibration on val/val_wl, and saves everything needed for inference to path."""
+    """Loads best_state_dict, fits calibration on val/val_wl, and saves everything needed for inference
+    and reporting (configs, best-epoch metrics, per-epoch history) to path."""
     device = device or get_device()
     model = model.to(device)
     model.load_state_dict(run_result["best_state_dict"])
 
     temperature, probit_params = _fit_checkpoint_calibration(model, arch_name, val, val_wl, device)
+    epoch_history = _history_to_dataframe(run_result["history"])
 
     checkpoint = TrainedModel(
         arch_name=arch_name,
         model_cfg=model_cfg,
+        train_cfg=train_cfg,
         state_dict=run_result["best_state_dict"],
         n_elo_bins=n_elo_bins,
         prep_cfg=prep_cfg,
         best_epoch=run_result["best_epoch"],
         best_score=run_result["best_score"],
+        best_train_metrics=run_result["best_train_metrics"],
+        best_val_metrics=run_result["best_val_metrics"],
+        best_lr=run_result["best_lr"],
+        epoch_history=epoch_history,
         temperature=temperature,
         probit_params=probit_params,
     )
@@ -493,6 +515,7 @@ class TrainConfig:
     """Training run settings: optimisation, schedule, early stopping, elo-bin reweighting."""
     n_epochs: int = 20
     batch_size: int = 64
+    eval_batch_size: int = 16384
     lr: float = 1e-3
     weight_decay: float = 0.0
     loss_name: str | None = None
@@ -513,13 +536,18 @@ class TrainConfig:
 
 @dataclass
 class TrainedModel:
-    """Everything for reconstructing a trained model and running inference on new data."""
+    """Everything for reconstructing a trained model and running inference, plus the model/train configs, best-epoch train/val metrics and lr, and a per-epoch metrics DataFrame for later reporting."""
     arch_name: str
     model_cfg: BaseModelConfig
+    train_cfg: TrainConfig
     state_dict: dict
     n_elo_bins: int | None
     prep_cfg: PrepConfig
     best_epoch: int
     best_score: float
+    best_train_metrics: dict
+    best_val_metrics: dict
+    best_lr: float
+    epoch_history: pd.DataFrame
     temperature: float | None
     probit_params: tuple[float, float]

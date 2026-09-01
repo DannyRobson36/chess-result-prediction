@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 01/09/26:
-- Full-length version of half-commit
+- Minor naming convention change
 """
 
 import glob
@@ -52,10 +52,10 @@ DEFAULT_DISPLAY_NAMES: dict[str, str] = {
 # (a) DISCOVERY & LOADING
 
 def discover_predictions(predictions_dir: str, split: str, names: list[str] | None = None) -> dict[str, str]:
-    """Finds {split}_predictions_{name}.csv in predictions_dir for each of names, or every matching file
+    """Finds {split}_pred_{name}.csv in predictions_dir for each of names, or every matching file
     if names is None, returns {name: path}, sorted by name. A requested name with no matching file is
     skipped, not raised."""
-    prefix = f'{split}_predictions_'
+    prefix = f'{split}_pred_'
 
     if names is None:
         pattern = os.path.join(predictions_dir, f'{prefix}*.csv')
@@ -114,7 +114,7 @@ def combine_predictions(main_df: pd.DataFrame, predictions_dir: str, split: str,
 
     if not to_load and not already_present:
         raise FileNotFoundError(
-            f"No '{split}_predictions_*.csv' files found in {predictions_dir}"
+            f"No '{split}_pred_*.csv' files found in {predictions_dir}"
             + (f' for names={names}' if names is not None else '')
         )
 

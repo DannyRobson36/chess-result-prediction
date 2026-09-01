@@ -13,7 +13,7 @@ CLI:
     --depth        Single Stockfish search depth to evaluate at.
 
 Latest changes: 01/09/26:
-- Removed probit calibration pathway, keeping Lichess conversion only
+- Switched output filename convention
 """
 
 import os
@@ -259,10 +259,10 @@ def main(argv: list[str] | None = None) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     name_tag = f'stockfish_d{args.depth}'
-    raw_path = os.path.join(args.output_dir, f'{args.split}_predictions_{name_tag}_raw.csv')
+    output_path = os.path.join(args.output_dir, f'{args.split}_pred_{name_tag}.csv')
 
-    df_raw.to_csv(raw_path, index=False)
-    print(f'Saved {len(df_raw):,} rows to {raw_path}')
+    df_raw.to_csv(output_path, index=False)
+    print(f'Saved {len(df_raw):,} rows to {output_path}')
 
 ####################
 # CLASSES

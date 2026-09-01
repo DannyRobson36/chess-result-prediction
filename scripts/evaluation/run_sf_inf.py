@@ -1,24 +1,19 @@
 """
 run_sf_inf.py
-Stockfish evaluation of one split's positions, writing both raw (fixed Lichess win% curve)
-and probit-calibrated predictions in compare_predictions-ready form, plus a JSON record of
-the fitted calibration.
+Stockfish evaluation of one split's positions, writing win-probability predictions via the
+fixed Lichess win% curve, in compare_predictions-ready form.
 
 Run:
-    !python run_sf_inf.py --input-path /path/to/val_900k_res_bal.csv --calib-path /path/to/val_900k_res_bal_wl.csv
-        --split val --depth 7
+    !python run_sf_inf.py --input-path /path/to/val_900k_res_bal.csv --split val --depth 7
 
 CLI:
     --input-path   Path to the split's positions CSV to score. Must contain game_id, fen.
-    --calib-path   Path to val_wl's positions CSV, decisive-only. Must contain game_id, fen,
-                   mover_result. Used only to fit probit calibration.
     --split        Which split --input-path is: val or test. Used to name output files.
-    --output-dir   Folder to write predictions into (calibration JSON goes into a calib/
-                   subfolder of this). Default: PREDICTIONS_DIR (config.py).
-    --depth        Single Stockfish search depth to evaluate at, for both --input-path and --calib-path.
+    --output-dir   Folder to write predictions into. Default: PREDICTIONS_DIR (config.py).
+    --depth        Single Stockfish search depth to evaluate at.
 
-Latest changes: 19/08/26:
-- Calibration JSON written separately to predictions location - inside /calib/
+Latest changes: 01/09/26:
+- Removed probit calibration pathway, keeping Lichess conversion only
 """
 
 import os
@@ -29,15 +24,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.config import PREDICTIONS_DIR
-from scripts.utils.utils_eval import fit_binary_probit, binary_probit_prediction_cols
 
 import argparse
 import csv
-import json
 import multiprocessing as mp
 import signal
 import subprocess
-from datetime import datetime
 
 import chess
 import chess.engine
@@ -64,7 +56,6 @@ ATTEMPT_TIMEOUT_SECONDS = 120
 ENGINE_PATH = '/usr/games/stockfish'
 
 REQUIRED_SCORE_COLUMNS = ['game_id', 'fen']
-REQUIRED_CALIB_COLUMNS = ['game_id', 'fen', 'mover_result']
 
 NUM_WORKERS = os.cpu_count() or 1
 
@@ -221,66 +212,38 @@ def raw_prediction_cols(evals: np.ndarray) -> dict:
 # (e) CLI
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parses --input-path, --calib-path, --split, --output-dir, --depth CLI arguments."""
+    """Parses --input-path, --split, --output-dir, --depth CLI arguments."""
     parser = argparse.ArgumentParser(
-        description='Stockfish evaluation of one split, writing both raw (fixed Lichess win% '
-                     'curve) and probit-calibrated predictions in compare_predictions-ready form.'
+        description='Stockfish evaluation of one split, writing win-probability predictions '
+                     'via the fixed Lichess win% curve.'
     )
     parser.add_argument('--input-path', required=True,
                          help='Path to the split\'s positions CSV to score. Must contain game_id, fen.')
-    parser.add_argument('--calib-path', required=True,
-                         help='Path to val_wl\'s positions CSV (decisive-only), used to fit probit '
-                              'calibration. Must contain game_id, fen, mover_result.')
     parser.add_argument('--split', required=True, choices=['val', 'test'],
-                         help='Which split --input-path is, used to name the output files.')
+                         help='Which split --input-path is, used to name the output file.')
     parser.add_argument('--output-dir', default=PREDICTIONS_DIR, help=f'Default: {PREDICTIONS_DIR}')
     parser.add_argument('--depth', type=int, required=True,
-                         help='Single Stockfish search depth to evaluate at, for both --input-path '
-                              'and --calib-path.')
+                         help='Single Stockfish search depth to evaluate at.')
     args = parser.parse_args(argv)
     if args.depth <= 0:
         parser.error('--depth must be > 0.')
     return args
 
 def main(argv: list[str] | None = None) -> None:
-    """Fits probit calibration on --calib-path, evaluates --input-path (reusing the calibration
-    pass if the two paths are the same file), writes raw and calibrated predictions plus a
-    calibration-record JSON."""
+    """Evaluates --input-path's positions at --depth and writes raw Lichess-curve win-probability
+    predictions to a single CSV."""
     args = parse_args(argv)
 
     if not os.path.exists(args.input_path):
         sys.exit(f'No input CSV found at {args.input_path}.')
-    if not os.path.exists(args.calib_path):
-        sys.exit(f'No calibration CSV found at {args.calib_path}.')
 
     ensure_stockfish_installed(ENGINE_PATH)
     print(f'Detected {NUM_WORKERS} CPU core(s) -- using all of them as workers.')
 
-    calib_rows = load_positions(args.calib_path, REQUIRED_CALIB_COLUMNS)
-    calib_results = [float(r['mover_result']) for r in calib_rows]
-    if any(r == 0.5 for r in calib_results):
-        sys.exit(f'{args.calib_path} contains drawn (mover_result=0.5) rows -- calibration must '
-                  f'be fit on decisive-only (val_wl) data.')
-
-    print(f'Evaluating {len(calib_rows):,} calibration position(s) at depth {args.depth}...')
-    calib_evals, calib_n_terminal, calib_n_fallback = evaluate_positions(calib_rows, args.depth, 'calibration')
-    print(f'Calibration set: {calib_n_terminal} terminal, {calib_n_fallback} depth-fallback position(s).')
-
-    calib_targets = np.array(calib_results, dtype='int64')
-    probit_params = fit_binary_probit(calib_evals, calib_targets)
-    print(f'Fitted probit calibration: c={probit_params[0]:.4f}, sigma={probit_params[1]:.4f}')
-
-    same_file = os.path.realpath(args.input_path) == os.path.realpath(args.calib_path)
-    if same_file:
-        print('--input-path and --calib-path are the same file -- reusing calibration '
-              'evaluations, skipping a second pass.')
-        score_rows = calib_rows
-        score_evals = calib_evals
-    else:
-        score_rows = load_positions(args.input_path, REQUIRED_SCORE_COLUMNS)
-        print(f'Evaluating {len(score_rows):,} scored position(s) at depth {args.depth}...')
-        score_evals, score_n_terminal, score_n_fallback = evaluate_positions(score_rows, args.depth, 'scoring')
-        print(f'Scored set: {score_n_terminal} terminal, {score_n_fallback} depth-fallback position(s).')
+    score_rows = load_positions(args.input_path, REQUIRED_SCORE_COLUMNS)
+    print(f'Evaluating {len(score_rows):,} position(s) at depth {args.depth}...')
+    score_evals, score_n_terminal, score_n_fallback = evaluate_positions(score_rows, args.depth, 'scoring')
+    print(f'{score_n_terminal} terminal, {score_n_fallback} depth-fallback position(s).')
 
     eval_col = f'eval_{args.depth}'
     base = {
@@ -291,34 +254,15 @@ def main(argv: list[str] | None = None) -> None:
     output_cols = ['game_id', 'fen', eval_col, 'prob_win', 'prob_draw', 'prob_loss', 'predicted_class']
 
     df_raw = pd.DataFrame({**base, **raw_prediction_cols(score_evals)})
-    df_calibrated = pd.DataFrame({**base, **binary_probit_prediction_cols(score_evals, probit_params)})
-
-    assert list(df_raw.columns) == output_cols, 'raw output columns do not match output_cols.'
-    assert list(df_calibrated.columns) == output_cols, 'calibrated output columns do not match output_cols.'
+    assert list(df_raw.columns) == output_cols, 'output columns do not match output_cols.'
 
     os.makedirs(args.output_dir, exist_ok=True)
-    calib_dir = os.path.join(args.output_dir, 'calib')
-    os.makedirs(calib_dir, exist_ok=True)
 
     name_tag = f'stockfish_d{args.depth}'
     raw_path = os.path.join(args.output_dir, f'{args.split}_predictions_{name_tag}_raw.csv')
-    calibrated_path = os.path.join(args.output_dir, f'{args.split}_predictions_{name_tag}_calibrated.csv')
-    calib_json_path = os.path.join(calib_dir, f'{args.split}_predictions_{name_tag}_calibration.json')
 
     df_raw.to_csv(raw_path, index=False)
-    df_calibrated.to_csv(calibrated_path, index=False)
-    with open(calib_json_path, 'w') as f:
-        json.dump({
-            'c': probit_params[0], 'sigma': probit_params[1],
-            'depth': args.depth,
-            'calib_source_path': args.calib_path,
-            'n_calib_positions': len(calib_rows),
-            'fitted_at': datetime.now().isoformat(timespec='seconds'),
-        }, f, indent=2)
-
     print(f'Saved {len(df_raw):,} rows to {raw_path}')
-    print(f'Saved {len(df_calibrated):,} rows to {calibrated_path}')
-    print(f'Saved calibration record to {calib_json_path}')
 
 ####################
 # CLASSES

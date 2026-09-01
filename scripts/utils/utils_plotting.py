@@ -1,9 +1,10 @@
 """
 utils_plotting.py
-Shared matplotlib style, figure sizing, and per-model colour-assignment helpers for evaluation plots.
+Shared matplotlib style, figure sizing, and per-model colour/linestyle-assignment helpers for
+evaluation plots.
 
-Latest changes: 20/08/26:
-- Added BASE_FIGSIZE
+Latest changes: 01/09/26:
+- Tol muted palette
 """
 
 import matplotlib.pyplot as plt
@@ -25,8 +26,23 @@ PLOT_STYLE = {
 # Default (width, height) in inches for a single-panel plot; multi-panel plots scale width per panel from this.
 BASE_FIGSIZE = (7, 4.5)
 
-# Colour cycle for per-model plot lines and legend entries.
-PALETTE = plt.cm.tab20.colors
+# Paul Tol's CVD-safe qualitative "muted" palette (9 colours), plus a trailing mid-grey for overflow
+# beyond 9 names. The grey is not part of the CVD-safe set and is only used as a last resort.
+PALETTE = (
+    '#332288',  # indigo
+    '#88CCEE',  # cyan
+    '#44AA99',  # teal
+    '#117733',  # green
+    '#999933',  # olive
+    '#DDCC77',  # sand
+    '#CC6677',  # rose
+    '#882255',  # wine
+    '#AA4499',  # purple
+    '#888888',  # grey, overflow only
+)
+
+# Default linestyle assigned by linestyles_for when no override is given.
+DEFAULT_LINESTYLE = '-'
 
 ####################
 # FUNCTIONS
@@ -39,8 +55,46 @@ def apply_plot_style(overrides: dict | None = None) -> None:
     plt.rcParams.update({**PLOT_STYLE, **(overrides or {})})
 
 
-# (b) COLOUR ASSIGNMENT
+# (b) COLOUR / LINESTYLE ASSIGNMENT
 
-def colors_for(names: list[str], palette: tuple = PALETTE) -> dict[str, tuple]:
-    """Assigns each name a stable colour from palette, in order, cycling if more names than colours."""
-    return {name: palette[i % len(palette)] for i, name in enumerate(names)}
+def colors_for(names: list[str], canonical_order: list[str] | None = None,
+                overrides: list[str | None] | None = None, palette: tuple = PALETTE) -> dict[str, str]:
+    """Assigns each name in names a colour from palette. If canonical_order is given, a name's colour
+    is fixed by its position in canonical_order, stable across plots and subsets; names absent from
+    canonical_order fall back to a cycling position after canonical_order's length. If canonical_order
+    is None, colours are assigned by position in names. overrides, given by position in names (None
+    entries keep the assigned colour), force specific names to a specific colour."""
+    assigned = {}
+    next_fallback = len(canonical_order) if canonical_order is not None else 0
+    for i, name in enumerate(names):
+        if canonical_order is not None and name in canonical_order:
+            idx = canonical_order.index(name)
+        elif canonical_order is not None:
+            idx = next_fallback
+            next_fallback += 1
+        else:
+            idx = i
+        assigned[name] = palette[idx % len(palette)]
+
+    if overrides is not None:
+        if len(overrides) != len(names):
+            raise ValueError(f'overrides must have the same length as names ({len(names)}), got {len(overrides)}.')
+        for name, override in zip(names, overrides):
+            if override is not None:
+                assigned[name] = override
+
+    return assigned
+
+
+def linestyles_for(names: list[str], overrides: list[str | None] | None = None,
+                    default: str = DEFAULT_LINESTYLE) -> dict[str, str]:
+    """Assigns each name in names default. overrides, given by position in names (None entries keep
+    default), force specific names to a specific linestyle."""
+    assigned = {name: default for name in names}
+    if overrides is not None:
+        if len(overrides) != len(names):
+            raise ValueError(f'overrides must have the same length as names ({len(names)}), got {len(overrides)}.')
+        for name, override in zip(names, overrides):
+            if override is not None:
+                assigned[name] = override
+    return assigned

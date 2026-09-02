@@ -38,11 +38,93 @@ TERMINATIONS_KEPT = ['Normal', 'Time forfeit']
 # assignment (see _resolve_plot_style). A name absent from a given plot's df is harmless here; it's
 # only looked up if that name also appears in the names list passed to a plot call.
 DEFAULT_DISPLAY_NAMES: dict[str, str] = {
-    'maia2_value_replica': 'Maia2-Value (Replica)',
-    # TODO: confirm and add the remaining arch_name keys from model_arch.py's ARCH_REGISTRY
-    # (Maia2ValueBoard / Feature / PureTransformer) -- not guessed here, snake_case unconfirmed.
+    # (a) BASELINES
+
     'stockfish_d1': 'Stockfish',
     'maia2': 'Maia2',
+
+    # (b) CNN -- DATASET / MODEL SIZE SCALING
+    'maia2_100k_final_small': 'CNN 100k Small',
+    'maia2_100k_final_medium': 'CNN 100k Large',
+    'maia2_500k_final_small': 'CNN 500k Small',
+    'maia2_500k_final_medium': 'CNN 500k Large',
+    'maia2_2p5m_final_small': 'CNN 2.5m Small',
+    'maia2_2p5m_final_medium': 'CNN 2.5m Large',
+    'maia2_12p5m_final_small': 'CNN 12.5m Small',
+    'maia2_12p5m_final_medium': 'CNN 12.5m Large',
+    'maia2_62p5m_final_small': 'CNN 62.5m Small',
+    'maia2_62p5m_final_medium': 'CNN 62.5m Large',
+
+    # (c) CNN -- AUXILIARY LOSS WEIGHT ABLATION
+    'maia2_100k_final_small_auxtest_noaux_seed1': 'CNN 100k Small - No Aux (Seed 1)',
+    'maia2_100k_final_small_auxtest_noaux_seed2': 'CNN 100k Small - No Aux (Seed 2)',
+    'maia2_100k_final_small_auxtest_noaux_seed3': 'CNN 100k Small - No Aux (Seed 3)',
+    'maia2_100k_final_small_auxtest_noaux_seed4': 'CNN 100k Small - No Aux (Seed 4)',
+    'maia2_100k_final_small_auxtest_noaux_seed5': 'CNN 100k Small - No Aux (Seed 5)',
+    'maia2_100k_final_small_auxtest_aux0p5_seed1': 'CNN 100k Small - 0.5 Aux (Seed 1)',
+    'maia2_100k_final_small_auxtest_aux0p5_seed2': 'CNN 100k Small - 0.5 Aux (Seed 2)',
+    'maia2_100k_final_small_auxtest_aux0p5_seed3': 'CNN 100k Small - 0.5 Aux (Seed 3)',
+    'maia2_100k_final_small_auxtest_aux0p5_seed4': 'CNN 100k Small - 0.5 Aux (Seed 4)',
+    'maia2_100k_final_small_auxtest_aux0p5_seed5': 'CNN 100k Small - 0.5 Aux (Seed 5)',
+    'maia2_100k_final_small_auxtest_aux1p0_seed1': 'CNN 100k Small - 1.0 Aux (Seed 1)',
+    'maia2_100k_final_small_auxtest_aux1p0_seed2': 'CNN 100k Small - 1.0 Aux (Seed 2)',
+    'maia2_100k_final_small_auxtest_aux1p0_seed3': 'CNN 100k Small - 1.0 Aux (Seed 3)',
+    'maia2_100k_final_small_auxtest_aux1p0_seed4': 'CNN 100k Small - 1.0 Aux (Seed 4)',
+    'maia2_100k_final_small_auxtest_aux1p0_seed5': 'CNN 100k Small - 1.0 Aux (Seed 5)',
+    'maia2_500k_final_small_auxtest_noaux_seed1': 'CNN 500k Small - No Aux (Seed 1)',
+    'maia2_500k_final_small_auxtest_noaux_seed2': 'CNN 500k Small - No Aux (Seed 2)',
+    'maia2_500k_final_small_auxtest_noaux_seed3': 'CNN 500k Small - No Aux (Seed 3)',
+    'maia2_500k_final_small_auxtest_noaux_seed4': 'CNN 500k Small - No Aux (Seed 4)',
+    'maia2_500k_final_small_auxtest_noaux_seed5': 'CNN 500k Small - No Aux (Seed 5)',
+    'maia2_500k_final_small_auxtest_aux0p5_seed1': 'CNN 500k Small - 0.5 Aux (Seed 1)',
+    'maia2_500k_final_small_auxtest_aux0p5_seed2': 'CNN 500k Small - 0.5 Aux (Seed 2)',
+    'maia2_500k_final_small_auxtest_aux0p5_seed3': 'CNN 500k Small - 0.5 Aux (Seed 3)',
+    'maia2_500k_final_small_auxtest_aux0p5_seed4': 'CNN 500k Small - 0.5 Aux (Seed 4)',
+    'maia2_500k_final_small_auxtest_aux0p5_seed5': 'CNN 500k Small - 0.5 Aux (Seed 5)',
+    'maia2_500k_final_small_auxtest_aux1p0_seed1': 'CNN 500k Small - 1.0 Aux (Seed 1)',
+    'maia2_500k_final_small_auxtest_aux1p0_seed2': 'CNN 500k Small - 1.0 Aux (Seed 2)',
+    'maia2_500k_final_small_auxtest_aux1p0_seed3': 'CNN 500k Small - 1.0 Aux (Seed 3)',
+    'maia2_500k_final_small_auxtest_aux1p0_seed4': 'CNN 500k Small - 1.0 Aux (Seed 4)',
+    'maia2_500k_final_small_auxtest_aux1p0_seed5': 'CNN 500k Small - 1.0 Aux (Seed 5)',
+
+    # (d) CNN -- SINGLE ELO-BIN SPECIALISTS
+    'maia2_500k_final_small_singlebin_bin1': 'CNN 500k Small - Bin 1',
+    'maia2_500k_final_small_singlebin_bin2': 'CNN 500k Small - Bin 2',
+    'maia2_500k_final_small_singlebin_bin3': 'CNN 500k Small - Bin 3',
+    'maia2_500k_final_small_singlebin_bin4': 'CNN 500k Small - Bin 4',
+    'maia2_500k_final_small_singlebin_bin5': 'CNN 500k Small - Bin 5',
+    'maia2_500k_final_small_singlebin_bin6': 'CNN 500k Small - Bin 6',
+    'maia2_500k_final_small_singlebin_bin7': 'CNN 500k Small - Bin 7',
+    'maia2_500k_final_small_singlebin_bin8': 'CNN 500k Small - Bin 8',
+    'maia2_500k_final_small_singlebin_bin9': 'CNN 500k Small - Bin 9',
+
+    # (e) CNN -- FEATURE ABLATION (NO ELO / NO CLOCK / NO INC)
+    'maia2_2p5m_final_medium_no_elo': 'CNN 2.5m Large - No Elo',
+    'maia2_2p5m_final_medium_no_clock': 'CNN 2.5m Large - No Clock',
+    'maia2_2p5m_final_medium_no_inc': 'CNN 2.5m Large - No Inc',
+
+    # (f) CNN -- REPLICAS
+    'maia2_value_replica': 'Maia2-Value (Replica)',
+
+    # (g) TRANSFORMER -- AUXILIARY LOSS WEIGHT ABLATION
+    'pure_transformer_100k_final_small_2and2_noaux_seed1': 'Transformer 100k - No Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_noaux_seed2': 'Transformer 100k - No Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_noaux_seed3': 'Transformer 100k - No Aux (Seed 3)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_seed1': 'Transformer 100k - 0.5 Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_seed2': 'Transformer 100k - 0.5 Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_seed3': 'Transformer 100k - 0.5 Aux (Seed 3)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_seed1': 'Transformer 100k - 1.0 Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_seed2': 'Transformer 100k - 1.0 Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_seed3': 'Transformer 100k - 1.0 Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_noaux_seed1': 'Transformer 500k - No Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_noaux_seed2': 'Transformer 500k - No Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_noaux_seed3': 'Transformer 500k - No Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_seed1': 'Transformer 500k - 0.5 Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_seed2': 'Transformer 500k - 0.5 Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_seed3': 'Transformer 500k - 0.5 Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_seed1': 'Transformer 500k - 1.0 Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_seed2': 'Transformer 500k - 1.0 Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_seed3': 'Transformer 500k - 1.0 Aux (Seed 3)',
 }
 
 ####################

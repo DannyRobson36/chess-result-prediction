@@ -3,7 +3,7 @@ compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
 Latest changes: 01/09/26:
-- Minor naming convention change
+- Added table classification report and confusion matrix
 """
 
 import glob
@@ -12,6 +12,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix as sk_confusion_matrix, classification_report
 from sklearn.metrics import roc_curve, auc
 
 from scripts.utils.utils_chess import (
@@ -2733,5 +2734,70 @@ def plot_result_rate_by_title_mismatch(df: pd.DataFrame, *,
     ax.legend()
     ax.set_ylim(*ylim)
 
+    plt.tight_layout()
+    plt.show()
+
+def table_classification_report(df: pd.DataFrame, names: list[str],
+                                  mover_result_col: str = 'mover_result',
+                                  display_names: dict[str, str] | None = None) -> pd.DataFrame:
+    """Returns a long-format DataFrame of precision/recall/f1-score/support per (model, class)."""
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col]
+    df = restrict_to_common_rows(df, cols_needed)
+    true_class = _true_class_series(df, mover_result_col)
+    classes_present = [c for c in RESULT_CLASS_NAMES if (true_class == c).any()]
+
+    display_names = DEFAULT_DISPLAY_NAMES if display_names is None else display_names
+    rows = []
+    for name in names:
+        pred_class = df[f'{name}_predicted_class']
+        report = classification_report(true_class, pred_class, labels=classes_present,
+                                         output_dict=True, zero_division=0)
+        for cls in classes_present:
+            rows.append({
+                'Model': resolve_display_name(name, display_names),
+                'Class': cls.capitalize(),
+                'Precision (%)': round(report[cls]['precision'] * 100, 1),
+                'Recall (%)': round(report[cls]['recall'] * 100, 1),
+                'F1 (%)': round(report[cls]['f1-score'] * 100, 1),
+                'Support': int(report[cls]['support']),
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_confusion_matrix(df: pd.DataFrame, names: list[str],
+                           mover_result_col: str = 'mover_result',
+                           title: str = 'Confusion matrix by true class',
+                           figsize: tuple[float, float] | None = None,
+                           display_names: dict[str, str] | None = None) -> None:
+    """Plots one true-class-normalized confusion matrix panel per model. Diagonal cells match
+    the recall values from plot_accuracy_by_class; off-diagonal cells show where the rest of
+    each true class's mass ends up."""
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col]
+    df = restrict_to_common_rows(df, cols_needed)
+    true_class = _true_class_series(df, mover_result_col)
+    classes_present = [c for c in RESULT_CLASS_NAMES if (true_class == c).any()]
+
+    display_names = DEFAULT_DISPLAY_NAMES if display_names is None else display_names
+    panel_width, panel_height = figsize or BASE_FIGSIZE
+    fig, axes = plt.subplots(1, len(names), figsize=(panel_width * len(names), panel_height), squeeze=False)
+
+    for i, name in enumerate(names):
+        pred_class = df[f'{name}_predicted_class']
+        cm = sk_confusion_matrix(true_class, pred_class, labels=classes_present, normalize='true')
+        ax = axes[0][i]
+        ax.imshow(cm, cmap='Blues', vmin=0, vmax=1)
+        ax.set_xticks(range(len(classes_present)))
+        ax.set_yticks(range(len(classes_present)))
+        ax.set_xticklabels([c.capitalize() for c in classes_present])
+        ax.set_yticklabels([c.capitalize() for c in classes_present])
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_title(resolve_display_name(name, display_names))
+        for r in range(cm.shape[0]):
+            for c in range(cm.shape[1]):
+                ax.text(c, r, f'{cm[r, c] * 100:.1f}%', ha='center', va='center',
+                        color='white' if cm[r, c] > 0.5 else 'black', fontsize=9)
+
+    fig.suptitle(title)
     plt.tight_layout()
     plt.show()

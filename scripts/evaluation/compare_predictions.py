@@ -2,8 +2,8 @@
 compare_predictions.py
 Reads per-model prediction csvs against a fixed val/test positions df, merges them, and provides eval-plots across models.
 
-Latest changes: 01/09/26:
-- Added table classification report and confusion matrix
+Latest changes: 03/09/26:
+- Added save_path to every plotting function 
 """
 
 import glob
@@ -43,6 +43,7 @@ DEFAULT_DISPLAY_NAMES: dict[str, str] = {
 
     'stockfish_d1': 'Stockfish',
     'maia2': 'Maia2',
+    'log_reg_baseline_2p5m_final': 'Logistic Regression',
 
     # (b) CNN -- DATASET / MODEL SIZE SCALING
     'maia2_100k_final_small': 'CNN 100k Small',
@@ -102,12 +103,12 @@ DEFAULT_DISPLAY_NAMES: dict[str, str] = {
     # (e) CNN -- FEATURE ABLATION (NO ELO / NO CLOCK / NO INC)
     'maia2_2p5m_final_medium_no_elo': 'CNN 2.5m Large - No Elo',
     'maia2_2p5m_final_medium_no_clock': 'CNN 2.5m Large - No Clock',
-    'maia2_2p5m_final_medium_no_inc': 'CNN 2.5m Large - No Inc',
+    'maia2_2p5m_final_medium_no_incflag': 'CNN 2.5m Large - No Inc',
 
     # (f) CNN -- REPLICAS
     'maia2_value_replica': 'Maia2-Value (Replica)',
 
-    # (g) TRANSFORMER -- AUXILIARY LOSS WEIGHT ABLATION
+    # (g) TRANSFORMER -- AUXILIARY LOSS WEIGHT ABLATION, ROPE
     'pure_transformer_100k_final_small_2and2_noaux_seed1': 'Transformer 100k - No Aux (Seed 1)',
     'pure_transformer_100k_final_small_2and2_noaux_seed2': 'Transformer 100k - No Aux (Seed 2)',
     'pure_transformer_100k_final_small_2and2_noaux_seed3': 'Transformer 100k - No Aux (Seed 3)',
@@ -126,6 +127,26 @@ DEFAULT_DISPLAY_NAMES: dict[str, str] = {
     'pure_transformer_500k_final_small_2and2_aux1p0_seed1': 'Transformer 500k - 1.0 Aux (Seed 1)',
     'pure_transformer_500k_final_small_2and2_aux1p0_seed2': 'Transformer 500k - 1.0 Aux (Seed 2)',
     'pure_transformer_500k_final_small_2and2_aux1p0_seed3': 'Transformer 500k - 1.0 Aux (Seed 3)',
+
+    # (h) TRANSFORMER -- AUXILIARY LOSS WEIGHT ABLATION, LEARNED POSITIONAL ENCODING
+    'pure_transformer_100k_final_small_2and2_noaux_learned_seed1': 'Transformer 100k Learned - No Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_noaux_learned_seed2': 'Transformer 100k Learned - No Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_noaux_learned_seed3': 'Transformer 100k Learned - No Aux (Seed 3)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_learned_seed1': 'Transformer 100k Learned - 0.5 Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_learned_seed2': 'Transformer 100k Learned - 0.5 Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_aux0p5_learned_seed3': 'Transformer 100k Learned - 0.5 Aux (Seed 3)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_learned_seed1': 'Transformer 100k Learned - 1.0 Aux (Seed 1)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_learned_seed2': 'Transformer 100k Learned - 1.0 Aux (Seed 2)',
+    'pure_transformer_100k_final_small_2and2_aux1p0_learned_seed3': 'Transformer 100k Learned - 1.0 Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_noaux_learned_seed1': 'Transformer 500k Learned - No Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_noaux_learned_seed2': 'Transformer 500k Learned - No Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_noaux_learned_seed3': 'Transformer 500k Learned - No Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_learned_seed1': 'Transformer 500k Learned - 0.5 Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_learned_seed2': 'Transformer 500k Learned - 0.5 Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_aux0p5_learned_seed3': 'Transformer 500k Learned - 0.5 Aux (Seed 3)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_learned_seed1': 'Transformer 500k Learned - 1.0 Aux (Seed 1)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_learned_seed2': 'Transformer 500k Learned - 1.0 Aux (Seed 2)',
+    'pure_transformer_500k_final_small_2and2_aux1p0_learned_seed3': 'Transformer 500k Learned - 1.0 Aux (Seed 3)',
 }
 
 ####################
@@ -403,6 +424,13 @@ def _add_hist_twin(ax: plt.Axes, bin_series: pd.Series, bin_values: list, x_labe
     ax.patch.set_visible(False)
 
 
+def _maybe_save(save_path: str | None) -> None:
+    """Saves the current figure to save_path (300dpi, tight bbox) if save_path is not None. Call
+    after plt.tight_layout() and before plt.show()."""
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+
 # (e) EARLY DIAGNOSTICS
 
 def plot_accuracy_by_class(df: pd.DataFrame, names: list[str],
@@ -411,7 +439,8 @@ def plot_accuracy_by_class(df: pd.DataFrame, names: list[str],
                             title: str = 'Result-prediction accuracy by true class',
                             figsize: tuple[float, float] | None = None,
                             display_names: dict[str, str] | None = None,
-                            color_overrides: list[str | None] | None = None) -> None:
+                            color_overrides: list[str | None] | None = None,
+                            save_path: str | None = None) -> None:
     """Plots each model's accuracy (recall) per true result class, dropping the draw class if no draws are present in mover_result_col."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -443,6 +472,7 @@ def plot_accuracy_by_class(df: pd.DataFrame, names: list[str],
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -453,7 +483,8 @@ def plot_accuracy_by_termination(df: pd.DataFrame, names: list[str],
                                   title: str = 'Result-prediction accuracy by termination type',
                                   figsize: tuple[float, float] | None = None,
                                   display_names: dict[str, str] | None = None,
-                                  color_overrides: list[str | None] | None = None) -> None:
+                                  color_overrides: list[str | None] | None = None,
+                                  save_path: str | None = None) -> None:
     """Plots each model's accuracy against true mover_result, grouped by termination type (Normal vs Time forfeit only)."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, termination_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -489,6 +520,7 @@ def plot_accuracy_by_termination(df: pd.DataFrame, names: list[str],
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 # (f) ACCURACY BY ELO BIN
@@ -503,7 +535,8 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
                               figsize: tuple[float, float] | None = None,
                               display_names: dict[str, str] | None = None,
                               color_overrides: list[str | None] | None = None,
-                              linestyle_overrides: list[str | None] | None = None) -> None:
+                              linestyle_overrides: list[str | None] | None = None,
+                              save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by mean elo."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, 'mover_elo', 'opponent_elo']
     if show_brier:
@@ -538,6 +571,7 @@ def plot_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
         ax_brier.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -548,7 +582,8 @@ def plot_confidence_by_elo_bin(df: pd.DataFrame, names: list[str],
                                 figsize: tuple[float, float] | None = None,
                                 display_names: dict[str, str] | None = None,
                                 color_overrides: list[str | None] | None = None,
-                                linestyle_overrides: list[str | None] | None = None) -> None:
+                                linestyle_overrides: list[str | None] | None = None,
+                                save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by mean elo."""
     cols_needed = ([f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')]
                    + [mover_result_col, 'mover_elo', 'opponent_elo'])
@@ -566,6 +601,7 @@ def plot_confidence_by_elo_bin(df: pd.DataFrame, names: list[str],
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -579,7 +615,8 @@ def plot_accuracy_new_player_comparison(df: pd.DataFrame, names: list[str],
                                          ylim: tuple[float, float] = (0, 100),
                                          title: str = 'Accuracy: new-account movers vs everyone else',
                                          figsize: tuple[float, float] | None = None,
-                                         display_names: dict[str, str] | None = None) -> None:
+                                         display_names: dict[str, str] | None = None,
+                                         save_path: str | None = None) -> None:
     """Plots each model's accuracy split into 'mover is a new account' (no history, elo exactly new_player_elo) vs everyone else."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_elo_col, has_history_mover_col, mover_result_col])
@@ -614,6 +651,7 @@ def plot_accuracy_new_player_comparison(df: pd.DataFrame, names: list[str],
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -625,7 +663,8 @@ def plot_accuracy_by_elo_bin_rematch(df: pd.DataFrame, names: list[str],
                                       title: str = 'Accuracy by Elo bin, rematch vs non-rematch',
                                       figsize: tuple[float, float] | None = None,
                                       display_names: dict[str, str] | None = None,
-                                      color_overrides: list[str | None] | None = None) -> None:
+                                      color_overrides: list[str | None] | None = None,
+                                      save_path: str | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by mean elo, split into rematch vs non-rematch lines. Linestyle already encodes rematch/non-rematch here, so only colour is overridable."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, 'mover_elo', 'opponent_elo', rematch_col])
@@ -660,6 +699,7 @@ def plot_accuracy_by_elo_bin_rematch(df: pd.DataFrame, names: list[str],
     plt.xticks(rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -678,7 +718,8 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
                           elo_bins: tuple[int, int] | None = None,
                           elo_bin_cfg: EloBinConfig = ELO_BINS,
                           color_overrides: list[str | None] | None = None,
-                          linestyle_overrides: list[str | None] | None = None) -> None:
+                          linestyle_overrides: list[str | None] | None = None,
+                          save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by plies played, as one row or two elo-bin-restricted rows."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, ply_played_col]
     if show_brier:
@@ -715,6 +756,7 @@ def plot_accuracy_by_ply(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel(f'Plies played (bins of {group_size})')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -732,7 +774,8 @@ def plot_accuracy_by_ply_proportion(df: pd.DataFrame, names: list[str],
                                      elo_bins: tuple[int, int] | None = None,
                                      elo_bin_cfg: EloBinConfig = ELO_BINS,
                                      color_overrides: list[str | None] | None = None,
-                                     linestyle_overrides: list[str | None] | None = None) -> None:
+                                     linestyle_overrides: list[str | None] | None = None,
+                                     save_path: str | None = None) -> None:
     """Plots per-model accuracy against true mover_result, binned by ply_played / ply_count (proportion of the eventual game length reached), as one row or two elo-bin-restricted rows."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, ply_played_col, ply_count_col]
     if show_brier:
@@ -776,6 +819,7 @@ def plot_accuracy_by_ply_proportion(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Proportion of game completed (ply_played / ply_count)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -786,7 +830,8 @@ def plot_confidence_by_ply(df: pd.DataFrame, names: list[str],
                             figsize: tuple[float, float] | None = None,
                             display_names: dict[str, str] | None = None,
                             color_overrides: list[str | None] | None = None,
-                            linestyle_overrides: list[str | None] | None = None) -> None:
+                            linestyle_overrides: list[str | None] | None = None,
+                            save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by plies played."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [ply_played_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -801,6 +846,7 @@ def plot_confidence_by_ply(df: pd.DataFrame, names: list[str],
     ax.set_xlabel(f'Plies played (bins of {group_size})')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 # (i) ACCURACY BY CLOCK
@@ -823,7 +869,8 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
                                      termination_col: str = 'termination',
                                      split_by_termination: bool = False,
                                      color_overrides: list[str | None] | None = None,
-                                     linestyle_overrides: list[str | None] | None = None) -> None:
+                                     linestyle_overrides: list[str | None] | None = None,
+                                     save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by proportion of clock time remaining, as one row or two elo-bin/increment/termination-restricted rows."""
     _count_active_row_splits(elo_bins is not None, split_by_increment, split_by_termination)
 
@@ -890,6 +937,7 @@ def plot_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
             ax_brier.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -902,7 +950,8 @@ def plot_confidence_by_combined_clock(df: pd.DataFrame, names: list[str],
                                        figsize: tuple[float, float] | None = None,
                                        display_names: dict[str, str] | None = None,
                                        color_overrides: list[str | None] | None = None,
-                                       linestyle_overrides: list[str | None] | None = None) -> None:
+                                       linestyle_overrides: list[str | None] | None = None,
+                                       save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by proportion of clock time remaining."""
     cols_needed = ([f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')]
                    + [mover_clock_col, opponent_clock_col, time_control_col])
@@ -924,6 +973,7 @@ def plot_confidence_by_combined_clock(df: pd.DataFrame, names: list[str],
     ax.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -943,7 +993,8 @@ def plot_accuracy_by_mover_clock(df: pd.DataFrame, names: list[str],
                                   termination_col: str = 'termination',
                                   split_by_termination: bool = False,
                                   color_overrides: list[str | None] | None = None,
-                                  linestyle_overrides: list[str | None] | None = None) -> None:
+                                  linestyle_overrides: list[str | None] | None = None,
+                                  save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by mover's own proportion of clock time remaining, as one row or two elo-bin/termination-restricted rows."""
     _count_active_row_splits(elo_bins is not None, split_by_termination)
 
@@ -1001,6 +1052,7 @@ def plot_accuracy_by_mover_clock(df: pd.DataFrame, names: list[str],
             ax_brier.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1012,7 +1064,8 @@ def plot_confidence_by_mover_clock(df: pd.DataFrame, names: list[str],
                                     figsize: tuple[float, float] | None = None,
                                     display_names: dict[str, str] | None = None,
                                     color_overrides: list[str | None] | None = None,
-                                    linestyle_overrides: list[str | None] | None = None) -> None:
+                                    linestyle_overrides: list[str | None] | None = None,
+                                    save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by mover's own proportion of clock time remaining."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [mover_clock_col, time_control_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -1033,6 +1086,140 @@ def plot_confidence_by_mover_clock(df: pd.DataFrame, names: list[str],
     ax.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
+    plt.show()
+
+
+def plot_accuracy_by_lowest_clock(df: pd.DataFrame, names: list[str],
+                                   mover_clock_col: str = 'mover_clock',
+                                   opponent_clock_col: str = 'opponent_clock',
+                                   time_control_col: str = 'time_control',
+                                   mover_result_col: str = 'mover_result',
+                                   bin_width: float = 0.05,
+                                   ylim: tuple[float, float] = (50, 80),
+                                   title: str = "Result-prediction accuracy by lower player's time remaining",
+                                   show_hist: bool = False,
+                                   show_brier: bool = False,
+                                   figsize: tuple[float, float] | None = None,
+                                   display_names: dict[str, str] | None = None,
+                                   elo_bins: tuple[int, int] | None = None,
+                                   elo_bin_cfg: EloBinConfig = ELO_BINS,
+                                   split_by_increment: bool = False,
+                                   termination_col: str = 'termination',
+                                   split_by_termination: bool = False,
+                                   color_overrides: list[str | None] | None = None,
+                                   linestyle_overrides: list[str | None] | None = None,
+                                   save_path: str | None = None) -> None:
+    """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by
+    the lower of the two players' clock proportions (min(mover_prop, opponent_prop)), as one row
+    or two elo-bin/increment/termination-restricted rows."""
+    _count_active_row_splits(elo_bins is not None, split_by_increment, split_by_termination)
+
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
+    if show_brier:
+        cols_needed += [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')]
+    if elo_bins is not None:
+        cols_needed += ['mover_elo', 'opponent_elo']
+    if split_by_termination:
+        cols_needed += [termination_col]
+    df = restrict_to_common_rows(df, cols_needed)
+
+    game_time = df[time_control_col].map(SEC_MAPPING)
+    n_before = len(df)
+    df = df[game_time.notna()]
+    game_time = game_time[game_time.notna()]
+    if len(df) != n_before:
+        print(f'plot_accuracy_by_lowest_clock: dropped {n_before - len(df):,} rows with unmapped {time_control_col}.')
+
+    df = df.copy()
+    mover_prop = (df[mover_clock_col] / game_time).clip(0, 1)
+    opponent_prop = (df[opponent_clock_col] / game_time).clip(0, 1)
+    lowest_prop = pd.concat([mover_prop, opponent_prop], axis=1).min(axis=1)
+    df['_lowest_time_bin'] = ((lowest_prop // bin_width) * bin_width + bin_width / 2).round(4)
+
+    display_names, colors, linestyles = _resolve_plot_style(names, display_names, color_overrides, linestyle_overrides)
+    panel_width, panel_height = figsize or BASE_FIGSIZE
+
+    if elo_bins is not None:
+        subsets, row_labels = _split_by_elo_bin(df, elo_bins, elo_bin_cfg)
+    elif split_by_increment:
+        inc_flag = df[time_control_col].map(INC_FLAG_MAPPING)
+        n_unmapped = int(inc_flag.isna().sum())
+        if n_unmapped:
+            print(f'plot_accuracy_by_lowest_clock: {n_unmapped:,} rows have unmapped {time_control_col} '
+                  f'for increment split -- excluded from both panels.')
+        subsets = [df[inc_flag == 0], df[inc_flag == 1]]
+        row_labels = ['no increment', 'with increment']
+    elif split_by_termination:
+        subsets, row_labels = _split_by_termination(df, termination_col)
+    else:
+        subsets, row_labels = [df], [None]
+
+    n_rows, n_cols = len(subsets), (2 if show_brier else 1)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(panel_width * n_cols, panel_height * n_rows), squeeze=False)
+
+    for row_idx, (sub_df, row_label) in enumerate(zip(subsets, row_labels)):
+        bin_series = sub_df['_lowest_time_bin']
+        bin_values = sorted(bin_series.dropna().unique())
+        row_title = title if row_label is None else f'{title} -- {row_label}'
+
+        ax_acc = axes[row_idx][0]
+        _binned_line_plot(ax_acc, sub_df, names, mover_result_col, bin_series, bin_values, bin_values,
+                           colors, linestyles, row_title, display_names, metric='accuracy', ylim=ylim)
+        ax_acc.set_xlabel("Proportion of time remaining, lower of the two players")
+        ax_acc.invert_xaxis()
+        if show_hist:
+            _add_hist_twin(ax_acc, bin_series, bin_values, bin_values, bar_width=bin_width * 0.9)
+
+        if show_brier:
+            ax_brier = axes[row_idx][1]
+            _binned_line_plot(ax_brier, sub_df, names, mover_result_col, bin_series, bin_values, bin_values,
+                               colors, linestyles, f'{row_title} (Brier)', display_names, metric='brier')
+            ax_brier.set_xlabel("Proportion of time remaining, lower of the two players")
+            ax_brier.invert_xaxis()
+
+    plt.tight_layout()
+    _maybe_save(save_path)
+    plt.show()
+
+
+def plot_confidence_by_lowest_clock(df: pd.DataFrame, names: list[str],
+                                     mover_clock_col: str = 'mover_clock',
+                                     opponent_clock_col: str = 'opponent_clock',
+                                     time_control_col: str = 'time_control',
+                                     bin_width: float = 0.05,
+                                     title: str = "Mean predicted confidence by lower player's time remaining",
+                                     figsize: tuple[float, float] | None = None,
+                                     display_names: dict[str, str] | None = None,
+                                     color_overrides: list[str | None] | None = None,
+                                     linestyle_overrides: list[str | None] | None = None,
+                                     save_path: str | None = None) -> None:
+    """Plots each model's mean max predicted probability, binned by the lower of the two players'
+    clock proportions."""
+    cols_needed = ([f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')]
+                   + [mover_clock_col, opponent_clock_col, time_control_col])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    game_time = df[time_control_col].map(SEC_MAPPING)
+    df = df[game_time.notna()]
+    game_time = game_time[game_time.notna()]
+    df = df.copy()
+    mover_prop = (df[mover_clock_col] / game_time).clip(0, 1)
+    opponent_prop = (df[opponent_clock_col] / game_time).clip(0, 1)
+    lowest_prop = pd.concat([mover_prop, opponent_prop], axis=1).min(axis=1)
+    df['_lowest_time_bin'] = ((lowest_prop // bin_width) * bin_width + bin_width / 2).round(4)
+
+    bin_values = sorted(df['_lowest_time_bin'].dropna().unique())
+    display_names, colors, linestyles = _resolve_plot_style(names, display_names, color_overrides, linestyle_overrides)
+    fig, ax = plt.subplots(figsize=figsize or BASE_FIGSIZE)
+    _binned_line_plot(ax, df, names, None, df['_lowest_time_bin'], bin_values, bin_values,
+                       colors, linestyles, title, display_names, metric='confidence')
+    ax.set_xlabel("Proportion of time remaining, lower of the two players")
+    ax.invert_xaxis()
+
+    plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1053,7 +1240,8 @@ def plot_accuracy_by_clock_diff(df: pd.DataFrame, names: list[str],
                                  termination_col: str = 'termination',
                                  split_by_termination: bool = False,
                                  color_overrides: list[str | None] | None = None,
-                                 linestyle_overrides: list[str | None] | None = None) -> None:
+                                 linestyle_overrides: list[str | None] | None = None,
+                                 save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by mover-minus-opponent clock seconds, as one row or two elo-bin/termination-restricted rows."""
     _count_active_row_splits(elo_bins is not None, split_by_termination)
 
@@ -1108,6 +1296,7 @@ def plot_accuracy_by_clock_diff(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Mover clock minus opponent clock (seconds)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1120,7 +1309,8 @@ def plot_confidence_by_clock_diff(df: pd.DataFrame, names: list[str],
                                    figsize: tuple[float, float] | None = None,
                                    display_names: dict[str, str] | None = None,
                                    color_overrides: list[str | None] | None = None,
-                                   linestyle_overrides: list[str | None] | None = None) -> None:
+                                   linestyle_overrides: list[str | None] | None = None,
+                                   save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by mover-minus-opponent clock seconds."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [mover_clock_col, opponent_clock_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -1140,6 +1330,7 @@ def plot_confidence_by_clock_diff(df: pd.DataFrame, names: list[str],
     ax.set_xlabel('Mover clock minus opponent clock (seconds)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1185,7 +1376,8 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                   termination_col: str = 'termination',
                                   split_by_termination: bool = False,
                                   color_overrides: list[str | None] | None = None,
-                                  linestyle_overrides: list[str | None] | None = None) -> None:
+                                  linestyle_overrides: list[str | None] | None = None,
+                                  save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by opponent/mover clock ratio, as one row or two elo-bin/termination-restricted rows."""
     _count_active_row_splits(elo_bins is not None, split_by_termination)
 
@@ -1257,6 +1449,7 @@ def plot_accuracy_by_clock_ratio(df: pd.DataFrame, names: list[str],
             ax_brier.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1270,7 +1463,8 @@ def plot_confidence_by_clock_ratio(df: pd.DataFrame, names: list[str],
                                     figsize: tuple[float, float] | None = None,
                                     display_names: dict[str, str] | None = None,
                                     color_overrides: list[str | None] | None = None,
-                                    linestyle_overrides: list[str | None] | None = None) -> None:
+                                    linestyle_overrides: list[str | None] | None = None,
+                                    save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by opponent/mover clock ratio."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [mover_clock_col, opponent_clock_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -1299,6 +1493,7 @@ def plot_confidence_by_clock_ratio(df: pd.DataFrame, names: list[str],
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 # (j) ROC & CALIBRATION
@@ -1326,7 +1521,8 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str], mover_result_col: str = 'mo
                   display_names: dict[str, str] | None = None,
                   elo_bins: tuple[int, int] | None = None, elo_bin_cfg: EloBinConfig = ELO_BINS,
                   color_overrides: list[str | None] | None = None,
-                  linestyle_overrides: list[str | None] | None = None) -> None:
+                  linestyle_overrides: list[str | None] | None = None,
+                  save_path: str | None = None) -> None:
     """Plots ROC curves (one panel per class, or just positive_class if given) across models, as one row or two elo-bin-restricted rows."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
@@ -1353,7 +1549,9 @@ def plot_roc_auc(df: pd.DataFrame, names: list[str], mover_result_col: str = 'mo
             panel_title = f'{cls.capitalize()} prediction' + (f' -- {panel_label}' if panel_label is not None else '')
             _draw_roc_panel(axes[row_idx][col_idx], row_df, names, mover_result_col, cls,
                              class_to_result, colors, linestyles, ylim, panel_title, display_names)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    _maybe_save(save_path)
+    plt.show()
 
 
 def _draw_calibration_panel(ax: plt.Axes, df: pd.DataFrame, names: list[str], mover_result_col: str, cls: str,
@@ -1385,7 +1583,8 @@ def plot_calibration(df: pd.DataFrame, names: list[str], mover_result_col: str =
                       display_names: dict[str, str] | None = None,
                       elo_bins: tuple[int, int] | None = None, elo_bin_cfg: EloBinConfig = ELO_BINS,
                       color_overrides: list[str | None] | None = None,
-                      linestyle_overrides: list[str | None] | None = None) -> None:
+                      linestyle_overrides: list[str | None] | None = None,
+                      save_path: str | None = None) -> None:
     """Plots reliability diagrams (mean predicted probability vs observed frequency, equal-width bins) across models, as one row or two elo-bin-restricted rows."""
     class_to_result = {'win': 1.0, 'loss': 0.0, 'draw': 0.5}
     if positive_class is not None and positive_class not in class_to_result:
@@ -1414,7 +1613,9 @@ def plot_calibration(df: pd.DataFrame, names: list[str], mover_result_col: str =
             _draw_calibration_panel(axes[row_idx][col_idx], row_df, names, mover_result_col, cls,
                                      class_to_result, bin_edges, n_bins, colors, linestyles, ylim,
                                      panel_title, display_names)
-    plt.tight_layout(); plt.show()
+    plt.tight_layout()
+    _maybe_save(save_path)
+    plt.show()
 
 # (k) AGREEMENT
 
@@ -1423,7 +1624,8 @@ def plot_agreement_rate(df: pd.DataFrame, names: list[str], baseline: str,
                          title: str | None = None,
                          figsize: tuple[float, float] | None = None,
                          display_names: dict[str, str] | None = None,
-                         color_overrides: list[str | None] | None = None) -> None:
+                         color_overrides: list[str | None] | None = None,
+                         save_path: str | None = None) -> None:
     """Plots each model's predicted_class agreement rate (%) with baseline's predicted_class, as one bar per model."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [f'{baseline}_predicted_class']
     df = restrict_to_common_rows(df, cols_needed)
@@ -1440,6 +1642,7 @@ def plot_agreement_rate(df: pd.DataFrame, names: list[str], baseline: str,
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1468,7 +1671,8 @@ def plot_agreement_rate_by_elo_bin(df: pd.DataFrame, names: list[str], baseline:
                                     figsize: tuple[float, float] | None = None,
                                     display_names: dict[str, str] | None = None,
                                     color_overrides: list[str | None] | None = None,
-                                    linestyle_overrides: list[str | None] | None = None) -> None:
+                                    linestyle_overrides: list[str | None] | None = None,
+                                    save_path: str | None = None) -> None:
     """Plots each model's predicted_class agreement rate (%) with baseline's predicted_class, binned by mean elo."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', 'mover_elo', 'opponent_elo'])
@@ -1490,6 +1694,7 @@ def plot_agreement_rate_by_elo_bin(df: pd.DataFrame, names: list[str], baseline:
         _add_hist_twin(ax, binned['elo_bin'], bin_values, labels, bar_width=0.9)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1503,7 +1708,8 @@ def plot_agreement_rate_by_combined_clock(df: pd.DataFrame, names: list[str], ba
                                            figsize: tuple[float, float] | None = None,
                                            display_names: dict[str, str] | None = None,
                                            color_overrides: list[str | None] | None = None,
-                                           linestyle_overrides: list[str | None] | None = None) -> None:
+                                           linestyle_overrides: list[str | None] | None = None,
+                                           save_path: str | None = None) -> None:
     """Plots each model's agreement rate (%) with baseline, binned by proportion of clock time remaining."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_clock_col, opponent_clock_col, time_control_col])
@@ -1527,6 +1733,7 @@ def plot_agreement_rate_by_combined_clock(df: pd.DataFrame, names: list[str], ba
     ax.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1541,7 +1748,8 @@ def plot_agreement_rate_by_clock_ratio(df: pd.DataFrame, names: list[str], basel
                                         figsize: tuple[float, float] | None = None,
                                         display_names: dict[str, str] | None = None,
                                         color_overrides: list[str | None] | None = None,
-                                        linestyle_overrides: list[str | None] | None = None) -> None:
+                                        linestyle_overrides: list[str | None] | None = None,
+                                        save_path: str | None = None) -> None:
     """Plots each model's agreement rate (%) with baseline, binned by opponent/mover clock ratio."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_clock_col, opponent_clock_col])
@@ -1571,6 +1779,7 @@ def plot_agreement_rate_by_clock_ratio(df: pd.DataFrame, names: list[str], basel
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1581,7 +1790,8 @@ def plot_agreement_rate_by_phase(df: pd.DataFrame, names: list[str], baseline: s
                                   figsize: tuple[float, float] | None = None,
                                   display_names: dict[str, str] | None = None,
                                   color_overrides: list[str | None] | None = None,
-                                  linestyle_overrides: list[str | None] | None = None) -> None:
+                                  linestyle_overrides: list[str | None] | None = None,
+                                  save_path: str | None = None) -> None:
     """Plots each model's agreement rate (%) with baseline, binned by continuous game phase score."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1601,6 +1811,7 @@ def plot_agreement_rate_by_phase(df: pd.DataFrame, names: list[str], baseline: s
     ax.set_xlabel('Game phase (0 = opening/full material, 256 = bare endgame)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1611,7 +1822,8 @@ def plot_agreement_rate_by_phase_simple(df: pd.DataFrame, names: list[str], base
                                          figsize: tuple[float, float] | None = None,
                                          display_names: dict[str, str] | None = None,
                                          color_overrides: list[str | None] | None = None,
-                                         linestyle_overrides: list[str | None] | None = None) -> None:
+                                         linestyle_overrides: list[str | None] | None = None,
+                                         save_path: str | None = None) -> None:
     """Plots each model's agreement rate (%) with baseline, grouped into opening/middlegame/endgame."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1629,6 +1841,7 @@ def plot_agreement_rate_by_phase_simple(df: pd.DataFrame, names: list[str], base
     ax.set_xlabel('Game phase')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1637,7 +1850,8 @@ def plot_accuracy_by_agreement(df: pd.DataFrame, names: list[str], baseline: str
                                 ylim: tuple[float, float] = (0, 100),
                                 title: str | None = None,
                                 figsize: tuple[float, float] | None = None,
-                                display_names: dict[str, str] | None = None) -> None:
+                                display_names: dict[str, str] | None = None,
+                                save_path: str | None = None) -> None:
     """Plots each model's accuracy against true mover_result, split into agreeing-with-baseline vs disagreeing-with-baseline bars."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_result_col])
@@ -1671,6 +1885,7 @@ def plot_accuracy_by_agreement(df: pd.DataFrame, names: list[str], baseline: str
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1707,7 +1922,8 @@ def plot_accuracy_by_agreement_elo_bin(df: pd.DataFrame, names: list[str], basel
                                         title: str | None = None,
                                         figsize: tuple[float, float] | None = None,
                                         display_names: dict[str, str] | None = None,
-                                        color_overrides: list[str | None] | None = None) -> None:
+                                        color_overrides: list[str | None] | None = None,
+                                        save_path: str | None = None) -> None:
     """Plots each model's accuracy against true mover_result, split by agreement with baseline, binned by mean elo. Linestyle already encodes agree/disagree here, so only colour is overridable."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_result_col, 'mover_elo', 'opponent_elo'])
@@ -1727,6 +1943,7 @@ def plot_accuracy_by_agreement_elo_bin(df: pd.DataFrame, names: list[str], basel
     plt.xticks(rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1740,7 +1957,8 @@ def plot_accuracy_by_agreement_by_combined_clock(df: pd.DataFrame, names: list[s
                                                   title: str | None = None,
                                                   figsize: tuple[float, float] | None = None,
                                                   display_names: dict[str, str] | None = None,
-                                                  color_overrides: list[str | None] | None = None) -> None:
+                                                  color_overrides: list[str | None] | None = None,
+                                                  save_path: str | None = None) -> None:
     """Plots each model's accuracy, split by agreement with baseline, binned by proportion of clock time remaining. Linestyle already encodes agree/disagree here, so only colour is overridable."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
@@ -1765,6 +1983,7 @@ def plot_accuracy_by_agreement_by_combined_clock(df: pd.DataFrame, names: list[s
     ax.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1779,7 +1998,8 @@ def plot_accuracy_by_agreement_by_clock_ratio(df: pd.DataFrame, names: list[str]
                                                title: str | None = None,
                                                figsize: tuple[float, float] | None = None,
                                                display_names: dict[str, str] | None = None,
-                                               color_overrides: list[str | None] | None = None) -> None:
+                                               color_overrides: list[str | None] | None = None,
+                                               save_path: str | None = None) -> None:
     """Plots each model's accuracy, split by agreement with baseline, binned by opponent/mover clock ratio. Linestyle already encodes agree/disagree here, so only colour is overridable."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [f'{baseline}_predicted_class', mover_result_col, mover_clock_col, opponent_clock_col])
@@ -1810,6 +2030,7 @@ def plot_accuracy_by_agreement_by_clock_ratio(df: pd.DataFrame, names: list[str]
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1820,7 +2041,8 @@ def plot_accuracy_by_agreement_by_phase(df: pd.DataFrame, names: list[str], base
                                          title: str | None = None,
                                          figsize: tuple[float, float] | None = None,
                                          display_names: dict[str, str] | None = None,
-                                         color_overrides: list[str | None] | None = None) -> None:
+                                         color_overrides: list[str | None] | None = None,
+                                         save_path: str | None = None) -> None:
     """Plots each model's accuracy, split by agreement with baseline, binned by continuous game phase score. Linestyle already encodes agree/disagree here, so only colour is overridable."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1842,6 +2064,7 @@ def plot_accuracy_by_agreement_by_phase(df: pd.DataFrame, names: list[str], base
     ax.set_xlabel('Game phase (0 = opening/full material, 256 = bare endgame)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1852,7 +2075,8 @@ def plot_accuracy_by_agreement_by_phase_simple(df: pd.DataFrame, names: list[str
                                                 title: str | None = None,
                                                 figsize: tuple[float, float] | None = None,
                                                 display_names: dict[str, str] | None = None,
-                                                color_overrides: list[str | None] | None = None) -> None:
+                                                color_overrides: list[str | None] | None = None,
+                                                save_path: str | None = None) -> None:
     """Plots each model's accuracy, split by agreement with baseline, grouped into opening/middlegame/endgame. Linestyle already encodes agree/disagree here, so only colour is overridable."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1872,6 +2096,7 @@ def plot_accuracy_by_agreement_by_phase_simple(df: pd.DataFrame, names: list[str
     ax.set_xlabel('Game phase')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1891,7 +2116,8 @@ def plot_accuracy_by_material(df: pd.DataFrame, names: list[str],
                                elo_bins: tuple[int, int] | None = None,
                                elo_bin_cfg: EloBinConfig = ELO_BINS,
                                color_overrides: list[str | None] | None = None,
-                               linestyle_overrides: list[str | None] | None = None) -> None:
+                               linestyle_overrides: list[str | None] | None = None,
+                               save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by total material on board (descending: max material left, 0 right, from a precomputed material_col), as one row or two elo-bin-restricted rows."""
     if material_col not in df.columns:
         raise ValueError(f'{material_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1940,6 +2166,7 @@ def plot_accuracy_by_material(df: pd.DataFrame, names: list[str],
             ax_brier.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1951,7 +2178,8 @@ def plot_confidence_by_material(df: pd.DataFrame, names: list[str],
                                  figsize: tuple[float, float] | None = None,
                                  display_names: dict[str, str] | None = None,
                                  color_overrides: list[str | None] | None = None,
-                                 linestyle_overrides: list[str | None] | None = None) -> None:
+                                 linestyle_overrides: list[str | None] | None = None,
+                                 save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by total material on board (descending axis)."""
     if material_col not in df.columns:
         raise ValueError(f'{material_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -1976,6 +2204,7 @@ def plot_confidence_by_material(df: pd.DataFrame, names: list[str],
     ax.invert_xaxis()
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -1993,7 +2222,8 @@ def plot_accuracy_by_material_diff(df: pd.DataFrame, names: list[str],
                                     elo_bins: tuple[int, int] | None = None,
                                     elo_bin_cfg: EloBinConfig = ELO_BINS,
                                     color_overrides: list[str | None] | None = None,
-                                    linestyle_overrides: list[str | None] | None = None) -> None:
+                                    linestyle_overrides: list[str | None] | None = None,
+                                    save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by mover-minus-opponent material, as one row or two elo-bin-restricted rows."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, fen_col]
     if show_brier:
@@ -2037,6 +2267,7 @@ def plot_accuracy_by_material_diff(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Material difference, mover minus opponent')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2048,7 +2279,8 @@ def plot_confidence_by_material_diff(df: pd.DataFrame, names: list[str],
                                       figsize: tuple[float, float] | None = None,
                                       display_names: dict[str, str] | None = None,
                                       color_overrides: list[str | None] | None = None,
-                                      linestyle_overrides: list[str | None] | None = None) -> None:
+                                      linestyle_overrides: list[str | None] | None = None,
+                                      save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by mover-minus-opponent material."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [fen_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -2069,6 +2301,7 @@ def plot_confidence_by_material_diff(df: pd.DataFrame, names: list[str],
     ax.set_xlabel('Material difference, mover minus opponent')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2086,7 +2319,8 @@ def plot_accuracy_by_phase(df: pd.DataFrame, names: list[str],
                             elo_bins: tuple[int, int] | None = None,
                             elo_bin_cfg: EloBinConfig = ELO_BINS,
                             color_overrides: list[str | None] | None = None,
-                            linestyle_overrides: list[str | None] | None = None) -> None:
+                            linestyle_overrides: list[str | None] | None = None,
+                            save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by continuous game phase score, as one row or two elo-bin-restricted rows."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -2133,6 +2367,7 @@ def plot_accuracy_by_phase(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Game phase (0 = opening/full material, 256 = bare endgame)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2143,7 +2378,8 @@ def plot_confidence_by_phase(df: pd.DataFrame, names: list[str],
                               figsize: tuple[float, float] | None = None,
                               display_names: dict[str, str] | None = None,
                               color_overrides: list[str | None] | None = None,
-                              linestyle_overrides: list[str | None] | None = None) -> None:
+                              linestyle_overrides: list[str | None] | None = None,
+                              save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by continuous game phase score."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -2161,6 +2397,7 @@ def plot_confidence_by_phase(df: pd.DataFrame, names: list[str],
     ax.set_xlabel('Game phase (0 = opening/full material, 256 = bare endgame)')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2173,7 +2410,8 @@ def plot_accuracy_by_phase_simple(df: pd.DataFrame, names: list[str],
                                    figsize: tuple[float, float] | None = None,
                                    display_names: dict[str, str] | None = None,
                                    color_overrides: list[str | None] | None = None,
-                                   linestyle_overrides: list[str | None] | None = None) -> None:
+                                   linestyle_overrides: list[str | None] | None = None,
+                                   save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, grouped into opening/middlegame/endgame (derived from a precomputed phase_col)."""
     if phase_col not in df.columns:
         raise ValueError(f'{phase_col!r} not found in df -- run add_material_and_phase_cols(df) first.')
@@ -2202,6 +2440,7 @@ def plot_accuracy_by_phase_simple(df: pd.DataFrame, names: list[str],
         ax_brier.set_xlabel('Game phase')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2221,7 +2460,8 @@ def plot_accuracy_by_past_performance(df: pd.DataFrame, names: list[str],
                                        elo_bins: tuple[int, int] | None = None,
                                        elo_bin_cfg: EloBinConfig = ELO_BINS,
                                        color_overrides: list[str | None] | None = None,
-                                       linestyle_overrides: list[str | None] | None = None) -> None:
+                                       linestyle_overrides: list[str | None] | None = None,
+                                       save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by the mover's recency-weighted past win rate (0 to ~0.965). Rows with no history for the mover are excluded."""
     cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, past_mover_col, has_history_mover_col]
     if show_brier:
@@ -2265,6 +2505,7 @@ def plot_accuracy_by_past_performance(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel("Mover's recency-weighted past win rate")
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2276,7 +2517,8 @@ def plot_confidence_by_past_performance(df: pd.DataFrame, names: list[str],
                                          figsize: tuple[float, float] | None = None,
                                          display_names: dict[str, str] | None = None,
                                          color_overrides: list[str | None] | None = None,
-                                         linestyle_overrides: list[str | None] | None = None) -> None:
+                                         linestyle_overrides: list[str | None] | None = None,
+                                         save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by the mover's recency-weighted past win rate."""
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [past_mover_col, has_history_mover_col]
     df = df[df[has_history_mover_col].astype(bool)]
@@ -2292,6 +2534,7 @@ def plot_confidence_by_past_performance(df: pd.DataFrame, names: list[str],
     ax.set_xlabel("Mover's recency-weighted past win rate")
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2311,7 +2554,8 @@ def plot_accuracy_by_past_performance_diff(df: pd.DataFrame, names: list[str],
                                             elo_bins: tuple[int, int] | None = None,
                                             elo_bin_cfg: EloBinConfig = ELO_BINS,
                                             color_overrides: list[str | None] | None = None,
-                                            linestyle_overrides: list[str | None] | None = None) -> None:
+                                            linestyle_overrides: list[str | None] | None = None,
+                                            save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by mover-minus-opponent recency-weighted past win rate. Rows with no history for either player are excluded."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_result_col, past_mover_col, past_opponent_col, has_history_mover_col, has_history_opponent_col])
@@ -2357,6 +2601,7 @@ def plot_accuracy_by_past_performance_diff(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Past-performance difference, mover minus opponent')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2370,7 +2615,8 @@ def plot_confidence_by_past_performance_diff(df: pd.DataFrame, names: list[str],
                                               figsize: tuple[float, float] | None = None,
                                               display_names: dict[str, str] | None = None,
                                               color_overrides: list[str | None] | None = None,
-                                              linestyle_overrides: list[str | None] | None = None) -> None:
+                                              linestyle_overrides: list[str | None] | None = None,
+                                              save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by mover-minus-opponent recency-weighted past win rate."""
     cols_needed = ([f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')]
                    + [past_mover_col, past_opponent_col, has_history_mover_col, has_history_opponent_col])
@@ -2388,6 +2634,7 @@ def plot_confidence_by_past_performance_diff(df: pd.DataFrame, names: list[str],
     ax.set_xlabel('Past-performance difference, mover minus opponent')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2408,7 +2655,8 @@ def plot_accuracy_by_hours_since_log_ratio(df: pd.DataFrame, names: list[str],
                                             elo_bins: tuple[int, int] | None = None,
                                             elo_bin_cfg: EloBinConfig = ELO_BINS,
                                             color_overrides: list[str | None] | None = None,
-                                            linestyle_overrides: list[str | None] | None = None) -> None:
+                                            linestyle_overrides: list[str | None] | None = None,
+                                            save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by log(hours_since_opponent / hours_since_mover), as one row or two elo-bin-restricted rows. Rows with no prior game for either player are excluded."""
     n_before = len(df)
     df = df[df[hours_since_mover_col].notna() & df[hours_since_opponent_col].notna()]
@@ -2460,6 +2708,7 @@ def plot_accuracy_by_hours_since_log_ratio(df: pd.DataFrame, names: list[str],
             ax_brier.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2472,7 +2721,8 @@ def plot_confidence_by_hours_since_log_ratio(df: pd.DataFrame, names: list[str],
                                               figsize: tuple[float, float] | None = None,
                                               display_names: dict[str, str] | None = None,
                                               color_overrides: list[str | None] | None = None,
-                                              linestyle_overrides: list[str | None] | None = None) -> None:
+                                              linestyle_overrides: list[str | None] | None = None,
+                                              save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by log(hours_since_opponent / hours_since_mover)."""
     df = df[df[hours_since_mover_col].notna() & df[hours_since_opponent_col].notna()]
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [hours_since_mover_col, hours_since_opponent_col]
@@ -2496,6 +2746,7 @@ def plot_confidence_by_hours_since_log_ratio(df: pd.DataFrame, names: list[str],
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2513,7 +2764,8 @@ def plot_accuracy_by_hours_since_freshest(df: pd.DataFrame, names: list[str],
                                            elo_bins: tuple[int, int] | None = None,
                                            elo_bin_cfg: EloBinConfig = ELO_BINS,
                                            color_overrides: list[str | None] | None = None,
-                                           linestyle_overrides: list[str | None] | None = None) -> None:
+                                           linestyle_overrides: list[str | None] | None = None,
+                                           save_path: str | None = None) -> None:
     """Plots per-model accuracy (and optionally Brier score) against true mover_result, binned by min(hours_since_mover, hours_since_opponent), as one row or two elo-bin-restricted rows. Rows with no prior game for either player are excluded."""
     n_before = len(df)
     df = df[df[hours_since_mover_col].notna() & df[hours_since_opponent_col].notna()]
@@ -2559,6 +2811,7 @@ def plot_accuracy_by_hours_since_freshest(df: pd.DataFrame, names: list[str],
             ax_brier.set_xlabel('Hours since the more recent of the two players last played')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2570,7 +2823,8 @@ def plot_confidence_by_hours_since_freshest(df: pd.DataFrame, names: list[str],
                                              figsize: tuple[float, float] | None = None,
                                              display_names: dict[str, str] | None = None,
                                              color_overrides: list[str | None] | None = None,
-                                             linestyle_overrides: list[str | None] | None = None) -> None:
+                                             linestyle_overrides: list[str | None] | None = None,
+                                             save_path: str | None = None) -> None:
     """Plots each model's mean max predicted probability, binned by min(hours_since_mover, hours_since_opponent)."""
     df = df[df[hours_since_mover_col].notna() & df[hours_since_opponent_col].notna()]
     cols_needed = [f'{name}_prob_{c}' for name in names for c in ('win', 'draw', 'loss')] + [hours_since_mover_col, hours_since_opponent_col]
@@ -2588,6 +2842,7 @@ def plot_confidence_by_hours_since_freshest(df: pd.DataFrame, names: list[str],
     ax.set_xlabel('Hours since the more recent of the two players last played')
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2645,7 +2900,8 @@ def plot_accuracy_by_title_mismatch(df: pd.DataFrame, names: list[str],
                                      ylim: tuple[float, float] = (0, 100),
                                      title: str | None = None,
                                      figsize: tuple[float, float] | None = None,
-                                     display_names: dict[str, str] | None = None) -> None:
+                                     display_names: dict[str, str] | None = None,
+                                     save_path: str | None = None) -> None:
     """Plots each model's accuracy against true mover_result, split into title/elo-mismatched (a lower-elo, stronger-titled player is present) vs aligned bars. In scope: both players titled in the same track (open, or women's if include_womens); also titled-vs-untitled pairs if include_no_title (untitled treated as the lowest possible title strength). Untitled-vs-untitled is never in scope."""
     cols_needed = ([f'{name}_predicted_class' for name in names]
                    + [mover_title_col, opponent_title_col, mover_elo_col, opponent_elo_col, mover_result_col])
@@ -2684,6 +2940,7 @@ def plot_accuracy_by_title_mismatch(df: pd.DataFrame, names: list[str],
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
 
 
@@ -2697,7 +2954,8 @@ def plot_result_rate_by_title_mismatch(df: pd.DataFrame, *,
                                         include_no_title: bool = False,
                                         ylim: tuple[float, float] = (0, 100),
                                         title: str = "Result rate (higher-elo player's perspective) by title/elo mismatch",
-                                        figsize: tuple[float, float] | None = None) -> None:
+                                        figsize: tuple[float, float] | None = None,
+                                        save_path: str | None = None) -> None:
     """Plots the true win/draw/loss rate, from the higher-elo player's perspective, comparing title/elo-mismatched vs aligned games. In scope: both players titled in the same track (open, or women's if include_womens); also titled-vs-untitled pairs if include_no_title. Untitled-vs-untitled is never in scope."""
     cols_needed = [mover_title_col, opponent_title_col, mover_elo_col, opponent_elo_col, mover_result_col]
     df = restrict_to_common_rows(df, cols_needed)
@@ -2735,7 +2993,11 @@ def plot_result_rate_by_title_mismatch(df: pd.DataFrame, *,
     ax.set_ylim(*ylim)
 
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
+
+
+# (p) CLASSIFICATION REPORT & CONFUSION MATRIX
 
 def table_classification_report(df: pd.DataFrame, names: list[str],
                                   mover_result_col: str = 'mover_result',
@@ -2768,7 +3030,8 @@ def plot_confusion_matrix(df: pd.DataFrame, names: list[str],
                            mover_result_col: str = 'mover_result',
                            title: str = 'Confusion matrix by true class',
                            figsize: tuple[float, float] | None = None,
-                           display_names: dict[str, str] | None = None) -> None:
+                           display_names: dict[str, str] | None = None,
+                           save_path: str | None = None) -> None:
     """Plots one true-class-normalized confusion matrix panel per model. Diagonal cells match
     the recall values from plot_accuracy_by_class; off-diagonal cells show where the rest of
     each true class's mass ends up."""
@@ -2800,4 +3063,100 @@ def plot_confusion_matrix(df: pd.DataFrame, names: list[str],
 
     fig.suptitle(title)
     plt.tight_layout()
+    _maybe_save(save_path)
     plt.show()
+
+
+# (q) STANDALONE METRIC TABLES
+
+def table_accuracy_by_elo_bin(df: pd.DataFrame, names: list[str],
+                               mover_result_col: str = 'mover_result',
+                               cfg: EloBinConfig = ELO_BINS,
+                               display_names: dict[str, str] | None = None) -> pd.DataFrame:
+    """Returns a DataFrame of accuracy (%) per model (columns) by Elo bin (rows), matching the
+    binning used by plot_accuracy_by_elo_bin. Useful for pulling exact numbers (e.g. best-vs-worst
+    spread at a given bin) to comment on alongside the plot."""
+    cols_needed = [f'{name}_predicted_class' for name in names] + [mover_result_col, 'mover_elo', 'opponent_elo']
+    df = restrict_to_common_rows(df, cols_needed)
+    binned, edges = elo_bin_by_mover(df, cfg, method='mean')
+    labels = elo_bin_labels(edges)
+    n_bins = len(edges) - 1
+    display_names = DEFAULT_DISPLAY_NAMES if display_names is None else display_names
+
+    data = {}
+    for name in names:
+        pred_val = binned[f'{name}_predicted_class'].map(CLASS_TO_VAL)
+        correct = pred_val == binned[mover_result_col]
+        data[resolve_display_name(name, display_names)] = [
+            correct[binned['elo_bin'] == b].mean() * 100 if (binned['elo_bin'] == b).sum() else float('nan')
+            for b in range(n_bins)
+        ]
+    return pd.DataFrame(data, index=labels)
+
+
+def table_accuracy_by_combined_clock(df: pd.DataFrame, names: list[str],
+                                      mover_clock_col: str = 'mover_clock',
+                                      opponent_clock_col: str = 'opponent_clock',
+                                      time_control_col: str = 'time_control',
+                                      mover_result_col: str = 'mover_result',
+                                      bin_width: float = 0.05,
+                                      display_names: dict[str, str] | None = None) -> pd.DataFrame:
+    """Returns a DataFrame of accuracy (%) per model (columns) by combined clock-remaining bin
+    (rows), matching the binning used by plot_accuracy_by_combined_clock."""
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    game_time = df[time_control_col].map(SEC_MAPPING)
+    df = df[game_time.notna()].copy()
+    game_time = game_time[game_time.notna()]
+    time_left_prop = ((df[mover_clock_col] + df[opponent_clock_col]) / (2 * game_time)).clip(0, 1)
+    df['_time_bin'] = ((time_left_prop // bin_width) * bin_width + bin_width / 2).round(4)
+
+    bin_values = sorted(df['_time_bin'].dropna().unique())
+    display_names = DEFAULT_DISPLAY_NAMES if display_names is None else display_names
+
+    data = {}
+    for name in names:
+        pred_val = df[f'{name}_predicted_class'].map(CLASS_TO_VAL)
+        correct = pred_val == df[mover_result_col]
+        data[resolve_display_name(name, display_names)] = [
+            correct[df['_time_bin'] == b].mean() * 100 if (df['_time_bin'] == b).sum() else float('nan')
+            for b in bin_values
+        ]
+    return pd.DataFrame(data, index=bin_values)
+
+
+def table_accuracy_by_lowest_clock(df: pd.DataFrame, names: list[str],
+                                    mover_clock_col: str = 'mover_clock',
+                                    opponent_clock_col: str = 'opponent_clock',
+                                    time_control_col: str = 'time_control',
+                                    mover_result_col: str = 'mover_result',
+                                    bin_width: float = 0.05,
+                                    display_names: dict[str, str] | None = None) -> pd.DataFrame:
+    """Returns a DataFrame of accuracy (%) per model (columns) by the lower of the two players'
+    clock-remaining bin (rows), matching the binning used by plot_accuracy_by_lowest_clock."""
+    cols_needed = ([f'{name}_predicted_class' for name in names]
+                   + [mover_result_col, mover_clock_col, opponent_clock_col, time_control_col])
+    df = restrict_to_common_rows(df, cols_needed)
+
+    game_time = df[time_control_col].map(SEC_MAPPING)
+    df = df[game_time.notna()].copy()
+    game_time = game_time[game_time.notna()]
+    mover_prop = (df[mover_clock_col] / game_time).clip(0, 1)
+    opponent_prop = (df[opponent_clock_col] / game_time).clip(0, 1)
+    lowest_prop = pd.concat([mover_prop, opponent_prop], axis=1).min(axis=1)
+    df['_lowest_time_bin'] = ((lowest_prop // bin_width) * bin_width + bin_width / 2).round(4)
+
+    bin_values = sorted(df['_lowest_time_bin'].dropna().unique())
+    display_names = DEFAULT_DISPLAY_NAMES if display_names is None else display_names
+
+    data = {}
+    for name in names:
+        pred_val = df[f'{name}_predicted_class'].map(CLASS_TO_VAL)
+        correct = pred_val == df[mover_result_col]
+        data[resolve_display_name(name, display_names)] = [
+            correct[df['_lowest_time_bin'] == b].mean() * 100 if (df['_lowest_time_bin'] == b).sum() else float('nan')
+            for b in bin_values
+        ]
+    return pd.DataFrame(data, index=bin_values)

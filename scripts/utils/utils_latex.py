@@ -4,10 +4,11 @@ Converts pandas DataFrames into booktabs-style LaTeX table/subtable blocks for d
 dissertation.
 
 Latest changes: 08/09/26:
-- Added render_grouped_tabular for multicolumn-header tables
+- Fixed %-handling error
 """
 
 import math
+import re
 
 ####################
 # CONSTANTS
@@ -27,6 +28,9 @@ DEFAULT_COLUMN_FORMAT = {
 # Total width budget (of \textwidth) split across subtables in a grid row, leaving a small gutter
 # between columns.
 GRID_WIDTH_BUDGET = 0.96
+
+# Characters escaped by _escape_latex_text when not already preceded by a backslash.
+LATEX_SPECIAL_CHARS = '%&#_'
 
 ####################
 # FUNCTIONS
@@ -67,14 +71,22 @@ def _format_row_cells(row_label, row, column_specs: list[dict], nan_placeholder:
     return cells
 
 
-# (b) TABULAR RENDERING
+# (b) TEXT ESCAPING
+
+def _escape_latex_text(text: str) -> str:
+    """Escapes any unescaped LATEX_SPECIAL_CHARS character in text with a preceding backslash."""
+    return re.sub(f'(?<!\\\\)([{re.escape(LATEX_SPECIAL_CHARS)}])', r'\\\1', text)
+
+
+# (c) TABULAR RENDERING
 
 def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
                     nan_placeholder: str = NAN_PLACEHOLDER) -> str:
     """Renders df (one row per table row, indexed by row label) as a booktabs tabular block, formatting
     each column per its spec (dict with keys: key, label, decimals, multiply, suffix, sign, nan_placeholder)."""
     align = 'l' + 'r' * len(column_specs)
-    header = ' & '.join([index_label] + [spec['label'] for spec in column_specs])
+    header = ' & '.join([_escape_latex_text(index_label)] +
+                         [_escape_latex_text(spec['label']) for spec in column_specs])
 
     lines = [
         f'\\begin{{tabular}}{{{align}}}',
@@ -106,14 +118,15 @@ def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict]
     cmidrules = []
     col_cursor = 2
     for g in group_specs:
-        group_cells.append(f"\\multicolumn{{{g['span']}}}{{c}}{{{g['label']}}}")
+        group_cells.append(f"\\multicolumn{{{g['span']}}}{{c}}{{{_escape_latex_text(g['label'])}}}")
         col_end = col_cursor + g['span'] - 1
         cmidrules.append(f'\\cmidrule(lr){{{col_cursor}-{col_end}}}')
         col_cursor = col_end + 1
     group_header = ' & '.join(group_cells)
     cmidrule_line = ' '.join(cmidrules)
 
-    sub_header = ' & '.join([index_label] + [spec['label'] for spec in column_specs])
+    sub_header = ' & '.join([_escape_latex_text(index_label)] +
+                             [_escape_latex_text(spec['label']) for spec in column_specs])
 
     lines = [
         f'\\begin{{tabular}}{{{align}}}',
@@ -130,14 +143,14 @@ def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict]
     return '\n'.join(lines)
 
 
-# (c) SUBTABLE / TABLE ASSEMBLY
+# (d) SUBTABLE / TABLE ASSEMBLY
 
 def render_subtable(tabular_latex: str, caption: str, label: str, width: str = '\\textwidth') -> str:
     """Wraps tabular_latex in a top-aligned subtable of the given width, with its own caption/label."""
     body = '\n'.join([
         '\\centering',
         tabular_latex,
-        f'\\caption{{{caption}}}',
+        f'\\caption{{{_escape_latex_text(caption)}}}',
         f'\\label{{{label}}}',
     ])
     return f'\\begin{{subtable}}[t]{{{width}}}\n{_indent(body, 4)}\n\\end{{subtable}}'
@@ -162,7 +175,7 @@ def render_table(subtables: list[dict], outer_caption: str, outer_label: str, n_
     full_body = '\n'.join([
         '\\centering',
         body,
-        f'\\caption{{{outer_caption}}}',
+        f'\\caption{{{_escape_latex_text(outer_caption)}}}',
         f'\\label{{{outer_label}}}',
     ])
     return f'\\begin{{table}}[{position}]\n{_indent(full_body, 4)}\n\\end{{table}}'
@@ -173,14 +186,14 @@ def render_flat_table(tabular_latex: str, caption: str, label: str, position: st
     its own caption/label -- e.g. a grouped-header table from render_grouped_tabular."""
     body = '\n'.join([
         '\\centering',
-        f'\\caption{{{caption}}}',
+        f'\\caption{{{_escape_latex_text(caption)}}}',
         f'\\label{{{label}}}',
         tabular_latex,
     ])
     return f'\\begin{{table}}[{position}]\n{_indent(body, 4)}\n\\end{{table}}'
 
 
-# (d) FILE OUTPUT
+# (e) FILE OUTPUT
 
 def write_table(latex: str, path: str) -> None:
     """Writes a rendered table/subtable block to path as a standalone .tex file."""

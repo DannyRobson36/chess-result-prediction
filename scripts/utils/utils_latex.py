@@ -4,7 +4,7 @@ Converts pandas DataFrames into booktabs-style LaTeX table/subtable blocks for d
 dissertation.
 
 Latest changes: 08/09/26:
-- Fixed %-handling error
+- Fixed several bugs
 """
 
 import math
@@ -23,6 +23,7 @@ DEFAULT_COLUMN_FORMAT = {
     'multiply': None,
     'suffix': '',
     'sign': False,
+    'text': False,
 }
 
 # Total width budget (of \textwidth) split across subtables in a grid row, leaving a small gutter
@@ -36,17 +37,36 @@ LATEX_SPECIAL_CHARS = '%&#_'
 # FUNCTIONS
 ####################
 
-# (a) VALUE FORMATTING
+# (a) TEXT ESCAPING
+
+def _escape_latex_text(text: str) -> str:
+    """Escapes any unescaped LATEX_SPECIAL_CHARS character in text with a preceding backslash.
+    Applied to every piece of display text written into a .tex file by this module -- captions,
+    labels, headers, row labels, text-column cell values, and suffixes -- so that a raw %, &, #, or
+    _ anywhere in caller-supplied text (e.g. a model name used as a row label) never breaks
+    compilation."""
+    return re.sub(f'(?<!\\\\)([{re.escape(LATEX_SPECIAL_CHARS)}])', r'\\\1', text)
+
+
+# (b) VALUE FORMATTING
 
 def format_value(value: float, decimals: int = 2, multiply: float | None = None, suffix: str = '',
                   sign: bool = False, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Formats one numeric value to decimals d.p., with optional multiply, suffix, and forced sign;
-    returns nan_placeholder for NaN."""
+    """Formats one numeric value to decimals d.p., with optional multiply, escaped suffix, and forced
+    sign; returns escaped nan_placeholder for NaN."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
-        return nan_placeholder
+        return _escape_latex_text(nan_placeholder)
     scaled = value * multiply if multiply is not None else value
     text = f'{scaled:+.{decimals}f}' if sign else f'{scaled:.{decimals}f}'
-    return f'{text}{suffix}'
+    return f'{text}{_escape_latex_text(suffix)}'
+
+
+def format_text_value(value, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
+    """Passes a non-numeric value through as an escaped plain string, returning escaped
+    nan_placeholder for None/NaN."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return _escape_latex_text(nan_placeholder)
+    return _escape_latex_text(str(value))
 
 
 def _indent(text: str, spaces: int) -> str:
@@ -56,26 +76,26 @@ def _indent(text: str, spaces: int) -> str:
 
 
 def _format_row_cells(row_label, row, column_specs: list[dict], nan_placeholder: str) -> list[str]:
-    """Formats one data row (row_label plus each column_spec's value) into cell strings."""
-    cells = [str(row_label)]
+    """Formats one data row (escaped row_label plus each column_spec's value) into cell strings. A
+    spec with text=True passes its value through format_text_value instead of numeric formatting."""
+    cells = [_escape_latex_text(str(row_label))]
     for spec in column_specs:
         fmt = {**DEFAULT_COLUMN_FORMAT, **spec}
-        cells.append(format_value(
-            row[spec['key']],
-            decimals=fmt['decimals'],
-            multiply=fmt['multiply'],
-            suffix=fmt['suffix'],
-            sign=fmt['sign'],
-            nan_placeholder=spec.get('nan_placeholder', nan_placeholder),
-        ))
+        if fmt['text']:
+            cells.append(format_text_value(
+                row[spec['key']],
+                nan_placeholder=spec.get('nan_placeholder', nan_placeholder),
+            ))
+        else:
+            cells.append(format_value(
+                row[spec['key']],
+                decimals=fmt['decimals'],
+                multiply=fmt['multiply'],
+                suffix=fmt['suffix'],
+                sign=fmt['sign'],
+                nan_placeholder=spec.get('nan_placeholder', nan_placeholder),
+            ))
     return cells
-
-
-# (b) TEXT ESCAPING
-
-def _escape_latex_text(text: str) -> str:
-    """Escapes any unescaped LATEX_SPECIAL_CHARS character in text with a preceding backslash."""
-    return re.sub(f'(?<!\\\\)([{re.escape(LATEX_SPECIAL_CHARS)}])', r'\\\1', text)
 
 
 # (c) TABULAR RENDERING
@@ -83,7 +103,8 @@ def _escape_latex_text(text: str) -> str:
 def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
                     nan_placeholder: str = NAN_PLACEHOLDER) -> str:
     """Renders df (one row per table row, indexed by row label) as a booktabs tabular block, formatting
-    each column per its spec (dict with keys: key, label, decimals, multiply, suffix, sign, nan_placeholder)."""
+    each column per its spec (dict with keys: key, label, decimals, multiply, suffix, sign, text,
+    nan_placeholder). text=True passes the column's value through as a plain escaped string."""
     align = 'l' + 'r' * len(column_specs)
     header = ' & '.join([_escape_latex_text(index_label)] +
                          [_escape_latex_text(spec['label']) for spec in column_specs])
@@ -105,8 +126,8 @@ def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict]
                             nan_placeholder: str = NAN_PLACEHOLDER) -> str:
     """Renders df as a booktabs tabular block with a spanning multicolumn group header row (plus
     cmidrules) above the per-column sub-header row. column_specs is the same flat per-data-column
-    list as render_tabular; group_specs is an ordered list of dicts (keys: label, span) whose spans
-    must sum to len(column_specs)."""
+    list as render_tabular (text=True columns supported the same way); group_specs is an ordered
+    list of dicts (keys: label, span) whose spans must sum to len(column_specs)."""
     total_span = sum(g['span'] for g in group_specs)
     if total_span != len(column_specs):
         raise ValueError(f'group_specs spans sum to {total_span}, expected {len(column_specs)} '

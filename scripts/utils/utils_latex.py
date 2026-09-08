@@ -4,7 +4,7 @@ Converts pandas DataFrames into booktabs-style LaTeX table/subtable blocks for d
 dissertation.
 
 Latest changes: 08/09/26:
-- Initial commit
+- Added render_grouped_tabular for multicolumn-header tables
 """
 
 import math
@@ -51,6 +51,22 @@ def _indent(text: str, spaces: int) -> str:
     return '\n'.join(f'{pad}{line}' if line else line for line in text.split('\n'))
 
 
+def _format_row_cells(row_label, row, column_specs: list[dict], nan_placeholder: str) -> list[str]:
+    """Formats one data row (row_label plus each column_spec's value) into cell strings."""
+    cells = [str(row_label)]
+    for spec in column_specs:
+        fmt = {**DEFAULT_COLUMN_FORMAT, **spec}
+        cells.append(format_value(
+            row[spec['key']],
+            decimals=fmt['decimals'],
+            multiply=fmt['multiply'],
+            suffix=fmt['suffix'],
+            sign=fmt['sign'],
+            nan_placeholder=spec.get('nan_placeholder', nan_placeholder),
+        ))
+    return cells
+
+
 # (b) TABULAR RENDERING
 
 def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
@@ -67,17 +83,48 @@ def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
         _indent('\\midrule', 4),
     ]
     for row_label, row in df.iterrows():
-        cells = [str(row_label)]
-        for spec in column_specs:
-            fmt = {**DEFAULT_COLUMN_FORMAT, **spec}
-            cells.append(format_value(
-                row[spec['key']],
-                decimals=fmt['decimals'],
-                multiply=fmt['multiply'],
-                suffix=fmt['suffix'],
-                sign=fmt['sign'],
-                nan_placeholder=spec.get('nan_placeholder', nan_placeholder),
-            ))
+        cells = _format_row_cells(row_label, row, column_specs, nan_placeholder)
+        lines.append(_indent(f'{" & ".join(cells)} \\\\', 4))
+    lines += [_indent('\\bottomrule', 4), '\\end{tabular}']
+    return '\n'.join(lines)
+
+
+def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict], index_label: str = 'Model',
+                            nan_placeholder: str = NAN_PLACEHOLDER) -> str:
+    """Renders df as a booktabs tabular block with a spanning multicolumn group header row (plus
+    cmidrules) above the per-column sub-header row. column_specs is the same flat per-data-column
+    list as render_tabular; group_specs is an ordered list of dicts (keys: label, span) whose spans
+    must sum to len(column_specs)."""
+    total_span = sum(g['span'] for g in group_specs)
+    if total_span != len(column_specs):
+        raise ValueError(f'group_specs spans sum to {total_span}, expected {len(column_specs)} '
+                          f'(len(column_specs)).')
+
+    align = 'l' + 'r' * len(column_specs)
+
+    group_cells = ['']
+    cmidrules = []
+    col_cursor = 2
+    for g in group_specs:
+        group_cells.append(f"\\multicolumn{{{g['span']}}}{{c}}{{{g['label']}}}")
+        col_end = col_cursor + g['span'] - 1
+        cmidrules.append(f'\\cmidrule(lr){{{col_cursor}-{col_end}}}')
+        col_cursor = col_end + 1
+    group_header = ' & '.join(group_cells)
+    cmidrule_line = ' '.join(cmidrules)
+
+    sub_header = ' & '.join([index_label] + [spec['label'] for spec in column_specs])
+
+    lines = [
+        f'\\begin{{tabular}}{{{align}}}',
+        _indent('\\toprule', 4),
+        _indent(f'{group_header} \\\\', 4),
+        _indent(cmidrule_line, 4),
+        _indent(f'{sub_header} \\\\', 4),
+        _indent('\\midrule', 4),
+    ]
+    for row_label, row in df.iterrows():
+        cells = _format_row_cells(row_label, row, column_specs, nan_placeholder)
         lines.append(_indent(f'{" & ".join(cells)} \\\\', 4))
     lines += [_indent('\\bottomrule', 4), '\\end{tabular}']
     return '\n'.join(lines)
@@ -119,6 +166,18 @@ def render_table(subtables: list[dict], outer_caption: str, outer_label: str, n_
         f'\\label{{{outer_label}}}',
     ])
     return f'\\begin{{table}}[{position}]\n{_indent(full_body, 4)}\n\\end{{table}}'
+
+
+def render_flat_table(tabular_latex: str, caption: str, label: str, position: str = 'htbp') -> str:
+    """Wraps tabular_latex directly in a table environment (no subtable), for a single table with
+    its own caption/label -- e.g. a grouped-header table from render_grouped_tabular."""
+    body = '\n'.join([
+        '\\centering',
+        f'\\caption{{{caption}}}',
+        f'\\label{{{label}}}',
+        tabular_latex,
+    ])
+    return f'\\begin{{table}}[{position}]\n{_indent(body, 4)}\n\\end{{table}}'
 
 
 # (d) FILE OUTPUT

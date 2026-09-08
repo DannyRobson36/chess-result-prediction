@@ -1,10 +1,10 @@
 """
 utils_plotting.py
-Shared matplotlib style, figure sizing, and per-model colour/linestyle-assignment helpers for
-evaluation plots.
+Shared matplotlib style, figure sizing, and per-model colour/linestyle/marker-assignment helpers
+for evaluation plots.
 
-Latest changes: 01/09/26:
-- Tol muted palette
+Latest changes: 08/09/26:
+- Added figsize_for, save_fig, markers_for
 """
 
 import matplotlib.pyplot as plt
@@ -21,6 +21,9 @@ PLOT_STYLE = {
     'axes.labelsize': 11,
     'legend.fontsize': 9.5,
     'figure.dpi': 150,
+    'savefig.dpi': 300,
+    'pdf.fonttype': 42,
+    'ps.fonttype': 42,
 }
 
 # Default (width, height) in inches for a single-panel plot; multi-panel plots scale width per panel from this.
@@ -44,6 +47,12 @@ PALETTE = (
 # Default linestyle assigned by linestyles_for when no override is given.
 DEFAULT_LINESTYLE = '-'
 
+# Default marker assigned by markers_for when no override is given.
+DEFAULT_MARKER = None
+
+# Marker cycle used by markers_for when canonical_order is given, matching PALETTE's length.
+MARKER_CYCLE = ('o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>')
+
 ####################
 # FUNCTIONS
 ####################
@@ -55,7 +64,19 @@ def apply_plot_style(overrides: dict | None = None) -> None:
     plt.rcParams.update({**PLOT_STYLE, **(overrides or {})})
 
 
-# (b) COLOUR / LINESTYLE ASSIGNMENT
+def figsize_for(n_panels: int, base_figsize: tuple = BASE_FIGSIZE) -> tuple:
+    """Returns (width, height) for n_panels side-by-side subplots, scaling width by n_panels from base_figsize."""
+    width, height = base_figsize
+    return (width * n_panels, height)
+
+
+def save_fig(fig, path: str, dpi: int = 300) -> None:
+    """Saves fig to path at dpi with a tight bounding box, then closes fig."""
+    fig.savefig(path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+
+
+# (b) COLOUR / LINESTYLE / MARKER ASSIGNMENT
 
 def colors_for(names: list[str], canonical_order: list[str] | None = None,
                 overrides: list[str | None] | None = None, palette: tuple = PALETTE) -> dict[str, str]:
@@ -97,4 +118,33 @@ def linestyles_for(names: list[str], overrides: list[str | None] | None = None,
         for name, override in zip(names, overrides):
             if override is not None:
                 assigned[name] = override
+    return assigned
+
+
+def markers_for(names: list[str], canonical_order: list[str] | None = None,
+                 overrides: list[str | None] | None = None, marker_cycle: tuple = MARKER_CYCLE,
+                 default: str | None = DEFAULT_MARKER) -> dict[str, str | None]:
+    """Assigns each name in names a marker from marker_cycle, following the same canonical_order/fallback
+    rule as colors_for. If canonical_order is None, every name gets default. overrides, given by position
+    in names (None entries keep the assigned marker), force specific names to a specific marker."""
+    assigned = {}
+    next_fallback = len(canonical_order) if canonical_order is not None else 0
+    for i, name in enumerate(names):
+        if canonical_order is None:
+            assigned[name] = default
+            continue
+        if name in canonical_order:
+            idx = canonical_order.index(name)
+        else:
+            idx = next_fallback
+            next_fallback += 1
+        assigned[name] = marker_cycle[idx % len(marker_cycle)]
+
+    if overrides is not None:
+        if len(overrides) != len(names):
+            raise ValueError(f'overrides must have the same length as names ({len(names)}), got {len(overrides)}.')
+        for name, override in zip(names, overrides):
+            if override is not None:
+                assigned[name] = override
+
     return assigned

@@ -2,8 +2,8 @@
 """
 Project-wide hardcoded config for use across scripts.
 
-Latest changes: 14/08/26:
-- Updated to final checkpoint/prediction dirs
+Latest changes: 08/09/26:
+- Added Overleaf dirs and project ID
 """
 
 ####################
@@ -23,7 +23,7 @@ CHECKPOINTS_DIR = '/content/drive/MyDrive/drive_diss/checkpoints/final'
 PREDICTIONS_DIR = '/content/drive/MyDrive/drive_diss/data/predictions/final'
 
 ####################
-# Local Disk - Colab session 
+# Local Disk
 ####################
 
 LOCAL_SPLITS_DIR = '/content/prepared_splits'
@@ -34,6 +34,21 @@ LOCAL_SPLITS_DIR = '/content/prepared_splits'
 
 REPO_DIR = '/content/chess-result-prediction'
 REPO_SCRIPTS_DIR = '/content/chess-result-prediction/scripts'
+
+####################
+# Overleaf
+####################
+
+OVERLEAF_DIR = '/content/drive/MyDrive/drive_diss/overleaf_diss'
+OVERLEAF_PROJECT_ID = '6a8deff0019101d71483df29'
+
+FIGURES_EDA = '/content/drive/MyDrive/drive_diss/overleaf_diss/figures/eda'
+FIGURES_TRAINING = '/content/drive/MyDrive/drive_diss/overleaf_diss/figures/training'
+FIGURES_RESULTS = '/content/drive/MyDrive/drive_diss/overleaf_diss/figures/results'
+
+TABLES_EDA = '/content/drive/MyDrive/drive_diss/overleaf_diss/tables/eda'
+TABLES_TRAINING = '/content/drive/MyDrive/drive_diss/overleaf_diss/tables/training'
+TABLES_RESULTS = '/content/drive/MyDrive/drive_diss/overleaf_diss/tables/results'
 
 ####################
 # Reproducibility

@@ -19,7 +19,7 @@ Run:
         --probit False
 
 Latest changes: 10/09/26:
-- Added --probit CLI flag
+- Minor text change
 """
 
 import argparse
@@ -42,6 +42,7 @@ from scripts.utils.utils_eval import apply_temperature, collapse_to_expected_sco
 ####################
 
 REQUIRED_OUTPUT_COLS = ['game_id', 'fen', 'prob_win', 'prob_draw', 'prob_loss', 'predicted_class']
+
 
 BATCH_SIZE = 1024
 

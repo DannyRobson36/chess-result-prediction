@@ -3,21 +3,23 @@ run_inference.py
 Runs a trained checkpoint on a val/test positions CSV, writing predictions in
 compare_predictions-ready form: game_id, fen, prob_win, prob_draw, prob_loss, predicted_class.
 Auto-detects whether the input contains draws: if so, writes native temperature-calibrated
-3-way probabilities; if not (decisive-only input), collapses to a probit-calibrated expected
-score, with prob_draw written as 0.
+3-way probabilities; if not, collapses to a single expected score, then either probit-calibrates
+it or writes it directly, per --probit.
 
 CLI (all required):
     --checkpoint-path   Full path to the .pt checkpoint.
     --input-path        Path to the val/test positions CSV to evaluate.
     --output-path       Full path to write the predictions CSV to.
+    --probit            True or False. Only affects decisive-only (no-draw) classification input.
 
 Run:
     !python run_inference.py --checkpoint-path /content/drive/.../maia2_value_feature_run1.pt 
         --input-path /content/drive/.../val_900k_res_bal_wl.csv 
-        --output-path /content/drive/.../val_predictions_maia2_value_feature_run1.csv
+        --output-path /content/drive/.../val_predictions_maia2_value_feature_run1.csv 
+        --probit False
 
-Latest changes: 20/08/26:
-- run_inference_batches unpacks predict_fn's (preds, aux_preds) return
+Latest changes: 10/09/26:
+- Added --probit CLI flag
 """
 
 import argparse
@@ -41,7 +43,6 @@ from scripts.utils.utils_eval import apply_temperature, collapse_to_expected_sco
 
 REQUIRED_OUTPUT_COLS = ['game_id', 'fen', 'prob_win', 'prob_draw', 'prob_loss', 'predicted_class']
 
-# batch size for inference; hand-edit here rather than via CLI
 BATCH_SIZE = 1024
 
 ####################
@@ -51,7 +52,7 @@ BATCH_SIZE = 1024
 # (a) CLI
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parses the --checkpoint-path, --input-path, --output-path CLI arguments."""
+    """Parses the --checkpoint-path, --input-path, --output-path, --probit CLI arguments."""
     parser = argparse.ArgumentParser(
         description='Runs a trained checkpoint on a val/test positions CSV, writing predictions '
                      'in compare_predictions-ready form.'
@@ -62,6 +63,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          help='Path to the val/test positions CSV to evaluate. Must contain mover_result.')
     parser.add_argument('--output-path', required=True,
                          help='Full path (including filename) to write the predictions CSV to.')
+    parser.add_argument('--probit', required=True, choices=['True', 'False'],
+                         help='True applies the fitted binary probit to decisive-only classification '
+                              'input; False writes the collapsed expected score directly. No effect on '
+                              'has-draws input or on regression architectures.')
     return parser.parse_args(argv)
 
 # (b) INFERENCE
@@ -81,7 +86,17 @@ def run_inference_batches(model: torch.nn.Module, arch_name: str, split, batch_s
     return torch.cat(all_preds)
 
 
-def compute_probs(raw_preds: torch.Tensor, output_type: str, has_draws: bool,
+def _collapsed_score_prediction_cols(expected_score: np.ndarray) -> dict:
+    """Returns prob_win/prob_draw/prob_loss/predicted_class directly from an expected score, uncalibrated."""
+    prob_win = expected_score
+    prob_loss = 1.0 - expected_score
+    prob_draw = np.zeros_like(prob_win)
+    predicted_class = np.where(prob_win >= 0.5, 'win', 'loss')
+    return {'prob_win': prob_win, 'prob_draw': prob_draw, 'prob_loss': prob_loss,
+            'predicted_class': predicted_class}
+
+
+def compute_probs(raw_preds: torch.Tensor, output_type: str, has_draws: bool, use_probit: bool,
                    temperature: float | None, probit_params: tuple[float, float]) -> dict:
     """Converts raw model output into prob_win/prob_draw/prob_loss/predicted_class arrays."""
     if output_type == 'classification':
@@ -95,7 +110,9 @@ def compute_probs(raw_preds: torch.Tensor, output_type: str, has_draws: bool,
                 'predicted_class': predicted_class,
             }
         expected_score = collapse_to_expected_score(torch.softmax(raw_preds, dim=1))
-        return binary_probit_prediction_cols(expected_score, probit_params)
+        if use_probit:
+            return binary_probit_prediction_cols(expected_score, probit_params)
+        return _collapsed_score_prediction_cols(expected_score)
 
     return binary_probit_prediction_cols(raw_preds.numpy(), probit_params)
 
@@ -104,6 +121,7 @@ def compute_probs(raw_preds: torch.Tensor, output_type: str, has_draws: bool,
 def main(argv: list[str] | None = None) -> None:
     """Loads a checkpoint, applies it to a positions CSV, writes a predictions CSV."""
     args = parse_args(argv)
+    use_probit = args.probit == 'True'
 
     if not os.path.exists(args.checkpoint_path):
         sys.exit(f'No checkpoint found at {args.checkpoint_path}.')
@@ -120,6 +138,10 @@ def main(argv: list[str] | None = None) -> None:
     model.load_state_dict(checkpoint.state_dict)
     model = model.to(device)
 
+    output_type = get_output_type(checkpoint.arch_name)
+    if output_type == 'regression' and not use_probit:
+        print('Note: --probit False has no effect on regression architectures; probit is always applied.')
+
     print(f'Loading positions from: {args.input_path}')
     df = pd.read_csv(args.input_path)
     print(f'Loaded {len(df):,} position(s).')
@@ -128,15 +150,19 @@ def main(argv: list[str] | None = None) -> None:
         split = apply_prepared_splits(df, checkpoint.prep_cfg, out_dir=tmp_dir)
 
         has_draws = bool((split.result_class == 1).any())
-        mode_str = ('native 3-way (temperature-calibrated)' if has_draws
-                    else 'collapsed expected score (probit-calibrated), prob_draw=0')
+        if has_draws:
+            mode_str = 'native 3-way (temperature-calibrated)'
+        elif use_probit:
+            mode_str = 'collapsed expected score (probit-calibrated), prob_draw=0'
+        else:
+            mode_str = 'collapsed expected score (uncalibrated), prob_draw=0'
         print(f'Input contains draws: {has_draws} -- writing {mode_str}.')
 
         print(f'Running inference on {len(split):,} position(s)...')
-        output_type = get_output_type(checkpoint.arch_name)
         raw_preds = run_inference_batches(model, checkpoint.arch_name, split, BATCH_SIZE, device)
 
-        probs = compute_probs(raw_preds, output_type, has_draws, checkpoint.temperature, checkpoint.probit_params)
+        probs = compute_probs(raw_preds, output_type, has_draws, use_probit,
+                               checkpoint.temperature, checkpoint.probit_params)
 
         df_out = pd.DataFrame({
             'game_id': split.game_id,

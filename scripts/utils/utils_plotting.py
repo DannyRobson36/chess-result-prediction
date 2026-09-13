@@ -3,8 +3,8 @@ utils_plotting.py
 Shared matplotlib style, figure sizing, and per-model colour/linestyle/marker-assignment helpers 
 for evaluation plots. 
  
-Latest changes: 08/09/26: 
-- Added axis/legend sizing options
+Latest changes: 13/09/26: 
+- Added per-plot axis-label, tick-label, and legend-size overrides
 """ 
  
 import matplotlib.pyplot as plt 
@@ -61,14 +61,19 @@ MARKER_CYCLE = ('o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>')
  
 def apply_plot_style(
     axis_label_size: float | None = None,
+    tick_label_size: float | None = None,
     legend_size: float | None = None,
     overrides: dict | None = None,
 ) -> None: 
-    """Applies PLOT_STYLE to matplotlib's rcParams, with optional per-plot axis-label and legend-size overrides.""" 
+    """Applies PLOT_STYLE with optional per-plot text-size overrides.""" 
     style = {**PLOT_STYLE, **(overrides or {})}
 
     if axis_label_size is not None:
         style['axes.labelsize'] = axis_label_size
+
+    if tick_label_size is not None:
+        style['xtick.labelsize'] = tick_label_size
+        style['ytick.labelsize'] = tick_label_size
 
     if legend_size is not None:
         style['legend.fontsize'] = legend_size

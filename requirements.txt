@@ -9,3 +9,4 @@ requests
 tqdm
 psutil
 pyarrow
+python-dotenv

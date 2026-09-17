@@ -3,8 +3,8 @@ utils_latex.py
 Converts pandas DataFrames into booktabs-style LaTeX table/subtable blocks for direct input into
 dissertation.
 
-Latest changes: 08/09/26:
-- Fixed several bugs
+Latest changes: 17/09/26:
+- Shortened docstrings
 """
 
 import math
@@ -14,10 +14,10 @@ import re
 # CONSTANTS
 ####################
 
-# String substituted for NaN/missing values in every formatted table cell.
+# Placeholder shown for NaN or missing values.
 NAN_PLACEHOLDER = '--'
 
-# Fallback formatting applied to a column when its column_spec omits a given key.
+# Fallback format keys for a column_spec.
 DEFAULT_COLUMN_FORMAT = {
     'decimals': 2,
     'multiply': None,
@@ -26,11 +26,10 @@ DEFAULT_COLUMN_FORMAT = {
     'text': False,
 }
 
-# Total width budget (of \textwidth) split across subtables in a grid row, leaving a small gutter
-# between columns.
+# Fraction of \textwidth split across subtables in a grid row.
 GRID_WIDTH_BUDGET = 0.96
 
-# Characters escaped by _escape_latex_text when not already preceded by a backslash.
+# Characters escaped by _escape_latex_text.
 LATEX_SPECIAL_CHARS = '%&#_'
 
 ####################
@@ -40,11 +39,7 @@ LATEX_SPECIAL_CHARS = '%&#_'
 # (a) TEXT ESCAPING
 
 def _escape_latex_text(text: str) -> str:
-    """Escapes any unescaped LATEX_SPECIAL_CHARS character in text with a preceding backslash.
-    Applied to every piece of display text written into a .tex file by this module -- captions,
-    labels, headers, row labels, text-column cell values, and suffixes -- so that a raw %, &, #, or
-    _ anywhere in caller-supplied text (e.g. a model name used as a row label) never breaks
-    compilation."""
+    """Escapes unescaped LATEX_SPECIAL_CHARS characters in text."""
     return re.sub(f'(?<!\\\\)([{re.escape(LATEX_SPECIAL_CHARS)}])', r'\\\1', text)
 
 
@@ -52,8 +47,8 @@ def _escape_latex_text(text: str) -> str:
 
 def format_value(value: float, decimals: int = 2, multiply: float | None = None, suffix: str = '',
                   sign: bool = False, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Formats one numeric value to decimals d.p., with optional multiply, escaped suffix, and forced
-    sign; returns escaped nan_placeholder for NaN."""
+    """Formats value to decimals d.p., with optional multiply, suffix, and forced sign; returns
+    nan_placeholder for NaN."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return _escape_latex_text(nan_placeholder)
     scaled = value * multiply if multiply is not None else value
@@ -62,8 +57,7 @@ def format_value(value: float, decimals: int = 2, multiply: float | None = None,
 
 
 def format_text_value(value, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Passes a non-numeric value through as an escaped plain string, returning escaped
-    nan_placeholder for None/NaN."""
+    """Passes value through as an escaped string; returns nan_placeholder for None/NaN."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return _escape_latex_text(nan_placeholder)
     return _escape_latex_text(str(value))
@@ -76,8 +70,10 @@ def _indent(text: str, spaces: int) -> str:
 
 
 def _format_row_cells(row_label, row, column_specs: list[dict], nan_placeholder: str) -> list[str]:
-    """Formats one data row (escaped row_label plus each column_spec's value) into cell strings. A
-    spec with text=True passes its value through format_text_value instead of numeric formatting."""
+    """Formats row_label and each column_spec's value in row into cell strings.
+
+    column_specs: text=True formats that column as plain text instead of numeric.
+    """
     cells = [_escape_latex_text(str(row_label))]
     for spec in column_specs:
         fmt = {**DEFAULT_COLUMN_FORMAT, **spec}
@@ -102,9 +98,11 @@ def _format_row_cells(row_label, row, column_specs: list[dict], nan_placeholder:
 
 def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
                     nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Renders df (one row per table row, indexed by row label) as a booktabs tabular block, formatting
-    each column per its spec (dict with keys: key, label, decimals, multiply, suffix, sign, text,
-    nan_placeholder). text=True passes the column's value through as a plain escaped string."""
+    """Renders df as a booktabs tabular block, one row per table row.
+
+    column_specs: dicts with keys key, label, decimals, multiply, suffix, sign, text, nan_placeholder.
+        text=True formats that column as plain text instead of numeric.
+    """
     align = 'l' + 'r' * len(column_specs)
     header = ' & '.join([_escape_latex_text(index_label)] +
                          [_escape_latex_text(spec['label']) for spec in column_specs])
@@ -124,14 +122,14 @@ def render_tabular(df, column_specs: list[dict], index_label: str = 'Model',
 
 def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict], index_label: str = 'Model',
                             nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Renders df as a booktabs tabular block with a spanning multicolumn group header row (plus
-    cmidrules) above the per-column sub-header row. column_specs is the same flat per-data-column
-    list as render_tabular (text=True columns supported the same way); group_specs is an ordered
-    list of dicts (keys: label, span) whose spans must sum to len(column_specs)."""
+    """Renders df as a booktabs tabular block with a spanning group header row above the column sub-header row.
+
+    column_specs: same as render_tabular.
+    group_specs: ordered dicts with keys label, span; spans must sum to len(column_specs).
+    """
     total_span = sum(g['span'] for g in group_specs)
     if total_span != len(column_specs):
-        raise ValueError(f'group_specs spans sum to {total_span}, expected {len(column_specs)} '
-                          f'(len(column_specs)).')
+        raise ValueError(f'group_specs spans sum to {total_span}, expected {len(column_specs)}.')
 
     align = 'l' + 'r' * len(column_specs)
 
@@ -167,7 +165,7 @@ def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict]
 # (d) SUBTABLE / TABLE ASSEMBLY
 
 def render_subtable(tabular_latex: str, caption: str, label: str, width: str = '\\textwidth') -> str:
-    """Wraps tabular_latex in a top-aligned subtable of the given width, with its own caption/label."""
+    """Wraps tabular_latex in a top-aligned subtable of width, with its own caption and label."""
     body = '\n'.join([
         '\\centering',
         tabular_latex,
@@ -179,9 +177,11 @@ def render_subtable(tabular_latex: str, caption: str, label: str, width: str = '
 
 def render_table(subtables: list[dict], outer_caption: str, outer_label: str, n_cols: int = 1,
                   position: str = 'htbp', vspace: str = '1em') -> str:
-    """Assembles subtables (each a dict with tabular, caption, label) into a table environment.
-    n_cols=1 stacks subtables at full width; n_cols>1 arranges them n_cols per row at an even width
-    share, wrapping to further rows as needed."""
+    """Assembles subtables into a table environment.
+
+    subtables: dicts with keys tabular, caption, label.
+    n_cols: subtables per row; wraps to further rows as needed.
+    """
     width = '\\textwidth' if n_cols == 1 else f'{(GRID_WIDTH_BUDGET / n_cols):.2f}\\textwidth'
 
     blocks = [
@@ -203,8 +203,7 @@ def render_table(subtables: list[dict], outer_caption: str, outer_label: str, n_
 
 
 def render_flat_table(tabular_latex: str, caption: str, label: str, position: str = 'htbp') -> str:
-    """Wraps tabular_latex directly in a table environment (no subtable), for a single table with
-    its own caption/label -- e.g. a grouped-header table from render_grouped_tabular."""
+    """Wraps tabular_latex directly in a table environment, with its own caption and label."""
     body = '\n'.join([
         '\\centering',
         f'\\caption{{{_escape_latex_text(caption)}}}',

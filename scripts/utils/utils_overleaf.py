@@ -1,9 +1,10 @@
 """
 utils_overleaf.py
-Path resolution for saving figures/tables into subject-specific Overleaf subfolders.
+Path resolution for saving figures/tables into subject-specific Overleaf subfolders, and pushing
+generated files to the Overleaf git remote.
 
-Latest changes: 08/09/26:
-- Fixed error in push_to_overleaf v2
+Latest changes: 17/09/26:
+- Fixed push_to_overleaf to back up tracked-but-modified paths before pulling
 """
 
 import os
@@ -26,16 +27,23 @@ def resolve_output_path(base_dir: str, subfolder: str, filename: str) -> str:
 
 def push_to_overleaf(repo_dir: str, paths: list[str], message: str) -> None:
     """Pulls repo_dir, stages paths, commits with message, and pushes to the Overleaf remote.
-    No-ops with a printed message if paths have no staged changes."""
-    untracked = subprocess.run(['git', '-C', repo_dir, 'ls-files', '--others', '--exclude-standard', *paths],
-                                capture_output=True, text=True, check=True).stdout.splitlines()
+    Local content on paths always wins over the pull. No-ops if there's nothing to push."""
+    dirty = {}
+    for path in paths:
+        status = subprocess.run(['git', '-C', repo_dir, 'status', '--porcelain', '--', path],
+                                 capture_output=True, text=True, check=True).stdout
+        if status.strip():
+            dirty[path] = status[:2]
 
     cached_bytes = {}
-    for rel_path in untracked:
+    for rel_path, code in dirty.items():
         abs_path = os.path.join(repo_dir, rel_path)
         with open(abs_path, 'rb') as f:
             cached_bytes[abs_path] = f.read()
-        os.remove(abs_path)
+        if code == '??':
+            os.remove(abs_path)
+        else:
+            subprocess.run(['git', '-C', repo_dir, 'checkout', 'HEAD', '--', rel_path], check=True)
 
     pull = subprocess.run(['git', '-C', repo_dir, 'pull'], capture_output=True, text=True)
     if pull.returncode != 0:
@@ -48,9 +56,9 @@ def push_to_overleaf(repo_dir: str, paths: list[str], message: str) -> None:
         with open(abs_path, 'wb') as f:
             f.write(content)
 
-    subprocess.run(['git', '-C', repo_dir, 'add', *paths], check=True)
+    subprocess.run(['git', '-C', repo_dir, 'add', '--', *paths], check=True)
 
-    status = subprocess.run(['git', '-C', repo_dir, 'status', '--porcelain', *paths],
+    status = subprocess.run(['git', '-C', repo_dir, 'status', '--porcelain', '--', *paths],
                              capture_output=True, text=True, check=True)
     if not status.stdout.strip():
         print('No changes to push.')

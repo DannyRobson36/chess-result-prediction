@@ -2,8 +2,8 @@
 utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
-Latest changes: 24/08/26:
-- Added material and title-strength helpers
+Latest changes: 17/09/26:
+- Shortened docstrings
 """
 
 import numpy as np
@@ -16,7 +16,8 @@ from dataclasses import dataclass
 # CONSTANTS
 ####################
 
-# Game phase
+# (a) GAME PHASE
+
 PAWN_PHASE = 0
 KNIGHT_PHASE = 1
 BISHOP_PHASE = 1
@@ -29,7 +30,8 @@ TOTAL_PHASE = (PAWN_PHASE * 16 + KNIGHT_PHASE * 4 + BISHOP_PHASE * 4
 OPENING_MAX_PHASE = 64
 MIDDLEGAME_MAX_PHASE = 192
 
-# Material values (pawns included, kings excluded)
+# (b) MATERIAL VALUES (pawns included, kings excluded)
+
 PAWN_VALUE = 1
 KNIGHT_VALUE = 3
 BISHOP_VALUE = 3
@@ -44,20 +46,25 @@ PIECE_VALUES = {
     chess.QUEEN: QUEEN_VALUE,
 }
 
-# Fen handling
+# (c) FEN HANDLING
+
 FEN_PAD = '.'
 BOARD_SEQ_LEN = 76
 FEN_CHARS = sorted(set('PNBRQKpnbrqk.wabcdefgh0123456789'))
 FEN_VOCAB = {'<pad>': 0, **{ch: i + 1 for i, ch in enumerate(FEN_CHARS)}}
 
-# Elo gap
+# (d) ELO GAP
+
 GAP_BIN_WIDTH = 10
 
-# Result encoding
-RESULT_TO_CLASS = {0.0: 0, 0.5: 1, 1.0: 2} 
+# (e) RESULT ENCODING
+
+RESULT_TO_CLASS = {0.0: 0, 0.5: 1, 1.0: 2}
 RESULT_CLASS_NAMES = ['loss', 'draw', 'win']
 
-# Title encoding. Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
+# (f) TITLE ENCODING
+
+# Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
 # lichess.org/qa/4451), rather than fit from train data, since it's a small, effectively
 # closed set. 'no_title' matches the label run_pos_storage.py substitutes for the raw 'None'
 # sentinel; 'unk' is a safety net for any value outside this vocabulary.
@@ -79,8 +86,10 @@ TITLE_TO_IDX = {
 }
 TITLE_VOCAB_SIZE = len(TITLE_TO_IDX)
 
-# Title strength, within-track only -- open and women's titles are separate scales and are
-# never compared directly. Higher = stronger. LM has no women's-track counterpart.
+# (g) TITLE STRENGTH
+
+# Within-track only -- open and women's titles are separate scales and are never compared
+# directly. Higher = stronger. LM has no women's-track counterpart.
 OPEN_TITLE_STRENGTH = {'GM': 6, 'IM': 5, 'FM': 4, 'CM': 3, 'NM': 2, 'LM': 1}
 WOMENS_TITLE_STRENGTH = {'WGM': 6, 'WIM': 5, 'WFM': 4, 'WCM': 3, 'WNM': 2}
 
@@ -206,13 +215,14 @@ def total_material(fen: str) -> int:
 
 
 def material_diff(fen: str) -> int:
-    """Mover-perspective signed material difference (mover minus opponent), standard values, pawns included."""
+    """Returns mover-perspective signed material difference (mover minus opponent), pawns included."""
     board, _ = _mover_perspective_board(fen)
     diff = 0
     for piece in board.piece_map().values():
         value = PIECE_VALUES.get(piece.piece_type, 0)
         diff += value if piece.color == chess.WHITE else -value
     return diff
+
 
 # (c) GENERAL CONVERSION FROM WHITE-MOVER PERSPECTIVE
 
@@ -313,7 +323,7 @@ def _res_better(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _find_threshold_crossing(bin_centres: list[float], values: list, target: float) -> float | None:
-    """Interpolates the gap value at which values first reaches target."""
+    """Interpolates the gap value at which values first reach target."""
     pairs = [(c, v) for c, v in zip(bin_centres, values) if v is not None]
     if not pairs:
         return None
@@ -330,7 +340,7 @@ def _find_threshold_crossing(bin_centres: list[float], values: list, target: flo
 
 
 def _compute_gap_threshold(group: pd.DataFrame, target_score: float, gap_bin_width: int) -> float | None:
-    """Fits the win-rate-by-gap curve for one bracket, finds where it crosses target_score."""
+    """Fits win-rate-by-gap for one bracket and returns where it crosses target_score."""
     nonzero = group[group['elo_gap'] > 0]
     if nonzero.empty:
         return None
@@ -443,9 +453,11 @@ def encode_result_continuous(mover_result: pd.Series) -> torch.Tensor:
     """Returns mover_result as a float32 tensor."""
     return torch.tensor(mover_result.to_numpy(), dtype=torch.float32)
 
+
 def encode_result_class(mover_result: pd.Series) -> torch.Tensor:
     """Maps mover_result (0/0.5/1) to a class index (loss/draw/win) tensor."""
     return torch.tensor(mover_result.map(RESULT_TO_CLASS).to_numpy(), dtype=torch.long)
+
 
 def decode_result_class(class_idx: np.ndarray | torch.Tensor | list[int]) -> list[str]:
     """Maps class indices (0/1/2) back to result names (loss/draw/win)."""

@@ -3,8 +3,8 @@ utils_eval.py
 Model-independent evaluation helpers: baselines, per-row metrics, binned accuracy, calibration,
 display-name mapping.
 
-Latest changes: 20/08/26:
-- Added resolve_display_name/resolve_display_names for legend labels
+Latest changes: 17/09/26:
+- Removed unused ordered-probit functions, moved target-encoding notes into docstrings
 """
 
 import numpy as np
@@ -18,6 +18,7 @@ from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, 
 # CONSTANTS
 ####################
 
+# Optimisation direction ('min'/'max') per metric name.
 METRIC_MODES = {'loss': 'min', 'log_loss': 'min', 'accuracy': 'max', 'macro_f1': 'max'}
 
 ####################
@@ -179,7 +180,7 @@ def apply_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 def fit_binary_temperature(logit: torch.Tensor, targets: torch.Tensor, max_iter: int = 100) -> float:
-    """Fits a single temperature for a binary model."""
+    """Fits a single temperature for a binary model, via fit_temperature."""
     two_class_logits = torch.stack([torch.zeros_like(logit), logit], dim=1)
     return fit_temperature(two_class_logits, targets, max_iter=max_iter)
 
@@ -190,51 +191,8 @@ def apply_binary_temperature(logit: torch.Tensor, temperature: float) -> torch.T
     return apply_temperature(two_class_logits, temperature)[:, 1]
 
 
-def _ordered_probit_probs(preds: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor,
-                           sigma: torch.Tensor) -> torch.Tensor:
-    """Returns W/D/L probabilities for scalar preds under cutpoints c1<c2 and scale sigma."""
-    z1 = (c1 - preds) / sigma
-    z2 = (c2 - preds) / sigma
-    cdf1 = 0.5 * (1.0 + torch.erf(z1 / np.sqrt(2.0)))
-    cdf2 = 0.5 * (1.0 + torch.erf(z2 / np.sqrt(2.0)))
-    p_loss = cdf1
-    p_draw = (cdf2 - cdf1).clamp(min=1e-8)
-    p_win = (1.0 - cdf2).clamp(min=1e-8)
-    return torch.stack([p_win, p_draw, p_loss.clamp(min=1e-8)], dim=1)
-
-
-def fit_ordered_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 200) -> tuple[float, float, float]:
-    """Fits two cutpoints to convert scalar predictions to W/D/L probabilities."""
-    preds_t = torch.as_tensor(preds, dtype=torch.float32)
-    targets_t = torch.as_tensor(targets, dtype=torch.long)
-    target_idx = 2 - targets_t  # RESULT_TO_CLASS is loss=0/draw=1/win=2; probs are win-first
-
-    c1 = torch.tensor(0.25, requires_grad=True)
-    log_gap = torch.tensor(float(np.log(0.5)), requires_grad=True)
-    log_sigma = torch.tensor(float(np.log(0.25)), requires_grad=True)
-    optimizer = torch.optim.LBFGS([c1, log_gap, log_sigma], lr=0.1, max_iter=max_iter)
-
-    def closure() -> torch.Tensor:
-        optimizer.zero_grad()
-        probs = _ordered_probit_probs(preds_t, c1, c1 + log_gap.exp(), log_sigma.exp())
-        loss = -torch.log(probs[torch.arange(len(target_idx)), target_idx]).mean()
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-    return float(c1.item()), float((c1 + log_gap.exp()).item()), float(log_sigma.exp().item())
-
-
-def apply_ordered_probit(preds: np.ndarray, params: tuple[float, float, float]) -> np.ndarray:
-    """Returns W/D/L probabilities for scalar preds under fitted ordered probit params."""
-    c1, c2, sigma = params
-    probs = _ordered_probit_probs(torch.as_tensor(preds, dtype=torch.float32),
-                                   torch.tensor(c1), torch.tensor(c2), torch.tensor(sigma))
-    return probs.detach().numpy()
-
-
 def _binary_probit_probs(preds: torch.Tensor, c: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Returns W/L probabilities for scalar preds under a single cutpoint c and scale sigma."""
+    """Returns win/loss probabilities for scalar preds under a single cutpoint c and scale sigma."""
     z = (c - preds) / sigma
     cdf = 0.5 * (1.0 + torch.erf(z / np.sqrt(2.0)))
     p_loss = cdf.clamp(min=1e-8)
@@ -243,10 +201,13 @@ def _binary_probit_probs(preds: torch.Tensor, c: torch.Tensor, sigma: torch.Tens
 
 
 def fit_binary_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 200) -> tuple[float, float]:
-    """Fits a single cutpoint to convert scalar predictions to W/L probabilities, on decisive-only targets."""
+    """Fits a single cutpoint to convert scalar predictions to win/loss probabilities, on decisive-only targets.
+
+    targets: encoded per TWO_WAY_CLASS_NAMES (loss=0, win=1).
+    """
     preds_t = torch.as_tensor(preds, dtype=torch.float32)
     targets_t = torch.as_tensor(targets, dtype=torch.long)
-    target_idx = 1 - targets_t  # TWO_WAY_CLASS_NAMES is loss=0/win=1; probs are win-first
+    target_idx = 1 - targets_t
 
     c = torch.tensor(float(preds_t.mean()), requires_grad=True)
     sigma_init = float(preds_t.std())
@@ -267,7 +228,7 @@ def fit_binary_probit(preds: np.ndarray, targets: np.ndarray, max_iter: int = 20
 
 
 def apply_binary_probit(preds: np.ndarray, params: tuple[float, float]) -> np.ndarray:
-    """Returns W/L probabilities for scalar preds under fitted binary probit params."""
+    """Returns win/loss probabilities for scalar preds under fitted binary probit params."""
     c, sigma = params
     probs = _binary_probit_probs(torch.as_tensor(preds, dtype=torch.float32),
                                   torch.tensor(c), torch.tensor(sigma))
@@ -275,16 +236,16 @@ def apply_binary_probit(preds: np.ndarray, params: tuple[float, float]) -> np.nd
 
 
 def collapse_to_expected_score(probs: np.ndarray | torch.Tensor) -> np.ndarray:
-    """Collapses (loss, draw, win)-ordered 3-way probabilities into a single continuous expected
-    score (win=1, draw=0.5, loss=0), matching the Elo/Maia2/Stockfish-eval convention."""
+    """Collapses (loss, draw, win)-ordered probabilities into a continuous expected score
+    (win=1, draw=0.5, loss=0), the Elo/Maia2/Stockfish-eval convention."""
     if isinstance(probs, torch.Tensor):
         probs = probs.detach().numpy()
     return probs[:, 2] + 0.5 * probs[:, 1]
 
 
 def binary_probit_prediction_cols(raw_scores: np.ndarray, probit_params: tuple[float, float]) -> dict:
-    """Returns prob_win/prob_draw/prob_loss/predicted_class from raw scalar scores under a fitted
-    binary probit. prob_draw is always 0.0."""
+    """Returns prob_win, prob_draw (always 0.0), prob_loss, and predicted_class from raw_scores
+    under a fitted binary probit."""
     probs = apply_binary_probit(raw_scores, probit_params)
     prob_win = probs[:, 0]
     prob_loss = probs[:, 1]

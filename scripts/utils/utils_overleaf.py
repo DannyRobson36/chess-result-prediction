@@ -4,7 +4,7 @@ Path resolution for saving figures/tables into subject-specific Overleaf subfold
 generated files to the Overleaf git remote.
 
 Latest changes: 17/09/26:
-- Fixed push_to_overleaf to back up tracked-but-modified paths before pulling
+- Docstring tightening
 """
 
 import os
@@ -17,7 +17,7 @@ import subprocess
 # (a) PATH RESOLUTION
 
 def resolve_output_path(base_dir: str, subfolder: str, filename: str) -> str:
-    """Returns the full path for filename under base_dir/subfolder, creating the subfolder if needed."""
+    """Returns the full path for filename under base_dir/subfolder."""
     out_dir = os.path.join(base_dir, subfolder)
     os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, filename)
@@ -26,8 +26,7 @@ def resolve_output_path(base_dir: str, subfolder: str, filename: str) -> str:
 # (b) OVERLEAF SYNC
 
 def push_to_overleaf(repo_dir: str, paths: list[str], message: str) -> None:
-    """Pulls repo_dir, stages paths, commits with message, and pushes to the Overleaf remote.
-    Local content on paths always wins over the pull. No-ops if there's nothing to push."""
+    """Pulls repo_dir, stages paths, commits with message, and pushes to the Overleaf remote."""
     dirty = {}
     for path in paths:
         status = subprocess.run(['git', '-C', repo_dir, 'status', '--porcelain', '--', path],

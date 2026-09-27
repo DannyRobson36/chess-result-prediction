@@ -2,15 +2,16 @@
 utils_chess.py
 Chess-specific helpers: FEN parsing, board encoding, material/phase computation.
 
-Latest changes: 17/09/26:
-- Shortened docstrings
+Latest changes: 27/09/26:
+- Docstring tightening & reordering
 """
 
+from dataclasses import dataclass
+
+import chess
 import numpy as np
 import pandas as pd
 import torch
-import chess
-from dataclasses import dataclass
 
 ####################
 # CONSTANTS
@@ -64,10 +65,7 @@ RESULT_CLASS_NAMES = ['loss', 'draw', 'win']
 
 # (f) TITLE ENCODING
 
-# Fixed vocabulary matching Lichess's title set (lichess.org/help/master,
-# lichess.org/qa/4451), rather than fit from train data, since it's a small, effectively
-# closed set. 'no_title' matches the label run_pos_storage.py substitutes for the raw 'None'
-# sentinel; 'unk' is a safety net for any value outside this vocabulary.
+# Fixed Lichess title vocabulary, unk for anything else
 TITLE_TO_IDX = {
     'no_title': 0,
     'GM': 1,
@@ -88,8 +86,7 @@ TITLE_VOCAB_SIZE = len(TITLE_TO_IDX)
 
 # (g) TITLE STRENGTH
 
-# Within-track only -- open and women's titles are separate scales and are never compared
-# directly. Higher = stronger. LM has no women's-track counterpart.
+# Within-track title strength, higher = stronger
 OPEN_TITLE_STRENGTH = {'GM': 6, 'IM': 5, 'FM': 4, 'CM': 3, 'NM': 2, 'LM': 1}
 WOMENS_TITLE_STRENGTH = {'WGM': 6, 'WIM': 5, 'WFM': 4, 'WCM': 3, 'WNM': 2}
 
@@ -97,10 +94,10 @@ WOMENS_TITLE_STRENGTH = {'WGM': 6, 'WIM': 5, 'WFM': 4, 'WCM': 3, 'WNM': 2}
 # FUNCTIONS
 ####################
 
-# (a) FEN CONVERSIONS INTO MODEL INPUT - MOVER PERSPECTIVE, NOT WHITE
+# (a) FEN TO MOVER-PERSPECTIVE MODEL INPUT
 
 def _mover_perspective_board(fen: str) -> tuple[chess.Board, bool]:
-    """Parses a FEN and mirrors the board so the side to move is always white."""
+    """Parses FEN, mirrors so mover is white."""
     board = chess.Board(fen)
     mover_is_white = board.turn == chess.WHITE
     if not mover_is_white:
@@ -109,7 +106,7 @@ def _mover_perspective_board(fen: str) -> tuple[chess.Board, bool]:
 
 
 def fen_to_tensor(fen: str) -> torch.Tensor:
-    """Converts a FEN string into an (18, 8, 8) mover-perspective input tensor."""
+    """Returns (18, 8, 8) mover-perspective board tensor."""
     board, mover_is_white = _mover_perspective_board(fen)
 
     arr = np.zeros((18, 8, 8), dtype=np.float32)
@@ -136,7 +133,7 @@ def fen_to_tensor(fen: str) -> torch.Tensor:
 
 
 def fen_to_char_string(fen: str) -> str:
-    """Expands a mover-perspective FEN into a fixed-length (76-char) board+metadata character string."""
+    """Returns 76-char mover-perspective board+metadata string."""
     board, _ = _mover_perspective_board(fen)
     board_fen, active, castling, ep, halfmove, fullmove = board.fen().split(' ')
 
@@ -159,13 +156,13 @@ def fen_to_char_string(fen: str) -> str:
 
 
 def fen_to_token_ids(fen: str) -> torch.Tensor:
-    """Converts a FEN into a LongTensor of FEN_VOCAB indices."""
+    """Returns FEN_VOCAB token ids as LongTensor."""
     ids = [FEN_VOCAB.get(ch, 0) for ch in fen_to_char_string(fen)]
     return torch.tensor(ids, dtype=torch.long)
 
 
 def fen_to_legal_dest(fen: str) -> torch.Tensor:
-    """Converts a FEN into a (64,) mover-perspective legal-move-destination multi-hot tensor."""
+    """Returns (64,) mover-perspective legal-destination multi-hot."""
     board, _ = _mover_perspective_board(fen)
     arr = np.zeros(64, dtype=np.float32)
     for move in board.legal_moves:
@@ -174,7 +171,7 @@ def fen_to_legal_dest(fen: str) -> torch.Tensor:
 
 
 def fen_to_attacked_squares(fen: str) -> torch.Tensor:
-    """Converts a FEN into a (2, 64) mover-perspective attacked-squares tensor: row 0 mover, row 1 opponent."""
+    """Returns (2, 64) attacked squares, row 0 mover, row 1 opponent."""
     board, _ = _mover_perspective_board(fen)
     arr = np.zeros((2, 64), dtype=np.float32)
     for square, piece in board.piece_map().items():
@@ -187,7 +184,7 @@ def fen_to_attacked_squares(fen: str) -> torch.Tensor:
 # (b) COMPUTE GAME PHASE & MATERIAL FROM FEN
 
 def game_phase(fen: str) -> int:
-    """Computes a material-based game phase score from a FEN (0 = full material, 256 = bare endgame)."""
+    """Returns material-based phase, 0 full material to 256 bare endgame."""
     placement = fen.split(' ', 1)[0]
     minor_major = (
         (placement.count('N') + placement.count('n')) * KNIGHT_PHASE
@@ -200,7 +197,7 @@ def game_phase(fen: str) -> int:
 
 
 def phase_label(phase: int) -> str:
-    """Buckets a game phase score into opening, middlegame, or endgame."""
+    """Buckets phase into opening, middlegame, endgame."""
     if phase <= OPENING_MAX_PHASE:
         return 'opening'
     elif phase <= MIDDLEGAME_MAX_PHASE:
@@ -209,13 +206,13 @@ def phase_label(phase: int) -> str:
 
 
 def total_material(fen: str) -> int:
-    """Sums standard piece values (pawns included, kings excluded) for both sides from a FEN."""
+    """Sums piece values for both sides, kings excluded."""
     board = chess.Board(fen)
     return sum(PIECE_VALUES.get(piece.piece_type, 0) for piece in board.piece_map().values())
 
 
 def material_diff(fen: str) -> int:
-    """Returns mover-perspective signed material difference (mover minus opponent), pawns included."""
+    """Returns mover minus opponent material."""
     board, _ = _mover_perspective_board(fen)
     diff = 0
     for piece in board.piece_map().values():
@@ -227,7 +224,7 @@ def material_diff(fen: str) -> int:
 # (c) GENERAL CONVERSION FROM WHITE-MOVER PERSPECTIVE
 
 def to_mover_perspective(df: pd.DataFrame, column: str, mover_is_white_col: str = 'mover_is_white') -> pd.DataFrame:
-    """Flips a white-perspective column's sign to mover perspective based on mover_is_white."""
+    """Flips sign of white-perspective column to mover perspective."""
     df = df.copy()
     is_white = df[mover_is_white_col].to_numpy()
     df[column] = np.where(is_white, df[column].to_numpy(), -df[column].to_numpy())
@@ -235,8 +232,8 @@ def to_mover_perspective(df: pd.DataFrame, column: str, mover_is_white_col: str 
 
 
 def to_mover_opponent_perspective(df: pd.DataFrame, white_col: str, black_col: str,
-                                   mover_is_white_col: str = 'mover_is_white') -> pd.DataFrame:
-    """Replaces a white/black column pair with perspective-flipped mover/opponent columns."""
+                                  mover_is_white_col: str = 'mover_is_white') -> pd.DataFrame:
+    """Replaces white/black column pair with mover/opponent columns."""
     mover_col = white_col.replace('white', 'mover')
     opponent_col = black_col.replace('black', 'opponent')
 
@@ -255,7 +252,7 @@ def to_mover_opponent_perspective(df: pd.DataFrame, white_col: str, black_col: s
 
 @dataclass(frozen=True)
 class EloBinConfig:
-    """Elo bin edges: lower, upper, step, and whether tails are open."""
+    """Elo bin edges and open-tail flag."""
     lower: int = 800
     upper: int = 2200
     step: int = 200
@@ -265,7 +262,7 @@ ELO_BINS = EloBinConfig()
 
 
 def elo_bin_edges(cfg: EloBinConfig = ELO_BINS) -> list[float]:
-    """Returns bin edges from cfg, with open tails if cfg.tails."""
+    """Returns bin edges, open tails if cfg.tails."""
     edges = list(range(cfg.lower, cfg.upper + 1, cfg.step))
     if cfg.tails:
         edges = [-np.inf] + edges + [np.inf]
@@ -273,7 +270,7 @@ def elo_bin_edges(cfg: EloBinConfig = ELO_BINS) -> list[float]:
 
 
 def elo_bin_labels(edges: list[float]) -> list[str]:
-    """Returns a display label per bin, e.g. '<800', '800-999', '>=2200'."""
+    """Returns display label per bin, e.g. '<800', '800-999'."""
     labels = []
     for i in range(len(edges) - 1):
         lo, hi = edges[i], edges[i + 1]
@@ -286,10 +283,11 @@ def elo_bin_labels(edges: list[float]) -> list[str]:
     return labels
 
 
-def elo_bin_by_mover(df: pd.DataFrame, cfg: EloBinConfig = ELO_BINS, method: str = 'mean') -> tuple[pd.DataFrame, list[float]]:
-    """Bins games by elo (mean of mover/opponent, or mover-only) into cfg's edges."""
+def elo_bin_by_mover(df: pd.DataFrame, cfg: EloBinConfig = ELO_BINS,
+                     method: str = 'mean') -> tuple[pd.DataFrame, list[float]]:
+    """Adds elo_bin column, by mean or mover elo."""
     if method not in ('mean', 'mover'):
-        raise ValueError(f"method must be 'mean' or 'mover', got {method!r}")
+        raise ValueError(f'method must be mean or mover, got {method!r}')
 
     edges = elo_bin_edges(cfg)
     df = df.copy()
@@ -306,7 +304,7 @@ def elo_bin_by_mover(df: pd.DataFrame, cfg: EloBinConfig = ELO_BINS, method: str
 # (e) ELO-GAP RESTRICTION AND GAME-ID FILTERING
 
 def _dedup_to_game_level(df: pd.DataFrame, game_id_col: str = 'game_id') -> pd.DataFrame:
-    """Collapses position-level rows to one row per game_id."""
+    """Collapses rows to one per game_id."""
     n_before = len(df)
     game_df = df.drop_duplicates(subset=game_id_col).copy()
     if len(game_df) != n_before:
@@ -315,15 +313,15 @@ def _dedup_to_game_level(df: pd.DataFrame, game_id_col: str = 'game_id') -> pd.D
 
 
 def _res_better(df: pd.DataFrame) -> pd.DataFrame:
-    """Adds res_better: the result from the higher-elo player's perspective."""
+    """Adds res_better, result from higher-elo player's side."""
     df = df.copy()
     df['res_better'] = np.where(df['mover_elo'] >= df['opponent_elo'],
-                                 df['mover_result'], 1 - df['mover_result'])
+                                df['mover_result'], 1 - df['mover_result'])
     return df
 
 
 def _find_threshold_crossing(bin_centres: list[float], values: list, target: float) -> float | None:
-    """Interpolates the gap value at which values first reach target."""
+    """Interpolates gap where values first reach target."""
     pairs = [(c, v) for c, v in zip(bin_centres, values) if v is not None]
     if not pairs:
         return None
@@ -340,7 +338,7 @@ def _find_threshold_crossing(bin_centres: list[float], values: list, target: flo
 
 
 def _compute_gap_threshold(group: pd.DataFrame, target_score: float, gap_bin_width: int) -> float | None:
-    """Fits win-rate-by-gap for one bracket and returns where it crosses target_score."""
+    """Returns gap where bracket's res_better crosses target_score."""
     nonzero = group[group['elo_gap'] > 0]
     if nonzero.empty:
         return None
@@ -354,11 +352,11 @@ def _compute_gap_threshold(group: pd.DataFrame, target_score: float, gap_bin_wid
 
 
 def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, cfg: EloBinConfig = ELO_BINS,
-                            game_id_col: str = 'game_id', gap_bin_width: int = GAP_BIN_WIDTH,
-                            on_missing: str = 'keep_all') -> dict:
-    """Fits per-elo-bracket gap thresholds at which the higher-elo player reaches target_score."""
+                           game_id_col: str = 'game_id', gap_bin_width: int = GAP_BIN_WIDTH,
+                           on_missing: str = 'keep_all') -> dict:
+    """Fits per-bracket gap where higher-elo player reaches target_score."""
     if on_missing not in ('keep_all', 'drop_all'):
-        raise ValueError(f"on_missing must be 'keep_all' or 'drop_all', got {on_missing!r}")
+        raise ValueError(f'on_missing must be keep_all or drop_all, got {on_missing!r}')
 
     game_df = _dedup_to_game_level(df_train, game_id_col)
     binned, edges = elo_bin_by_mover(game_df, cfg, method='mean')
@@ -390,13 +388,13 @@ def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, cfg: Elo
         thresholds[i] = t
 
     if used_global_fallback:
-        print(f'\n{len(used_global_fallback)} bracket(s) had no own threshold; fell back to global ({global_threshold}):')
+        print(f'\n{len(used_global_fallback)} bracket(s) had no own threshold, fell back to global ({global_threshold}):')
         for i, label, n in used_global_fallback:
             print(f'  bin {i} ({label}): n={n:,} games in bracket')
 
     if used_hardcoded_fallback:
-        print(f"\n{len(used_hardcoded_fallback)} bracket(s) had NO own threshold AND no usable global fallback; "
-              f"used on_missing='{on_missing}' (threshold={fallback_value}):")
+        print(f'\n{len(used_hardcoded_fallback)} bracket(s) had no own threshold and no global fallback, '
+              f'used on_missing={on_missing!r} (threshold={fallback_value}):')
         for i, label, n in used_hardcoded_fallback:
             print(f'  bin {i} ({label}): n={n:,} games in bracket')
 
@@ -413,7 +411,7 @@ def fit_elo_gap_thresholds(df_train: pd.DataFrame, target_score: float, cfg: Elo
 
 
 def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool = True) -> list:
-    """Returns the game_ids passing the fitted elo-gap thresholds."""
+    """Returns game_ids within fitted gap thresholds."""
     fit_cfg = fit_result['config']
     thresholds = fit_result['thresholds']
     game_id_col = fit_cfg['game_id_col']
@@ -443,36 +441,36 @@ def apply_elo_gap_thresholds(df: pd.DataFrame, fit_result: dict, verbose: bool =
 
 
 def filter_by_game_ids(df: pd.DataFrame, game_ids: list, game_id_col: str = 'game_id') -> pd.DataFrame:
-    """Filters df to rows whose game_id_col is in game_ids."""
+    """Filters df to rows in game_ids."""
     return df[df[game_id_col].isin(game_ids)].reset_index(drop=True)
 
 
 # (f) RESULT ENCODING
 
 def encode_result_continuous(mover_result: pd.Series) -> torch.Tensor:
-    """Returns mover_result as a float32 tensor."""
+    """Returns mover_result as float32 tensor."""
     return torch.tensor(mover_result.to_numpy(), dtype=torch.float32)
 
 
 def encode_result_class(mover_result: pd.Series) -> torch.Tensor:
-    """Maps mover_result (0/0.5/1) to a class index (loss/draw/win) tensor."""
+    """Maps mover_result to loss/draw/win class tensor."""
     return torch.tensor(mover_result.map(RESULT_TO_CLASS).to_numpy(), dtype=torch.long)
 
 
 def decode_result_class(class_idx: np.ndarray | torch.Tensor | list[int]) -> list[str]:
-    """Maps class indices (0/1/2) back to result names (loss/draw/win)."""
+    """Maps class indices to result names."""
     return [RESULT_CLASS_NAMES[int(c)] for c in class_idx]
 
 
 # (g) TITLE ENCODING
 
 def encode_title_idx(title: pd.Series) -> np.ndarray:
-    """Maps a title Series to TITLE_TO_IDX indices as a plain int64 array."""
+    """Maps titles to TITLE_TO_IDX, unknown to unk."""
     return title.astype('object').map(TITLE_TO_IDX).fillna(TITLE_TO_IDX['unk']).to_numpy(dtype='int64')
 
 
 def title_track(title: str) -> str | None:
-    """Returns 'open', 'womens', or None (untitled/BOT/unrecognized) for a title string."""
+    """Returns 'open', 'womens', or None."""
     if title in OPEN_TITLE_STRENGTH:
         return 'open'
     if title in WOMENS_TITLE_STRENGTH:
@@ -481,7 +479,7 @@ def title_track(title: str) -> str | None:
 
 
 def title_strength(title: str) -> int | None:
-    """Returns the within-track strength rank for title, or None if untitled/unrecognized."""
+    """Returns within-track strength rank, or None."""
     if title in OPEN_TITLE_STRENGTH:
         return OPEN_TITLE_STRENGTH[title]
     return WOMENS_TITLE_STRENGTH.get(title)

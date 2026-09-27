@@ -1,10 +1,9 @@
 """
 features.py
-Builds model-ready SplitData from raw dataframes: scaling, elo binning.
-Also builds SplitData for new (inference) data from an already-fitted PrepConfig.
+Builds model-ready SplitData from raw dataframes, and from new data via a fitted PrepConfig.
 
-Latest changes: 27/08/26:
-- Corrected to full version
+Latest changes: 27/09/26:
+- Docstring tightening
 """
 
 import json
@@ -67,7 +66,7 @@ TOTAL_LENGTH_FLAG_MAPPING = {'600+0': 0, '600+5': 0, '900+10': 1}
 CHUNK_SIZE = 1_000_000
 BOARD_TENSOR_SHAPE = (18, 8, 8)
 
-# Board/token-tensor writing mode -> (write_boards, write_board_token_ids).
+# Board mode -> (write_boards, write_board_token_ids)
 BOARD_MODE_REGISTRY: dict[str, tuple[bool, bool]] = {
     'none': (False, False),
     'boards_only': (True, False),
@@ -75,22 +74,22 @@ BOARD_MODE_REGISTRY: dict[str, tuple[bool, bool]] = {
     'both': (True, True),
 }
 
-# Centipawn -> win-probability sigmoid constant (the Lichess win% curve).
+# Lichess cp -> win-probability sigmoid constant
 WIN_PCT_CONST = 0.00368208
 
-# Sentinel mover-perspective eval for a forced mate (positive if mate favors the mover).
+# Mover-perspective eval for forced mate, positive if mover mates
 MATE_SCORE_MOVER = 5_000
 
-# Per-engine hash size in MB for stockfish evaluation workers.
+# Stockfish hash size per engine, MB
 HASH_MB_PER_ENGINE = 16
 
-# Timeout in seconds for one position's stockfish analysis before a same-depth retry.
+# Stockfish timeout per position attempt, seconds
 ATTEMPT_TIMEOUT_SECONDS = 120
 
-# Starting Elo rating for a new Lichess account.
+# Starting elo for new Lichess account
 NEW_USER_STARTING_ELO = 1500
 
-# Exponent for the clip-then-power clock/hours-since transforms.
+# Exponent for clip-then-power transforms
 POW_EXPONENT = 0.3
 
 ####################
@@ -107,7 +106,7 @@ def cp_to_mover_winprob(cp: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
 # (b) SCALING TRANSFORMS
 
 def _fit_raw(pooled_train: np.ndarray) -> dict:
-    """Empty stats for the raw transform."""
+    """Returns empty stats for raw transform."""
     return {}
 
 
@@ -117,66 +116,66 @@ def _apply_raw(vals: np.ndarray, stats: dict) -> np.ndarray:
 
 
 def _fit_normal(pooled_train: np.ndarray) -> dict:
-    """Mean and std for z-score scaling."""
+    """Returns mean and std."""
     return {'mu': float(pooled_train.mean()), 'sigma': float(pooled_train.std())}
 
 
 def _apply_normal(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Z-score scales vals using fitted mu/sigma."""
+    """Z-scores vals with fitted mu/sigma."""
     return ((vals - stats['mu']) / stats['sigma']).astype('float32')
 
 
 def _fit_log_norm(pooled_train: np.ndarray) -> dict:
-    """Mean and std of log1p(vals) for log scaling."""
+    """Returns mean and std of log1p(vals)."""
     log_vals = np.log1p(pooled_train)
     return {'mu': float(log_vals.mean()), 'sigma': float(log_vals.std())}
 
 
 def _apply_log_norm(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Log1p then z-score scales vals using fitted mu/sigma."""
+    """Log1p then z-scores vals."""
     return ((np.log1p(vals) - stats['mu']) / stats['sigma']).astype('float32')
 
 
 def _fit_centered(pooled_train: np.ndarray) -> dict:
-    """Min and max for scaling to [-1, 1]."""
+    """Returns min and max."""
     return {'lo': float(pooled_train.min()), 'hi': float(pooled_train.max())}
 
 
 def _apply_centered(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Rescales vals to [-1, 1] using fitted lo/hi."""
+    """Rescales vals to [-1, 1] with fitted lo/hi."""
     span = stats['hi'] - stats['lo'] if stats['hi'] > stats['lo'] else 1.0
     return (2 * ((vals - stats['lo']) / span) - 1).astype('float32')
 
 
 def _fit_log_centered(pooled_train: np.ndarray) -> dict:
-    """Min and max of log1p(vals) for scaling to [-1, 1]."""
+    """Returns min and max of log1p(vals)."""
     log_vals = np.log1p(pooled_train)
     return {'lo': float(log_vals.min()), 'hi': float(log_vals.max())}
 
 
 def _apply_log_centered(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Log1p then rescales vals to [-1, 1] using fitted lo/hi."""
+    """Log1p then rescales vals to [-1, 1]."""
     span = stats['hi'] - stats['lo'] if stats['hi'] > stats['lo'] else 1.0
     return (2 * ((np.log1p(vals) - stats['lo']) / span) - 1).astype('float32')
 
 
 def _fit_pow_clock(pooled_train: np.ndarray) -> dict:
-    """Empty stats for the clip-then-power clock transform."""
+    """Returns empty stats for pow clock transform."""
     return {}
 
 
 def _apply_pow_clock(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Clips vals to [0, 1], then raises to POW_EXPONENT."""
+    """Clips vals to [0, 1], raises to POW_EXPONENT."""
     return (np.clip(vals, 0.0, 1.0) ** POW_EXPONENT).astype('float32')
 
 
 def _fit_pow_hours(pooled_train: np.ndarray) -> dict:
-    """Empty stats for the clip-then-power hours-since transform."""
+    """Returns empty stats for pow hours transform."""
     return {}
 
 
 def _apply_pow_hours(vals: np.ndarray, stats: dict) -> np.ndarray:
-    """Clips vals to [0, 1], then raises to POW_EXPONENT."""
+    """Clips vals to [0, 1], raises to POW_EXPONENT."""
     return (np.clip(vals, 0.0, 1.0) ** POW_EXPONENT).astype('float32')
 
 
@@ -191,12 +190,13 @@ _TRANS_FIT_APPLY = {
 }
 
 
-def _resolve_trans_name(scale_dict: dict | None, key: str, trans_map: dict[str, str], group_label: str) -> tuple[str, str]:
-    """Looks up and validates the transform name for key."""
+def _resolve_trans_name(scale_dict: dict | None, key: str, trans_map: dict[str, str],
+                        group_label: str) -> tuple[str, str]:
+    """Returns validated (trans_name, base_trans) for key."""
     trans_name = (scale_dict or {}).get(key, 'raw')
     if trans_name not in trans_map:
         raise ValueError(f'{group_label}[{key!r}]: unknown trans_name {trans_name!r}, '
-                          f'choose from {sorted(trans_map)}.')
+                         f'choose from {sorted(trans_map)}.')
     return trans_name, trans_map[trans_name]
 
 
@@ -206,13 +206,13 @@ def _validate_scale_keys(scale_dict: dict | None, expected_keys: set[str], group
         return
     unknown = set(scale_dict) - set(expected_keys)
     if unknown:
-        raise ValueError(f'{group_label} has unrecognized key(s) {sorted(unknown)}; '
-                          f'expected only {sorted(expected_keys)}.')
+        raise ValueError(f'{group_label} has unrecognized key(s) {sorted(unknown)}, '
+                         f'expected only {sorted(expected_keys)}.')
 
 
 def _fit_apply_pooled(train_mover_raw: np.ndarray, train_opponent_raw: np.ndarray, per_split_raw: dict,
-                       trans_name: str, base_trans: str, group_label: str) -> tuple[dict, dict]:
-    """Fits base_trans on pooled train arrays, applies to every split/side array."""
+                      trans_name: str, base_trans: str, group_label: str) -> tuple[dict, dict]:
+    """Fits base_trans on pooled train, applies to every split and side."""
     fit_fn, apply_fn = _TRANS_FIT_APPLY[base_trans]
     pooled = np.concatenate([train_mover_raw, train_opponent_raw])
     stats = fit_fn(pooled)
@@ -224,7 +224,7 @@ def _fit_apply_pooled(train_mover_raw: np.ndarray, train_opponent_raw: np.ndarra
 
 
 def _apply_stored_stats(raw: np.ndarray, stats: dict) -> np.ndarray:
-    """Applies a previously-fitted transform's apply function using its stored trans_name/stats."""
+    """Applies stored fitted transform to raw."""
     base_trans = _TRANS_NAME_TO_BASE[stats['trans_name']]
     apply_fn = _TRANS_FIT_APPLY[base_trans][1]
     return apply_fn(raw, stats)
@@ -233,11 +233,11 @@ def _apply_stored_stats(raw: np.ndarray, stats: dict) -> np.ndarray:
 # (c) COLUMN GROUP RESOLUTION
 
 def _match_one(cols: list[str], keyword: str, group_label: str) -> str:
-    """Returns the one column containing keyword, or raises."""
+    """Returns single column containing keyword, or raises."""
     matches = [c for c in cols if keyword in c]
     if len(matches) != 1:
         raise ValueError(f'{group_label}: expected exactly one column containing {keyword!r} '
-                          f'in {cols}, found {matches}.')
+                         f'in {cols}, found {matches}.')
     return matches[0]
 
 
@@ -260,8 +260,9 @@ def _resolve_clock_cols(clock_cols: list[str]) -> tuple[str, str, str]:
     return mover_col, opponent_col, remaining[0]
 
 
-def _clock_props(df: pd.DataFrame, mover_col: str, opponent_col: str, time_control_col: str) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (mover, opponent) clock time remaining as a proportion of total game time."""
+def _clock_props(df: pd.DataFrame, mover_col: str, opponent_col: str,
+                 time_control_col: str) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (mover, opponent) clock as proportion of game time."""
     game_time = df[time_control_col].map(SEC_MAPPING).to_numpy(dtype='float64')
     mover = df[mover_col].to_numpy(dtype='float64') / game_time
     opponent = df[opponent_col].to_numpy(dtype='float64') / game_time
@@ -269,38 +270,39 @@ def _clock_props(df: pd.DataFrame, mover_col: str, opponent_col: str, time_contr
 
 
 def _resolve_past_cols(past_cols: list[str]) -> dict[str, str]:
-    """Resolves past_cols to a dict of named columns."""
+    """Resolves past_cols to dict of named columns."""
     if len(past_cols) not in (2, 4, 6):
         raise ValueError(f'past_cols must have 2, 4, or 6 entries, got {len(past_cols)}: {past_cols}.')
     past_group = [c for c in past_cols if 'past' in c]
     hours_group = [c for c in past_cols if 'hours' in c]
     result_group = [c for c in past_cols if 'result' in c]
     if len(past_group) != 2:
-        raise ValueError(f"past_cols: expected exactly 2 'past' columns, found {past_group} in {past_cols}.")
+        raise ValueError(f'past_cols: expected exactly 2 past columns, found {past_group} in {past_cols}.')
     out = {
         'past_mover': _match_one(past_group, 'mover', 'past_cols (past)'),
         'past_opponent': _match_one(past_group, 'opponent', 'past_cols (past)'),
     }
     if len(past_cols) >= 4:
         if len(hours_group) != 2:
-            raise ValueError(f"past_cols: expected exactly 2 'hours' columns, found {hours_group} in {past_cols}.")
+            raise ValueError(f'past_cols: expected exactly 2 hours columns, found {hours_group} in {past_cols}.')
         out['hours_since_mover'] = _match_one(hours_group, 'mover', 'past_cols (hours)')
         out['hours_since_opponent'] = _match_one(hours_group, 'opponent', 'past_cols (hours)')
     if len(past_cols) == 6:
         if len(result_group) != 2:
-            raise ValueError(f"past_cols: expected exactly 2 'result' columns, found {result_group} in {past_cols}.")
+            raise ValueError(f'past_cols: expected exactly 2 result columns, found {result_group} in {past_cols}.')
         out['last_result_mover'] = _match_one(result_group, 'mover', 'past_cols (result)')
         out['last_result_opponent'] = _match_one(result_group, 'opponent', 'past_cols (result)')
     return out
 
 
 def _has_history_mask(df: pd.DataFrame, hours_since_col: str) -> np.ndarray:
-    """Boolean mask of rows with a non-missing hours-since value."""
+    """Returns mask of rows with non-missing hours-since."""
     return pd.to_numeric(df[hours_since_col], errors='coerce').notna().to_numpy()
 
 
-def _hours_since_props(df: pd.DataFrame, mover_col: str, opponent_col: str, max_hours: float) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (mover, opponent) hours-since-last-game as a proportion of max_hours, missing values filled to max_hours."""
+def _hours_since_props(df: pd.DataFrame, mover_col: str, opponent_col: str,
+                       max_hours: float) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (mover, opponent) hours-since as proportion of max_hours, missing as 1."""
     mover = pd.to_numeric(df[mover_col], errors='coerce').fillna(max_hours).to_numpy(dtype='float64') / max_hours
     opponent = pd.to_numeric(df[opponent_col], errors='coerce').fillna(max_hours).to_numpy(dtype='float64') / max_hours
     return mover, opponent
@@ -335,18 +337,18 @@ def _resolve_title_cols(title_cols: list[str]) -> tuple[str, str]:
 
 
 def _validate_time_control(values: pd.Series, valid_keys: Iterable[str]) -> None:
-    """Checks time_control values are all in valid_keys."""
+    """Raises on time_control values outside valid_keys."""
     unknown = set(values.unique()) - set(valid_keys)
     if unknown:
-        raise ValueError(f'time_control contains unrecognized value(s) {sorted(unknown)}; '
-                          f'expected only {sorted(valid_keys)}.')
+        raise ValueError(f'time_control contains unrecognized value(s) {sorted(unknown)}, '
+                         f'expected only {sorted(valid_keys)}.')
 
 
 # (d) ELO BINNING FOR SPLITS
 
 def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
-                     cfg: EloBinConfig = ELO_BINS) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, list[str]]:
-    """Bins mover, opponent, and mean elo into cfg's edges."""
+                    cfg: EloBinConfig = ELO_BINS) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, list[str]]:
+    """Bins mover, opponent and mean elo into cfg edges."""
     edges = elo_bin_edges(cfg)
     n_bins = len(edges) - 1
     labels = elo_bin_labels(edges)
@@ -361,12 +363,12 @@ def _bin_elo_splits(mover_elo: pd.Series, opponent_elo: pd.Series,
 
 # (e) STOCKFISH EVALUATION
 
+# Per-worker persistent engine handle
 _engine = None
-# Per-worker persistent engine handle, set by _stockfish_init_worker inside each pool process.
 
 
 def _ensure_stockfish_installed(engine_path: str) -> None:
-    """Installs stockfish via apt-get if engine_path doesn't already exist, raising if that fails."""
+    """Installs stockfish via apt-get if engine_path missing."""
     if os.path.exists(engine_path):
         return
     install = subprocess.run(['apt-get', 'install', '-y', 'stockfish'], capture_output=True, text=True)
@@ -375,20 +377,20 @@ def _ensure_stockfish_installed(engine_path: str) -> None:
 
 
 def _stockfish_start_engine() -> chess.engine.SimpleEngine:
-    """Starts one stockfish engine process for this worker."""
+    """Starts one stockfish engine."""
     engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
     engine.configure({'Threads': 1, 'Hash': HASH_MB_PER_ENGINE})
     return engine
 
 
 def _stockfish_init_worker() -> None:
-    """Starts this worker's persistent engine, stored in the module-level _engine global."""
+    """Starts worker's persistent engine into _engine."""
     global _engine
     _engine = _stockfish_start_engine()
 
 
 def _stockfish_restart_engine() -> None:
-    """Closes and restarts this worker's engine after a timeout or error."""
+    """Closes and restarts worker's engine."""
     global _engine
     try:
         _engine.close()
@@ -400,13 +402,13 @@ def _stockfish_restart_engine() -> None:
     _engine = _stockfish_start_engine()
 
 
-def _stockfish_alarm_handler(signum, frame) -> None:
-    """SIGALRM handler that converts a timeout into a _StockfishTimeout."""
+def _stockfish_alarm_handler(signum: int, frame: object) -> None:
+    """Raises _StockfishTimeout on SIGALRM."""
     raise _StockfishTimeout()
 
 
 def _stockfish_analyse_one(args: tuple[str, int]) -> float:
-    """Evaluates one fen at depth via this worker's persistent engine, mover-perspective centipawns."""
+    """Returns mover-perspective cp for one fen at depth."""
     fen, depth = args
     board = chess.Board(fen)
     mover_is_white = board.turn
@@ -437,7 +439,7 @@ def _stockfish_analyse_one(args: tuple[str, int]) -> float:
 
 
 def _stockfish_eval_fens(fens: np.ndarray, depth: int) -> np.ndarray:
-    """Evaluates every fen at depth via a multiprocessing pool of persistent engines, mover-perspective cp."""
+    """Returns mover-perspective cp for every fen, via worker pool."""
     _ensure_stockfish_installed(STOCKFISH_PATH)
 
     tasks = [(fen, depth) for fen in fens]
@@ -454,26 +456,25 @@ def _stockfish_eval_fens(fens: np.ndarray, depth: int) -> np.ndarray:
 # (f) DISK PERSISTENCE
 
 def _rss_gb() -> float:
-    """Returns the current process's resident memory usage in GB."""
+    """Returns process RSS in GB."""
     return psutil.Process().memory_info().rss / (1024 ** 3)
 
 
 def _resolve_board_mode(board_mode: str) -> tuple[bool, bool]:
-    """Returns (write_boards, write_board_token_ids) for board_mode, from BOARD_MODE_REGISTRY."""
+    """Returns (write_boards, write_board_token_ids) for board_mode."""
     if board_mode not in BOARD_MODE_REGISTRY:
-        raise ValueError(f"Unknown board_mode '{board_mode}', choose from {list(BOARD_MODE_REGISTRY)}")
+        raise ValueError(f'Unknown board_mode {board_mode!r}, choose from {list(BOARD_MODE_REGISTRY)}')
     return BOARD_MODE_REGISTRY[board_mode]
 
 
 def _preallocate_npy(path: str, shape: tuple, dtype: type) -> np.memmap:
-    """Creates a disk-backed .npy array at path, preallocated to shape/dtype."""
+    """Creates preallocated disk-backed .npy at path."""
     return np.lib.format.open_memmap(path, mode='w+', dtype=dtype, shape=shape)
 
 
 def _write_boards_tokens_and_aux(split_dir: str, fens: np.ndarray, desc: str, chunk_size: int,
-                                  write_boards: bool, write_tokens: bool, aux_targets: bool) -> None:
-    """Encodes fens row by row directly into preallocated boards/board_token_ids/aux-target .npy
-    files, flushing silently every chunk_size rows."""
+                                 write_boards: bool, write_tokens: bool, aux_targets: bool) -> None:
+    """Encodes fens into boards, token ids and aux-target .npy files."""
     if not write_boards and not write_tokens and not aux_targets:
         return
 
@@ -483,11 +484,11 @@ def _write_boards_tokens_and_aux(split_dir: str, fens: np.ndarray, desc: str, ch
     token_ids_mm = (_preallocate_npy(os.path.join(split_dir, 'board_token_ids.npy'), (n_rows, BOARD_SEQ_LEN), np.uint8)
                     if write_tokens else None)
     legal_dest_mm = (_preallocate_npy(os.path.join(split_dir, 'legal_dest.npy'), (n_rows, 64), np.bool_)
-                      if aux_targets else None)
+                     if aux_targets else None)
     attacked_mover_mm = (_preallocate_npy(os.path.join(split_dir, 'attacked_mover.npy'), (n_rows, 64), np.bool_)
-                          if aux_targets else None)
+                         if aux_targets else None)
     attacked_opponent_mm = (_preallocate_npy(os.path.join(split_dir, 'attacked_opponent.npy'), (n_rows, 64), np.bool_)
-                             if aux_targets else None)
+                            if aux_targets else None)
 
     for i in tqdm(range(n_rows), desc=desc, unit='rows'):
         if write_boards:
@@ -519,10 +520,10 @@ def _write_boards_tokens_and_aux(split_dir: str, fens: np.ndarray, desc: str, ch
 
 
 def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: np.ndarray, elo_oppo_bin: np.ndarray,
-                         features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
-                         n_elo_bins: int, bin_labels: list, game_id: list, fen: list,
-                         has_boards: bool, has_board_token_ids: bool, has_aux_targets: bool) -> None:
-    """Writes elo bins, features, targets, meta.json, and ids.json (game_id/fen) to split_dir."""
+                        features: dict, result_class: torch.Tensor, result_cont: torch.Tensor,
+                        n_elo_bins: int, bin_labels: list, game_id: list, fen: list,
+                        has_boards: bool, has_board_token_ids: bool, has_aux_targets: bool) -> None:
+    """Writes elo bins, features, targets, meta.json and ids.json to split_dir."""
     np.save(os.path.join(split_dir, 'elo_mean_bin.npy'), elo_mean_bin.astype(np.uint8))
     np.save(os.path.join(split_dir, 'elo_self_bin.npy'), elo_self_bin.astype(np.uint8))
     np.save(os.path.join(split_dir, 'elo_oppo_bin.npy'), elo_oppo_bin.astype(np.uint8))
@@ -544,7 +545,7 @@ def _write_split_arrays(split_dir: str, elo_mean_bin: np.ndarray, elo_self_bin: 
 
 
 def load_split(split_dir: str) -> 'SplitData':
-    """Loads SplitData from split_dir, memory-mapped (game_id/fen loaded fully, not memory-mapped)."""
+    """Loads memory-mapped SplitData from split_dir."""
     def _mmap_path(path: str) -> torch.Tensor:
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message='.*not writable.*', category=UserWarning)
@@ -588,24 +589,22 @@ def load_split(split_dir: str) -> 'SplitData':
 # (g) DATA PREP PIPELINE
 
 def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.DataFrame, *,
-                    mover_result_col: str,
-                    out_dir: str,
-                    fen_col: str = 'fen',
-                    game_id_col: str = 'game_id',
-                    elo_cols: list[str] | None = None, elo_scale: dict | None = None,
-                    clock_cols: list[str] | None = None, clock_scale: dict | None = None,
-                    past_cols: list[str] | None = None, past_scale: dict | None = None,
-                    color_cols: list[str] | None = None, color_scale: dict | None = None,
-                    ply_cols: list[str] | None = None, ply_scale: dict | None = None,
-                    rematch_cols: list[str] | None = None, rematch_scale: dict | None = None,
-                    title_cols: list[str] | None = None, title_scale: dict | None = None,
-                    cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
-                    board_mode: str = 'both', aux_targets: bool = False,
-                    sf_depth: int | None = None, sf_scale: dict | None = None,
-                    ) -> tuple['SplitData', 'SplitData', 'SplitData', 'PrepConfig']:
-    """Builds, saves, and memory-maps train/val/val_wl SplitData; returns a PrepConfig for reapplying
-    to new data. df_val drives training/early-stopping and temperature fitting; df_val_wl is a
-    separate, decisive-only (no-draw) sample used only for probit calibration fitting."""
+                   mover_result_col: str,
+                   out_dir: str,
+                   fen_col: str = 'fen',
+                   game_id_col: str = 'game_id',
+                   elo_cols: list[str] | None = None, elo_scale: dict | None = None,
+                   clock_cols: list[str] | None = None, clock_scale: dict | None = None,
+                   past_cols: list[str] | None = None, past_scale: dict | None = None,
+                   color_cols: list[str] | None = None, color_scale: dict | None = None,
+                   ply_cols: list[str] | None = None, ply_scale: dict | None = None,
+                   rematch_cols: list[str] | None = None, rematch_scale: dict | None = None,
+                   title_cols: list[str] | None = None, title_scale: dict | None = None,
+                   cfg: EloBinConfig = ELO_BINS, chunk_size: int = CHUNK_SIZE,
+                   board_mode: str = 'both', aux_targets: bool = False,
+                   sf_depth: int | None = None, sf_scale: dict | None = None,
+                   ) -> tuple['SplitData', 'SplitData', 'SplitData', 'PrepConfig']:
+    """Builds, saves and memory-maps train/val/val_wl SplitData, returns PrepConfig."""
     if elo_cols is None or elo_scale is None:
         raise ValueError('elo_cols and elo_scale are mandatory.')
 
@@ -624,10 +623,10 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
     train_mover_raw = df_train[mover_elo_col].to_numpy(dtype='float64')
     train_opponent_raw = df_train[opponent_elo_col].to_numpy(dtype='float64')
     per_split_raw = {name: {'mover': df[mover_elo_col].to_numpy(dtype='float64'),
-                             'opponent': df[opponent_elo_col].to_numpy(dtype='float64')}
-                      for name, df in dfs.items()}
+                            'opponent': df[opponent_elo_col].to_numpy(dtype='float64')}
+                     for name, df in dfs.items()}
     scaled, stats = _fit_apply_pooled(train_mover_raw, train_opponent_raw, per_split_raw,
-                                       trans_name, base_trans, 'elo_scale')
+                                      trans_name, base_trans, 'elo_scale')
     scaling_stats['pooled_elo'] = stats
     for name in dfs:
         features[name]['mover_elo_unscaled'] = per_split_raw[name]['mover'].astype('float32')
@@ -657,7 +656,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
 
         trans_name, base_trans = _resolve_trans_name(clock_scale, 'pooled_clock', _CLOCK_TRANS, 'clock_scale')
         scaled, stats = _fit_apply_pooled(train_mover_prop, train_opponent_prop, per_split_prop,
-                                           trans_name, base_trans, 'clock_scale')
+                                          trans_name, base_trans, 'clock_scale')
         scaling_stats['pooled_clock'] = stats
         for name in dfs:
             features[name]['mover_clock_unscaled'] = per_split_prop[name]['mover'].astype('float32')
@@ -694,13 +693,13 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
         has_history = None
         if has_hours:
             has_history = {name: {'mover': _has_history_mask(df, resolved['hours_since_mover']),
-                                   'opponent': _has_history_mask(df, resolved['hours_since_opponent'])}
-                            for name, df in dfs.items()}
+                                  'opponent': _has_history_mask(df, resolved['hours_since_opponent'])}
+                           for name, df in dfs.items()}
 
         trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_past', _PAST_TRANS, 'past_scale')
         per_split_raw = {name: {'mover': df[resolved['past_mover']].to_numpy(dtype='float64'),
-                                 'opponent': df[resolved['past_opponent']].to_numpy(dtype='float64')}
-                          for name, df in dfs.items()}
+                                'opponent': df[resolved['past_opponent']].to_numpy(dtype='float64')}
+                         for name, df in dfs.items()}
 
         no_history_fill = None
         fit_raw = per_split_raw
@@ -717,7 +716,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             }
 
         scaled, stats = _fit_apply_pooled(fit_raw['train']['mover'], fit_raw['train']['opponent'], fit_raw,
-                                           trans_name, base_trans, 'past_scale')
+                                          trans_name, base_trans, 'past_scale')
         if no_history_fill is not None:
             stats['no_history_fill'] = no_history_fill
         scaling_stats['pooled_past'] = stats
@@ -740,7 +739,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
                 o_elo = df[opponent_elo_col].to_numpy(dtype='float64')
 
                 for side, notna, elo in (('mover', has_history[name]['mover'], m_elo),
-                                          ('opponent', has_history[name]['opponent'], o_elo)):
+                                         ('opponent', has_history[name]['opponent'], o_elo)):
                     hist_raw = notna.astype('float64')
                     features[name][f'has_history_{side}_unscaled'] = hist_raw.astype('float32')
                     features[name][f'has_history_{side}_scaled'] = hist_apply_fn(hist_raw, {})
@@ -760,12 +759,12 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             per_split_prop = {}
             for name, df in dfs.items():
                 m, o = _hours_since_props(df, resolved['hours_since_mover'], resolved['hours_since_opponent'],
-                                           train_max_hours)
+                                          train_max_hours)
                 per_split_prop[name] = {'mover': m, 'opponent': o}
 
             trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_hours_since', _HOURS_TRANS, 'past_scale')
             scaled, stats = _fit_apply_pooled(per_split_prop['train']['mover'], per_split_prop['train']['opponent'],
-                                               per_split_prop, trans_name, base_trans, 'past_scale')
+                                              per_split_prop, trans_name, base_trans, 'past_scale')
             stats['max_hours'] = float(train_max_hours)
             scaling_stats['pooled_hours_since'] = stats
             for name in dfs:
@@ -774,13 +773,11 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
                 features[name]['hours_since_mover_scaled'] = scaled[name]['mover']
                 features[name]['hours_since_opponent_scaled'] = scaled[name]['opponent']
         else:
-            print("past_cols has 2 entries, has_history_mover/opponent not created "
-                  "(no NaN signal survives in past_mover/past_opponent to derive it from); "
-                  "past no-history correction skipped for the same reason.")
+            print('past_cols has 2 entries, has_history and no-history correction skipped.')
 
         if len(past_cols) == 6:
             trans_name, base_trans = _resolve_trans_name(past_scale, 'pooled_last_result',
-                                                           _LAST_RESULT_TRANS, 'past_scale')
+                                                         _LAST_RESULT_TRANS, 'past_scale')
 
             def _last_result_filled(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
                 m = pd.to_numeric(df[resolved['last_result_mover']], errors='coerce').fillna(0.5).to_numpy(dtype='float64')
@@ -794,7 +791,7 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
                 per_split_raw[name] = {'mover': m, 'opponent': o}
 
             scaled, stats = _fit_apply_pooled(train_mover_raw, train_opponent_raw, per_split_raw,
-                                               trans_name, base_trans, 'past_scale')
+                                              trans_name, base_trans, 'past_scale')
             scaling_stats['pooled_last_result'] = stats
             for name in dfs:
                 features[name]['last_result_mover_unscaled'] = per_split_raw[name]['mover'].astype('float32')
@@ -858,9 +855,10 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
             raise ValueError('title_scale is required whenever title_cols is given.')
         _validate_scale_keys(title_scale, {'pooled_title'}, 'title_scale')
         if 'pooled_title' not in title_scale:
-            raise ValueError("title_scale must include 'pooled_title': 'cat'.")
-        if title_scale['pooled_title'] != 'cat':
-            raise ValueError(f"title_scale['pooled_title'] must be 'cat', got {title_scale['pooled_title']!r}.")
+            raise ValueError('title_scale must include pooled_title: cat.')
+        pooled_title = title_scale['pooled_title']
+        if pooled_title != 'cat':
+            raise ValueError(f'title_scale pooled_title must be cat, got {pooled_title!r}.')
         title_mover_col, title_opponent_col = _resolve_title_cols(title_cols)
         for name, df in dfs.items():
             m_idx = encode_title_idx(df[title_mover_col]).astype('float32')
@@ -904,8 +902,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
 
         fens = df[fen_col].to_numpy()
         _write_boards_tokens_and_aux(split_dir, fens, desc=f'{name} boards/tokens/aux', chunk_size=chunk_size,
-                                      write_boards=write_boards, write_tokens=write_tokens,
-                                      aux_targets=aux_targets)
+                                     write_boards=write_boards, write_tokens=write_tokens,
+                                     aux_targets=aux_targets)
 
         elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = elo_bins[name]
         _write_split_arrays(
@@ -961,8 +959,8 @@ def prepare_splits(df_train: pd.DataFrame, df_val: pd.DataFrame, df_val_wl: pd.D
 
 
 def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str,
-                           chunk_size: int = CHUNK_SIZE) -> 'SplitData':
-    """Applies an already-fitted PrepConfig to new raw data, returning a memory-mapped SplitData."""
+                          chunk_size: int = CHUNK_SIZE) -> 'SplitData':
+    """Applies fitted PrepConfig to new data, returns memory-mapped SplitData."""
     required = [prep_cfg.mover_result_col, prep_cfg.fen_col, prep_cfg.game_id_col,
                 prep_cfg.mover_elo_col, prep_cfg.opponent_elo_col]
     if prep_cfg.mover_clock_col is not None:
@@ -999,7 +997,7 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
     if prep_cfg.mover_clock_col is not None:
         _validate_time_control(df[prep_cfg.time_control_col], SEC_MAPPING.keys())
         mover_prop, opponent_prop = _clock_props(df, prep_cfg.mover_clock_col, prep_cfg.opponent_clock_col,
-                                                  prep_cfg.time_control_col)
+                                                 prep_cfg.time_control_col)
         features['mover_clock_unscaled'] = mover_prop.astype('float32')
         features['opponent_clock_unscaled'] = opponent_prop.astype('float32')
         features['mover_clock_scaled'] = _apply_stored_stats(mover_prop, stats['pooled_clock'])
@@ -1045,7 +1043,7 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
 
             max_hours = stats['pooled_hours_since']['max_hours']
             m_hours, o_hours = _hours_since_props(df, resolved['hours_since_mover'], resolved['hours_since_opponent'],
-                                                   max_hours)
+                                                  max_hours)
             features['hours_since_mover_unscaled'] = m_hours.astype('float32')
             features['hours_since_opponent_unscaled'] = o_hours.astype('float32')
             features['hours_since_mover_scaled'] = _apply_stored_stats(m_hours, stats['pooled_hours_since'])
@@ -1106,8 +1104,8 @@ def apply_prepared_splits(df: pd.DataFrame, prep_cfg: 'PrepConfig', out_dir: str
 
     fens = df[prep_cfg.fen_col].to_numpy()
     _write_boards_tokens_and_aux(out_dir, fens, desc='boards/tokens/aux', chunk_size=chunk_size,
-                                  write_boards=write_boards, write_tokens=write_tokens,
-                                  aux_targets=prep_cfg.aux_targets)
+                                 write_boards=write_boards, write_tokens=write_tokens,
+                                 aux_targets=prep_cfg.aux_targets)
 
     elo_mean_bin, elo_self_bin, elo_oppo_bin, n_elo_bins, bin_labels = _bin_elo_splits(
         df[prep_cfg.mover_elo_col], df[prep_cfg.opponent_elo_col], prep_cfg.cfg)
@@ -1167,7 +1165,7 @@ class SplitData:
 
 @dataclass
 class PrepConfig:
-    """Resolved column names, transform choices, and fitted scaling stats needed to reapply prepare_splits to new data."""
+    """Resolved columns, transforms and fitted stats for reapplying prepare_splits."""
     mover_result_col: str
     fen_col: str
     game_id_col: str
@@ -1201,4 +1199,4 @@ class PrepConfig:
 # (b) STOCKFISH INTERNAL CONTROL FLOW
 
 class _StockfishTimeout(Exception):
-    """Raised when a single position's stockfish analysis exceeds ATTEMPT_TIMEOUT_SECONDS."""
+    """Raised when stockfish exceeds ATTEMPT_TIMEOUT_SECONDS."""

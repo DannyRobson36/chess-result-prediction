@@ -2,8 +2,8 @@
 model_support.py
 Building blocks for models
 
-Latest changes: 20/08/26:
-- Altered positioning in TokenAuxHead
+Latest changes: 27/09/26:
+- Docstring tightening
 """
 
 import torch
@@ -37,13 +37,13 @@ CATEGORICAL_BASE_NAMES = {"mover_title", "opponent_title"}
 # (a) REGISTRY-BACKED BUILDERS
 
 def get_activation(name: str) -> nn.Module:
-    """Returns an instantiated activation module by name."""
+    """Returns activation module by name."""
     if name not in ACTIVATION_REGISTRY:
         raise ValueError(f"Unknown activation '{name}', choose from {list(ACTIVATION_REGISTRY)}")
     return ACTIVATION_REGISTRY[name]()
 
 def build_pool(pool_type: str, dim: int, dropout: float | None = None) -> nn.Module:
-    """Builds a pooling module by name from POOL_REGISTRY; dropout must be None unless pool_type is 'attn'."""
+    """Builds pooling module by name, dropout only for attn."""
     if pool_type not in POOL_REGISTRY:
         raise ValueError(f"Unknown pool_type '{pool_type}', choose from {list(POOL_REGISTRY)}")
     if pool_type == "mean" and dropout is not None:
@@ -53,7 +53,7 @@ def build_pool(pool_type: str, dim: int, dropout: float | None = None) -> nn.Mod
     return POOL_REGISTRY[pool_type](dim, dropout)
 
 def build_cnn_block(block_type: str, planes: int, kernel_size: int, activation: str) -> nn.Module:
-    """Builds a CNN residual block by name from CNN_BLOCK_REGISTRY."""
+    """Builds CNN residual block by name."""
     if block_type not in CNN_BLOCK_REGISTRY:
         raise ValueError(f"Unknown cnn_block_type '{block_type}', choose from {list(CNN_BLOCK_REGISTRY)}")
     return CNN_BLOCK_REGISTRY[block_type](planes, kernel_size, activation)
@@ -61,7 +61,7 @@ def build_cnn_block(block_type: str, planes: int, kernel_size: int, activation: 
 # (b) FEATURE TOKEN HELPERS
 
 def resolve_active_features(features_dict: dict) -> list[str]:
-    """Returns active '<base>_scaled'/'<base>_unscaled' keys from a features dict."""
+    """Returns active _scaled/_unscaled feature keys."""
     features_dict = features_dict or {}
     active = [name for name, on in features_dict.items() if on]
 
@@ -83,17 +83,17 @@ def resolve_active_features(features_dict: dict) -> list[str]:
 
 
 def _is_binary_feature(name: str) -> bool:
-    """True if name's base (stripped of its _scaled/_unscaled suffix) is a binary feature."""
+    """True if name's base is binary."""
     return name.rsplit("_", 1)[0] in BINARY_BASE_NAMES
 
 
 def _is_categorical_feature(name: str) -> bool:
-    """True if name's base is a multi-class categorical feature."""
+    """True if name's base is categorical."""
     return name.rsplit("_", 1)[0] in CATEGORICAL_BASE_NAMES
 
 
 def build_feature_embeds(feature_names: list[str], dim_vit: int) -> nn.ModuleDict:
-    """Returns one embedding/linear module per feature; mover/opponent title share one embedding."""
+    """Returns embedding/linear per feature, titles share one embedding."""
     embeds = {}
     title_embed = None
     for name in feature_names:
@@ -109,7 +109,7 @@ def build_feature_embeds(feature_names: list[str], dim_vit: int) -> nn.ModuleDic
 
 
 def embed_feature(feature_embeds: nn.ModuleDict, name: str, val: torch.Tensor) -> torch.Tensor:
-    """Embeds one feature column into a (b, 1, dim_vit) token."""
+    """Embeds one feature into (b, 1, dim_vit) token."""
     if _is_binary_feature(name) or _is_categorical_feature(name):
         return feature_embeds[name](val.long()).unsqueeze(1)
     return feature_embeds[name](val.unsqueeze(-1)).unsqueeze(1)
@@ -117,7 +117,7 @@ def embed_feature(feature_embeds: nn.ModuleDict, name: str, val: torch.Tensor) -
 # (c) RAW FEATURE STACKING
 
 def stack_raw_features(feature_names: list[str], features: dict) -> torch.Tensor:
-    """Stacks each named feature's raw per-row scalar value into one (b, n_features) tensor."""
+    """Stacks raw features into (b, n_features) tensor."""
     return torch.stack([features[name].float() for name in feature_names], dim=1)
 
 ####################
@@ -127,7 +127,7 @@ def stack_raw_features(feature_names: list[str], features: dict) -> torch.Tensor
 # (a) CNN RES-NET BLOCKS
 
 class BasicBlock(nn.Module):
-    """Residual block: 2x (conv -> bn -> activation) plus a skip connection, Maia2-style.
+    """Residual block, 2x (conv -> bn -> activation) plus skip.
     Out: (b, planes, h, w).
     """
     def __init__(self, planes, kernel_size=3, activation="relu"):
@@ -151,7 +151,7 @@ CNN_BLOCK_REGISTRY = {
 }
 
 class ChessCNN(nn.Module):
-    """CNN trunk: board tensor to vit_length feature maps of shape (8, 8).
+    """CNN trunk, board tensor to vit_length feature maps.
     Out: (b, vit_length, 8, 8).
     """
     def __init__(self, cfg):
@@ -177,7 +177,7 @@ class ChessCNN(nn.Module):
 # (b) ATTENTION
 
 class Attention(nn.Module):
-    """Multi-head self-attention, with an optional elo-derived offset added to the query.
+    """Multi-head self-attention, optional elo offset on query.
     Out: (b, n, dim).
     """
     def __init__(self, dim, heads, dim_head, elo_dim=None, dropout=0.1):
@@ -214,7 +214,7 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 class RotaryEmbedding(nn.Module):
-    """Precomputes rotary (RoPE) cos/sin caches for q/k rotation.
+    """Applies RoPE rotation from cached cos/sin.
     Out: (b, h, n, dim_head), same shape as input.
     """
     def __init__(self, dim, max_seq_len=128):
@@ -235,7 +235,7 @@ class RotaryEmbedding(nn.Module):
         return x * cos + rotated * sin
 
 class RotaryAttention(nn.Module):
-    """Multi-head self-attention; RoPE applied to the first n_rotary tokens, rest pass through unrotated.
+    """Multi-head self-attention, RoPE on first n_rotary tokens.
     Out: (b, n, dim).
     """
     def __init__(self, dim, heads, dim_head, n_rotary, dropout=0.1):
@@ -287,7 +287,7 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 class MeanPool(nn.Module):
-    """Unweighted average over the token dimension.
+    """Mean over tokens.
     Out: (b, n, d) -> (b, d).
     """
     def __init__(self, dim=None, dropout=None):
@@ -297,7 +297,7 @@ class MeanPool(nn.Module):
         return x.mean(dim=1)
 
 class AttentionPool(nn.Module):
-    """Single learned query attends over all tokens to produce one pooled vector.
+    """Learned-query attention pooling over tokens.
     Out: (b, n, d) -> (b, d).
     """
     def __init__(self, dim, dropout=0.1):
@@ -328,8 +328,7 @@ POOL_REGISTRY = {
 # (d) AUXILIARY HEADS
 
 class TokenAuxHead(nn.Module):
-    """Per-token linear projection of (b, 64, dim_vit) FEN-order board-square tokens to a
-    legal_dest/attacked_mover/attacked_opponent auxiliary output.
+    """Per-token projection of board-square tokens to 3 aux maps.
     Out: (b, 3, 64).
     """
     def __init__(self, dim_vit):
@@ -342,8 +341,7 @@ class TokenAuxHead(nn.Module):
         return self.proj(x).transpose(1, 2)[:, :, self.perm]
 
 class SpatialAuxHead(nn.Module):
-    """1x1 conv projection of (b, vit_length, 8, 8) CNN output to a legal_dest/attacked_mover/
-    attacked_opponent auxiliary output.
+    """1x1 conv projection of CNN output to 3 aux maps.
     Out: (b, 3, 64).
     """
     def __init__(self, vit_length):

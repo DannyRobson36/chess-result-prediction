@@ -1,431 +1,353 @@
 """
-model_arch.py
-Contains all models using PyTorch
+model_support.py
+Building blocks for models
 
-Latest changes: 27/08/26:
-- Dropout organisation changed, transformer's meta tokens embedded with board (not features)
+Latest changes: 27/09/26:
+- Docstring tightening
 """
 
 import torch
 import torch.nn as nn
-from collections.abc import Callable
+import torch.nn.functional as F
 
-from scripts.utils.utils_chess import FEN_VOCAB, BOARD_SEQ_LEN
-
-from scripts.models.model_support import (
-    ChessCNN, Attention,
-    RotaryAttention, FeedForward,
-    build_pool, get_activation, resolve_active_features,
-    build_feature_embeds, embed_feature, stack_raw_features,
-    TokenAuxHead, SpatialAuxHead,
-)
-
-from scripts.models.model_config import (
-    BaseModelConfig,
-    LogRegBaselineConfig,
-    Maia2ValueBoardConfig, Maia2ValueFeatureConfig,
-    Maia2ValueReplicaConfig, PureTransformerConfig
-)
+from scripts.utils.utils_chess import TITLE_VOCAB_SIZE
 
 ####################
 # CONSTANTS
 ####################
 
-OUTPUT_TYPE_REGISTRY = {
-    "log_reg_baseline": "classification",
-    "maia2_value_board": "regression",
-    "maia2_value_replica": "regression",
-    "maia2_value_feature": "classification",
-    "pure_transformer": "classification",
+ACTIVATION_REGISTRY = {
+    "relu": nn.ReLU,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
 }
+
+BINARY_BASE_NAMES = {
+    "inc_flag", "total_length_flag", "mover_is_white",
+    "has_history_mover", "has_history_opponent",
+    "new_player_mover", "new_player_opponent",
+}
+
+CATEGORICAL_BASE_NAMES = {"mover_title", "opponent_title"}
 
 ####################
 # FUNCTIONS
 ####################
 
-def get_output_type(arch_name: str) -> str:
-    """Returns 'regression' or 'classification' for arch_name."""
-    if arch_name not in OUTPUT_TYPE_REGISTRY:
-        raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(OUTPUT_TYPE_REGISTRY)}")
-    return OUTPUT_TYPE_REGISTRY[arch_name]
+# (a) REGISTRY-BACKED BUILDERS
 
-def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None) -> dict:
-    """Returns the extra constructor kwargs (beyond cfg) that arch_name needs."""
-    if arch_name == "maia2_value_replica":
-        if n_elo_bins is None:
-            raise ValueError("maia2_value_replica requires n_elo_bins.")
-        return {"n_elo_bins": n_elo_bins}
-    if arch_name in ("maia2_value_feature", "pure_transformer", "log_reg_baseline"):
-        return {"n_result_classes": 3}
-    return {}
+def get_activation(name: str) -> nn.Module:
+    """Returns activation module by name."""
+    if name not in ACTIVATION_REGISTRY:
+        raise ValueError(f"Unknown activation '{name}', choose from {list(ACTIVATION_REGISTRY)}")
+    return ACTIVATION_REGISTRY[name]()
+
+def build_pool(pool_type: str, dim: int, dropout: float | None = None) -> nn.Module:
+    """Builds pooling module by name, dropout only for attn."""
+    if pool_type not in POOL_REGISTRY:
+        raise ValueError(f"Unknown pool_type '{pool_type}', choose from {list(POOL_REGISTRY)}")
+    if pool_type == "mean" and dropout is not None:
+        raise ValueError("pool_dropout was set but pool_type is 'mean', which has no dropout to apply.")
+    if pool_type == "attn" and dropout is None:
+        dropout = 0.1
+    return POOL_REGISTRY[pool_type](dim, dropout)
+
+def build_cnn_block(block_type: str, planes: int, kernel_size: int, activation: str) -> nn.Module:
+    """Builds CNN residual block by name."""
+    if block_type not in CNN_BLOCK_REGISTRY:
+        raise ValueError(f"Unknown cnn_block_type '{block_type}', choose from {list(CNN_BLOCK_REGISTRY)}")
+    return CNN_BLOCK_REGISTRY[block_type](planes, kernel_size, activation)
+
+# (b) FEATURE TOKEN HELPERS
+
+def resolve_active_features(features_dict: dict) -> list[str]:
+    """Returns active _scaled/_unscaled feature keys."""
+    features_dict = features_dict or {}
+    active = [name for name, on in features_dict.items() if on]
+
+    bases_seen = {}
+    for name in active:
+        if name.endswith("_scaled"):
+            base = name[: -len("_scaled")]
+        elif name.endswith("_unscaled"):
+            base = name[: -len("_unscaled")]
+        else:
+            raise ValueError(f"cfg.features key {name!r} must end in '_scaled' or '_unscaled'.")
+        bases_seen.setdefault(base, []).append(name)
+
+    collisions = {b: v for b, v in bases_seen.items() if len(v) > 1}
+    if collisions:
+        raise ValueError(f"cfg.features has both scaled and unscaled True for: {collisions} -- choose one.")
+
+    return active
+
+
+def _is_binary_feature(name: str) -> bool:
+    """True if name's base is binary."""
+    return name.rsplit("_", 1)[0] in BINARY_BASE_NAMES
+
+
+def _is_categorical_feature(name: str) -> bool:
+    """True if name's base is categorical."""
+    return name.rsplit("_", 1)[0] in CATEGORICAL_BASE_NAMES
+
+
+def build_feature_embeds(feature_names: list[str], dim_vit: int) -> nn.ModuleDict:
+    """Returns embedding/linear per feature, titles share one embedding."""
+    embeds = {}
+    title_embed = None
+    for name in feature_names:
+        if _is_categorical_feature(name):
+            if title_embed is None:
+                title_embed = nn.Embedding(TITLE_VOCAB_SIZE, dim_vit)
+            embeds[name] = title_embed
+        elif _is_binary_feature(name):
+            embeds[name] = nn.Embedding(2, dim_vit)
+        else:
+            embeds[name] = nn.Linear(1, dim_vit)
+    return nn.ModuleDict(embeds)
+
+
+def embed_feature(feature_embeds: nn.ModuleDict, name: str, val: torch.Tensor) -> torch.Tensor:
+    """Embeds one feature into (b, 1, dim_vit) token."""
+    if _is_binary_feature(name) or _is_categorical_feature(name):
+        return feature_embeds[name](val.long()).unsqueeze(1)
+    return feature_embeds[name](val.unsqueeze(-1)).unsqueeze(1)
+
+# (c) RAW FEATURE STACKING
+
+def stack_raw_features(feature_names: list[str], features: dict) -> torch.Tensor:
+    """Stacks raw features into (b, n_features) tensor."""
+    return torch.stack([features[name].float() for name in feature_names], dim=1)
 
 ####################
 # CLASSES
 ####################
 
-# (a) LOGISTIC REGRESSION (BASELINES)
+# (a) CNN RES-NET BLOCKS
 
-class LogRegBaseline(nn.Module):
-    """Plain logistic regression baseline: a single linear layer over raw scalar feature values."""
-    def __init__(self, cfg: LogRegBaselineConfig, n_result_classes: int = 3):
-        super().__init__()
-        if n_result_classes not in (2, 3):
-            raise ValueError(f"n_result_classes must be 2 or 3, got {n_result_classes}.")
-
-        self.cfg = cfg
-        self.feature_names = resolve_active_features(cfg.features)
-        self.linear = nn.Linear(len(self.feature_names), n_result_classes)
-
-    def forward(self, features: dict):
-        x = stack_raw_features(self.feature_names, features)
-        return self.linear(x)
-
-
-# (b) CNN/ATTENTION BASED MODELS
-
-class Maia2ValueBoard(nn.Module):
-    """Elo-unaware ablation of Maia2ValueReplica."""
-    def __init__(self, cfg: Maia2ValueBoardConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.cnn = ChessCNN(cfg)
-        self.to_patch_embedding = nn.Sequential(
-            nn.Linear(8 * 8, cfg.dim_vit),
-            nn.LayerNorm(cfg.dim_vit),
-        )
-        self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-
-        ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
-        self.attn_blocks = nn.ModuleList([
-            nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
-            ])
-            for _ in range(cfg.n_vit_layer)
-        ])
-        self.norm = nn.LayerNorm(cfg.dim_vit)
-        self.pool = build_pool(cfg.pool_type, cfg.dim_vit, cfg.pool_dropout)
-        self.last_ln = nn.LayerNorm(cfg.dim_vit)
-
-        self.value_hidden = nn.Linear(cfg.dim_vit, cfg.value_hidden_dim)
-        self.value_act = get_activation(cfg.value_activation)
-        self.value_dropout = nn.Dropout(cfg.value_dropout)
-        self.value_out = nn.Linear(cfg.value_hidden_dim, 1)
-
-    def forward(self, boards):
-        b = boards.size(0)
-        feats = self.cnn(boards)
-        feats = feats.view(b, feats.size(1), 8 * 8)
-        x = self.to_patch_embedding(feats)
-        x = x + self.pos_embedding
-        x = self.board_embed_dropout(x)
-
-        for attn, ff in self.attn_blocks:
-            x = attn(x) + x
-            x = ff(x) + x
-        x = self.pool(self.norm(x))
-        x = self.last_ln(x)
-
-        value_hidden = self.value_dropout(self.value_act(self.value_hidden(x)))
-        value_pred = self.value_out(value_hidden).squeeze(-1)
-        return value_pred
-
-
-class Maia2ValueReplica(nn.Module):
-    """Non-exact replica of Maia2, value head only."""
-    def __init__(self, cfg: Maia2ValueReplicaConfig, n_elo_bins: int):
-        super().__init__()
-        self.cfg = cfg
-        self.cnn = ChessCNN(cfg)
-        self.to_patch_embedding = nn.Sequential(
-            nn.Linear(8 * 8, cfg.dim_vit),
-            nn.LayerNorm(cfg.dim_vit),
-        )
-        self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-
-        self.elo_embedding = nn.Embedding(n_elo_bins, cfg.elo_dim)
-        ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
-        self.attn_blocks = nn.ModuleList([
-            nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, elo_dim=cfg.elo_dim * 2, dropout=cfg.trunk_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
-            ])
-            for _ in range(cfg.n_vit_layer)
-        ])
-        self.norm = nn.LayerNorm(cfg.dim_vit)
-        self.pool = build_pool(cfg.pool_type, cfg.dim_vit, cfg.pool_dropout)
-        self.last_ln = nn.LayerNorm(cfg.dim_vit)
-
-        self.value_hidden = nn.Linear(cfg.dim_vit, cfg.value_hidden_dim)
-        self.value_act = get_activation(cfg.value_activation)
-        self.value_dropout = nn.Dropout(cfg.value_dropout)
-        self.value_out = nn.Linear(cfg.value_hidden_dim, 1)
-
-    def forward(self, boards, elo_self_bin, elo_oppo_bin):
-        b = boards.size(0)
-        feats = self.cnn(boards)
-        feats = feats.view(b, feats.size(1), 8 * 8)
-        x = self.to_patch_embedding(feats)
-        x = x + self.pos_embedding
-        x = self.board_embed_dropout(x)
-
-        elo_emb = torch.cat([self.elo_embedding(elo_self_bin), self.elo_embedding(elo_oppo_bin)], dim=1)
-
-        for attn, ff in self.attn_blocks:
-            x = attn(x, elo_emb) + x
-            x = ff(x) + x
-        x = self.pool(self.norm(x))
-        x = self.last_ln(x)
-
-        value_hidden = self.value_dropout(self.value_act(self.value_hidden(x)))
-        value_pred = self.value_out(value_hidden).squeeze(-1)
-        return value_pred
-
-
-class Maia2ValueFeature(nn.Module):
-    """Maia2ValueReplica's trunk with features as additional attention tokens."""
-    def __init__(self, cfg: Maia2ValueFeatureConfig, n_result_classes: int = 3):
-        super().__init__()
-        if n_result_classes not in (2, 3):
-            raise ValueError(f"n_result_classes must be 2 or 3, got {n_result_classes}.")
-
-        self.cfg = cfg
-        self.feature_names = resolve_active_features(cfg.features)
-        self.cnn = ChessCNN(cfg)
-        self.to_patch_embedding = nn.Sequential(
-            nn.Linear(8 * 8, cfg.dim_vit),
-            nn.LayerNorm(cfg.dim_vit),
-        )
-        self.pos_embedding = nn.Parameter(torch.randn(1, cfg.vit_length, cfg.dim_vit))
-        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-        self.feat_embed_dropout = nn.Dropout(cfg.feat_embed_dropout)
-
-        self.feature_embeds = build_feature_embeds(self.feature_names, cfg.dim_vit)
-        self.feature_pos = nn.Parameter(torch.randn(1, len(self.feature_names), cfg.dim_vit))
-
-        ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
-        self.attn_blocks = nn.ModuleList([
-            nn.ModuleList([
-                Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
-                FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
-            ])
-            for _ in range(cfg.n_vit_layer)
-        ])
-        self.norm = nn.LayerNorm(cfg.dim_vit)
-        self.pool = build_pool(cfg.pool_type, cfg.dim_vit, cfg.pool_dropout)
-        self.last_ln = nn.LayerNorm(cfg.dim_vit)
-
-        self.aux_head = SpatialAuxHead(cfg.vit_length) if cfg.aux_head.enabled else None
-
-        self.value_hidden = nn.Linear(cfg.dim_vit, cfg.value_hidden_dim)
-        self.value_act = get_activation(cfg.value_activation)
-        self.value_dropout = nn.Dropout(cfg.value_dropout)
-        self.value_out = nn.Linear(cfg.value_hidden_dim, n_result_classes)
-
-    def forward(self, boards, features: dict):
-        b = boards.size(0)
-        feats = self.cnn(boards)
-        aux_logits = self.aux_head(feats) if self.aux_head is not None else None
-        feats = feats.view(b, feats.size(1), 8 * 8)
-        board_tokens = self.to_patch_embedding(feats)
-        board_tokens = board_tokens + self.pos_embedding
-        board_tokens = self.board_embed_dropout(board_tokens)
-
-        feature_tokens = torch.cat([
-            embed_feature(self.feature_embeds, name, features[name])
-            for name in self.feature_names
-        ], dim=1)
-        feature_tokens = feature_tokens + self.feature_pos
-        feature_tokens = self.feat_embed_dropout(feature_tokens)
-
-        x = torch.cat([board_tokens, feature_tokens], dim=1)
-
-        for attn, ff in self.attn_blocks:
-            x = attn(x) + x
-            x = ff(x) + x
-        x = self.pool(self.norm(x))
-        x = self.last_ln(x)
-
-        value_hidden = self.value_dropout(self.value_act(self.value_hidden(x)))
-        value_logits = self.value_out(value_hidden)
-        return value_logits, aux_logits
-
-
-# (c) PURE-TRANSFORMER MODELS
-
-class PureTransformer(nn.Module):
+class BasicBlock(nn.Module):
+    """Residual block, 2x (conv -> bn -> activation) plus skip.
+    Out: (b, planes, h, w).
     """
-    FEN-token transformer: 64 board squares, 12 FEN metadata chars, and feature tokens
-    Each get separate positional/identity treatment, then joint self-attention -> pool -> MLP head.
-    """
-    N_META = BOARD_SEQ_LEN - 64 
-
-    def __init__(self, cfg: PureTransformerConfig, n_result_classes: int = 3):
+    def __init__(self, planes, kernel_size=3, activation="relu"):
         super().__init__()
-        if n_result_classes not in (2, 3):
-            raise ValueError(f"n_result_classes must be 2 or 3, got {n_result_classes}.")
-        if cfg.pos_embed_type not in ("rope", "learned"):
-            raise ValueError(f"pos_embed_type must be 'rope' or 'learned', got {cfg.pos_embed_type!r}")
+        assert kernel_size % 2 == 1, "kernel_size must be odd for symmetric 'same' padding"
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv2d(planes, planes, kernel_size=kernel_size, padding=padding, bias=False)
+        self.bn1   = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=kernel_size, padding=padding, bias=False)
+        self.bn2   = nn.BatchNorm2d(planes)
+        self.act   = get_activation(activation)
 
-        self.cfg = cfg
-        self.feature_names = resolve_active_features(cfg.features)
+    def forward(self, x):
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + x
+        return self.act(out)
 
-        self.token_embedding = nn.Embedding(len(FEN_VOCAB), cfg.dim_vit)
-        self.board_embed_dropout = nn.Dropout(cfg.board_embed_dropout)
-        self.feat_embed_dropout = nn.Dropout(cfg.feat_embed_dropout)
+CNN_BLOCK_REGISTRY = {
+    "basic": BasicBlock,
+}
 
-        self.feature_embeds = build_feature_embeds(self.feature_names, cfg.dim_vit)
+class ChessCNN(nn.Module):
+    """CNN trunk, board tensor to vit_length feature maps.
+    Out: (b, vit_length, 8, 8).
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        padding = cfg.kernel_size // 2
+        self.conv1 = nn.Conv2d(cfg.input_channels, cfg.dim_cnn, kernel_size=cfg.kernel_size, padding=padding, bias=False)
+        self.bn1   = nn.BatchNorm2d(cfg.dim_cnn)
+        self.act   = get_activation(cfg.cnn_activation)
+        self.blocks = nn.Sequential(*[
+            build_cnn_block(cfg.cnn_block_type, cfg.dim_cnn, cfg.kernel_size, cfg.cnn_activation)
+            for _ in range(cfg.num_blocks_cnn)
+        ])
+        self.conv_last = nn.Conv2d(cfg.dim_cnn, cfg.vit_length, kernel_size=cfg.kernel_size, padding=padding, bias=False)
+        self.bn_last   = nn.BatchNorm2d(cfg.vit_length)
 
-        self.meta_pos = nn.Parameter(torch.randn(1, self.N_META, cfg.dim_vit))
-        self.feature_pos = nn.Parameter(torch.randn(1, len(self.feature_names), cfg.dim_vit))
-        if cfg.pos_embed_type == "learned":
-            self.board_pos_embedding = nn.Parameter(torch.randn(1, 64, cfg.dim_vit))
+    def forward(self, x):
+        out = self.act(self.bn1(self.conv1(x)))
+        out = self.blocks(out)
+        out = self.bn_last(self.conv_last(out))
+        return out
 
-        ff_hidden_dim = cfg.ff_hidden_dim if cfg.ff_hidden_dim is not None else cfg.dim_vit
-        if cfg.pos_embed_type == "learned":
-            self.blocks = nn.ModuleList([
-                nn.ModuleList([
-                    Attention(cfg.dim_vit, cfg.heads, cfg.dim_head, dropout=cfg.trunk_dropout),
-                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
-                ])
-                for _ in range(cfg.n_vit_layer)
-            ])
-        else:
-            self.blocks = nn.ModuleList([
-                nn.ModuleList([
-                    RotaryAttention(cfg.dim_vit, cfg.heads, cfg.dim_head, n_rotary=64, dropout=cfg.trunk_dropout),
-                    FeedForward(cfg.dim_vit, ff_hidden_dim, cfg.ff_activation, cfg.trunk_dropout),
-                ])
-                for _ in range(cfg.n_vit_layer)
-            ])
 
-        self.norm = nn.LayerNorm(cfg.dim_vit)
-        self.pool = build_pool(cfg.pool_type, cfg.dim_vit, cfg.pool_dropout)
-        self.last_ln = nn.LayerNorm(cfg.dim_vit)
+# (b) ATTENTION
 
-        self.aux_head = TokenAuxHead(cfg.dim_vit) if cfg.aux_head.enabled else None
+class Attention(nn.Module):
+    """Multi-head self-attention, optional elo offset on query.
+    Out: (b, n, dim).
+    """
+    def __init__(self, dim, heads, dim_head, elo_dim=None, dropout=0.1):
+        super().__init__()
+        inner_dim = heads * dim_head
 
-        self.value_hidden = nn.Linear(cfg.dim_vit, cfg.value_hidden_dim)
-        self.value_act = get_activation(cfg.value_activation)
-        self.value_dropout = nn.Dropout(cfg.value_dropout)
-        self.value_out = nn.Linear(cfg.value_hidden_dim, n_result_classes)
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.elo_query = nn.Linear(elo_dim, inner_dim, bias=False) if elo_dim is not None else None
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+        self.attend = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, board_token_ids, features: dict):
-        x = self.token_embedding(board_token_ids)  
-        board_tok, meta_tok = x[:, :64], x[:, 64:]
-
-        if self.cfg.pos_embed_type == "learned":
-            board_tok = board_tok + self.board_pos_embedding
-        board_tok = self.board_embed_dropout(board_tok)
-
-        meta_tok = meta_tok + self.meta_pos
-        meta_tok = self.board_embed_dropout(meta_tok)
-
-        feature_tokens = torch.cat([
-            embed_feature(self.feature_embeds, name, features[name])
-            for name in self.feature_names
-        ], dim=1)
-        feature_tokens = feature_tokens + self.feature_pos
-        feature_tokens = self.feat_embed_dropout(feature_tokens)
-
-        x = torch.cat([board_tok, meta_tok, feature_tokens], dim=1)
-
-        for attn, ff in self.blocks:
-            x = attn(x) + x
-            x = ff(x) + x
+    def forward(self, x, elo_emb=None):
+        b, n, _ = x.shape
         x = self.norm(x)
-        aux_logits = self.aux_head(x[:, :64]) if self.aux_head is not None else None
-        x = self.pool(x)
-        x = self.last_ln(x)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = [t.view(b, n, self.heads, -1).transpose(1, 2) for t in qkv]
 
-        value_hidden = self.value_dropout(self.value_act(self.value_hidden(x)))
-        value_logits = self.value_out(value_hidden)
-        return value_logits, aux_logits
+        if self.elo_query is not None:
+            if elo_emb is None:
+                raise ValueError("Attention was built with elo_dim set, but no elo_emb was passed.")
+            elo_effect = self.elo_query(elo_emb).view(b, self.heads, 1, -1)
+            q = q + elo_effect
+        elif elo_emb is not None:
+            raise ValueError("elo_emb was passed but this Attention has no elo_dim configured.")
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.dropout(self.attend(dots))
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(b, n, -1)
+        return self.to_out(out)
+
+class RotaryEmbedding(nn.Module):
+    """Applies RoPE rotation from cached cos/sin.
+    Out: (b, h, n, dim_head), same shape as input.
+    """
+    def __init__(self, dim, max_seq_len=128):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None], persistent=False)
+
+    def forward(self, x):
+        seq_len = x.shape[-2]
+        cos = self.cos_cached[:, :, :seq_len]
+        sin = self.sin_cached[:, :, :seq_len]
+        x1, x2 = x.chunk(2, dim=-1)
+        rotated = torch.cat([-x2, x1], dim=-1)
+        return x * cos + rotated * sin
+
+class RotaryAttention(nn.Module):
+    """Multi-head self-attention, RoPE on first n_rotary tokens.
+    Out: (b, n, dim).
+    """
+    def __init__(self, dim, heads, dim_head, n_rotary, dropout=0.1):
+        super().__init__()
+        inner_dim = heads * dim_head
+        self.heads = heads
+        self.dim_head = dim_head
+        self.n_rotary = n_rotary
+        self.dropout_p = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.rotary = RotaryEmbedding(dim_head, max_seq_len=n_rotary)
+
+    def forward(self, x):
+        b, n, _ = x.shape
+        x_norm = self.norm(x)
+        qkv = self.to_qkv(x_norm).chunk(3, dim=-1)
+        q, k, v = [t.view(b, n, self.heads, self.dim_head).transpose(1, 2) for t in qkv]
+
+        q = torch.cat([self.rotary(q[:, :, :self.n_rotary]), q[:, :, self.n_rotary:]], dim=2)
+        k = torch.cat([self.rotary(k[:, :, :self.n_rotary]), k[:, :, self.n_rotary:]], dim=2)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout_p if self.training else 0.0
+        )
+        out = out.transpose(1, 2).reshape(b, n, self.heads * self.dim_head)
+        return self.dropout(self.to_out(out))
 
 
-####################
-# EXTRAS
-####################
+# (c) NEURAL-NET FEEDFORWARD & POOLING
 
-# (a) MODEL BUILDING
+class FeedForward(nn.Module):
+    """LayerNorm -> linear -> activation -> dropout -> linear -> dropout.
+    Out: (b, n, dim).
+    """
+    def __init__(self, dim, hidden_dim, activation="gelu", dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            get_activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+    def forward(self, x):
+        return self.net(x)
 
-MODEL_REGISTRY: dict[str, tuple[type[nn.Module], type[BaseModelConfig]]] = {
-    "log_reg_baseline": (LogRegBaseline, LogRegBaselineConfig),
-    "maia2_value_board": (Maia2ValueBoard, Maia2ValueBoardConfig),
-    "maia2_value_replica": (Maia2ValueReplica, Maia2ValueReplicaConfig),
-    "maia2_value_feature": (Maia2ValueFeature, Maia2ValueFeatureConfig),
-    "pure_transformer": (PureTransformer, PureTransformerConfig),
+class MeanPool(nn.Module):
+    """Mean over tokens.
+    Out: (b, n, d) -> (b, d).
+    """
+    def __init__(self, dim=None, dropout=None):
+        super().__init__()
+
+    def forward(self, x):
+        return x.mean(dim=1)
+
+class AttentionPool(nn.Module):
+    """Learned-query attention pooling over tokens.
+    Out: (b, n, d) -> (b, d).
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, dim))
+        self.scale = dim ** -0.5
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_kv = nn.Linear(dim, dim * 2, bias=False)
+        self.to_out = nn.Linear(dim, dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        b = x.size(0)
+        q = self.to_q(self.query).expand(b, -1, -1)  # (b, 1, d)
+        k, v = self.to_kv(x).chunk(2, dim=-1)         # each (b, n, d)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # (b, 1, n)
+        attn = self.dropout(self.attend(dots))
+        out = torch.matmul(attn, v).squeeze(1)  # (b, d)
+        return self.to_out(out)
+
+POOL_REGISTRY = {
+    "mean": lambda dim, dropout: MeanPool(dim, dropout),
+    "attn": lambda dim, dropout: AttentionPool(dim, dropout=dropout),
 }
 
-def _validate_model_registry() -> None:
-    """Raises if a MODEL_REGISTRY config's default arch_name mismatches its key, or is missing from OUTPUT_TYPE_REGISTRY."""
-    for key, (_, cfg_cls) in MODEL_REGISTRY.items():
-        default_arch_name = cfg_cls().arch_name
-        if default_arch_name != key:
-            raise ValueError(f"MODEL_REGISTRY[{key!r}] config class {cfg_cls.__name__} has "
-                              f"default arch_name={default_arch_name!r}, which doesn't match its registry key.")
-        if key not in OUTPUT_TYPE_REGISTRY:
-            raise ValueError(f"MODEL_REGISTRY[{key!r}] has no entry in OUTPUT_TYPE_REGISTRY.")
+# (d) AUXILIARY HEADS
 
-_validate_model_registry()
+class TokenAuxHead(nn.Module):
+    """Per-token projection of board-square tokens to 3 aux maps.
+    Out: (b, 3, 64).
+    """
+    def __init__(self, dim_vit):
+        super().__init__()
+        self.proj = nn.Linear(dim_vit, 3)
+        perm = torch.tensor([(7 - i // 8) * 8 + (i % 8) for i in range(64)])
+        self.register_buffer('perm', perm)
 
-def build_model(arch_name: str, cfg: BaseModelConfig, n_elo_bins: int | None = None) -> nn.Module:
-    """Builds a model by arch_name from MODEL_REGISTRY, using cfg plus any data-derived kwargs it needs."""
-    if arch_name not in MODEL_REGISTRY:
-        raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(MODEL_REGISTRY)}")
-    model_cls, cfg_cls = MODEL_REGISTRY[arch_name]
+    def forward(self, x):
+        return self.proj(x).transpose(1, 2)[:, :, self.perm]
 
-    if not isinstance(cfg, cfg_cls):
-        raise TypeError(f"build_model('{arch_name}', ...) expects a {cfg_cls.__name__}, got {type(cfg).__name__}.")
-    if cfg.arch_name != arch_name:
-        raise ValueError(f"cfg.arch_name is '{cfg.arch_name}' but build_model was called with arch_name='{arch_name}'.")
+class SpatialAuxHead(nn.Module):
+    """1x1 conv projection of CNN output to 3 aux maps.
+    Out: (b, 3, 64).
+    """
+    def __init__(self, vit_length):
+        super().__init__()
+        self.proj = nn.Conv2d(vit_length, 3, kernel_size=1)
 
-    extra_kwargs = get_model_kwargs(arch_name, n_elo_bins)
-    return model_cls(cfg, **extra_kwargs)
-
-# (b) MODEL INFERENCE
-
-def predict_maia2_value_board(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Runs Maia2ValueBoard on a batch dict, returning (predictions, None)."""
-    return model(batch["boards"]), None
-
-def predict_maia2_value_replica(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Runs Maia2ValueReplica on a batch dict, returning (predictions, None)."""
-    return model(batch["boards"], batch["elo_self_bin"], batch["elo_oppo_bin"]), None
-
-
-def _batch_features(model: nn.Module, batch: dict) -> dict:
-    """Pulls just model.feature_names out of a flat batch dict, raising if any are missing."""
-    missing = [name for name in model.feature_names if name not in batch]
-    if missing:
-        raise KeyError(f"cfg.features asks for {missing}, which the batch does not contain.")
-    return {name: batch[name] for name in model.feature_names}
-
-def predict_log_reg_baseline(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Runs LogRegBaseline on a batch dict, returning (predictions, None)."""
-    return model(_batch_features(model, batch)), None
-
-def predict_maia2_value_feature(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Runs Maia2ValueFeature on a batch dict, returning (predictions, aux_predictions)."""
-    return model(batch["boards"], _batch_features(model, batch))
-
-def predict_pure_transformer(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Runs PureTransformer on a batch dict, returning (predictions, aux_predictions)."""
-    return model(batch["board_token_ids"], _batch_features(model, batch))
-
-
-PREDICT_REGISTRY: dict[str, Callable[[nn.Module, dict], tuple[torch.Tensor, torch.Tensor | None]]] = {
-    "log_reg_baseline": predict_log_reg_baseline,
-    "maia2_value_board": predict_maia2_value_board,
-    "maia2_value_replica": predict_maia2_value_replica,
-    "maia2_value_feature": predict_maia2_value_feature,
-    "pure_transformer": predict_pure_transformer,
-}
-
-def get_predict_fn(arch_name: str) -> Callable[[nn.Module, dict], tuple[torch.Tensor, torch.Tensor | None]]:
-    """Returns the predict(model, batch) function for arch_name."""
-    if arch_name not in PREDICT_REGISTRY:
-        raise ValueError(f"Unknown arch_name '{arch_name}', choose from {list(PREDICT_REGISTRY)}")
-    return PREDICT_REGISTRY[arch_name]
+    def forward(self, x):
+        b = x.size(0)
+        return self.proj(x).view(b, 3, 64)

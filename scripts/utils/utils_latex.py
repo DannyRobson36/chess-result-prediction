@@ -4,7 +4,7 @@ Converts pandas DataFrames into booktabs-style LaTeX table/subtable blocks for d
 dissertation.
 
 Latest changes: 17/09/26:
-- Shortened docstrings
+- Tightened docstrings
 """
 
 import math
@@ -47,8 +47,7 @@ def _escape_latex_text(text: str) -> str:
 
 def format_value(value: float, decimals: int = 2, multiply: float | None = None, suffix: str = '',
                   sign: bool = False, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Formats value to decimals d.p., with optional multiply, suffix, and forced sign; returns
-    nan_placeholder for NaN."""
+    """Formats value to decimals d.p., with optional multiply, suffix, and forced sign."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return _escape_latex_text(nan_placeholder)
     scaled = value * multiply if multiply is not None else value
@@ -57,7 +56,7 @@ def format_value(value: float, decimals: int = 2, multiply: float | None = None,
 
 
 def format_text_value(value, nan_placeholder: str = NAN_PLACEHOLDER) -> str:
-    """Passes value through as an escaped string; returns nan_placeholder for None/NaN."""
+    """Passes value through as an escaped string."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return _escape_latex_text(nan_placeholder)
     return _escape_latex_text(str(value))
@@ -165,7 +164,7 @@ def render_grouped_tabular(df, column_specs: list[dict], group_specs: list[dict]
 # (d) SUBTABLE / TABLE ASSEMBLY
 
 def render_subtable(tabular_latex: str, caption: str, label: str, width: str = '\\textwidth') -> str:
-    """Wraps tabular_latex in a top-aligned subtable of width, with its own caption and label."""
+    """Wraps tabular_latex in a top-aligned subtable of width, with own caption and label."""
     body = '\n'.join([
         '\\centering',
         tabular_latex,
@@ -203,7 +202,7 @@ def render_table(subtables: list[dict], outer_caption: str, outer_label: str, n_
 
 
 def render_flat_table(tabular_latex: str, caption: str, label: str, position: str = 'htbp') -> str:
-    """Wraps tabular_latex directly in a table environment, with its own caption and label."""
+    """Wraps tabular_latex directly in a table environment, with own caption and label."""
     body = '\n'.join([
         '\\centering',
         f'\\caption{{{_escape_latex_text(caption)}}}',

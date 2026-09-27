@@ -1,9 +1,9 @@
 """
 model_config.py
-Allows for configuration of model's parameters, depends on flexibility allowed in model_arch.py
+Per-architecture model config dataclasses.
 
-Latest changes: 27/08/26:
-- Alterations to dropout organisation - effects notebook-level
+Latest changes: 27/09/26:
+- Tightening docstring
 """
 
 from dataclasses import dataclass, field, asdict
@@ -18,11 +18,12 @@ class BaseModelConfig:
     arch_name: str = ""
 
     def to_dict(self) -> dict:
+        """Returns config as dict."""
         return asdict(self)
 
 @dataclass
 class AuxHeadConfig:
-    """Auxiliary legal-move/attacked-square head: on/off flag and combined loss weight."""
+    """Aux head on/off flag and loss weight."""
     enabled: bool = False
     loss_weight: float | None = None
 
@@ -30,7 +31,7 @@ class AuxHeadConfig:
 
 @dataclass
 class LogRegBaselineConfig(BaseModelConfig):
-    """Config for LogRegBaseline: plain logistic regression over raw scalar feature values."""
+    """Config for LogRegBaseline."""
     arch_name: str = "log_reg_baseline"
 
     features: dict = field(default_factory=dict)
@@ -39,7 +40,7 @@ class LogRegBaselineConfig(BaseModelConfig):
 
 @dataclass
 class Maia2ValueBoardConfig(BaseModelConfig):
-    """Config for Maia2ValueBoard: plain-attention, elo-blind CNN+attention value model."""
+    """Config for Maia2ValueBoard."""
     arch_name: str = "maia2_value_board"
 
     input_channels: int = 18
@@ -71,7 +72,7 @@ class Maia2ValueBoardConfig(BaseModelConfig):
 
 @dataclass
 class Maia2ValueReplicaConfig(BaseModelConfig):
-    """Config for Maia2ValueReplica: non-exact replica of Maia2, value head only."""
+    """Config for Maia2ValueReplica."""
     arch_name: str = "maia2_value_replica"
 
     input_channels: int = 18
@@ -104,7 +105,7 @@ class Maia2ValueReplicaConfig(BaseModelConfig):
 
 @dataclass
 class Maia2ValueFeatureConfig(BaseModelConfig):
-    """Config for Maia2ValueFeature: Maia2ValueReplica's trunk with features as additional tokens."""
+    """Config for Maia2ValueFeature."""
     arch_name: str = "maia2_value_feature"
 
     input_channels: int = 18
@@ -142,7 +143,7 @@ class Maia2ValueFeatureConfig(BaseModelConfig):
 
 @dataclass
 class PureTransformerConfig(BaseModelConfig):
-    """Config for PureTransformer: FEN-token-sequence transformer, rope or learned position embedding."""
+    """Config for PureTransformer."""
     arch_name: str = "pure_transformer"
 
     dim_vit: int = 64

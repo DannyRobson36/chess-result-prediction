@@ -32,11 +32,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts.features.features import apply_prepared_splits
-from scripts.models.model_arch import build_model, get_output_type, get_predict_fn
-from scripts.training.training import TrainedModel, iterate_batches, make_batch, get_device
-from scripts.utils.utils_chess import RESULT_CLASS_NAMES
-from scripts.utils.utils_eval import apply_temperature, collapse_to_expected_score, binary_probit_prediction_cols
+from src.features.features import apply_prepared_splits
+from src.models.model_arch import build_model, get_output_type, get_predict_fn
+from src.training.training import TrainedModel, iterate_batches, make_batch, get_device
+from src.utils.utils_chess import RESULT_CLASS_NAMES
+from src.utils.utils_eval import apply_temperature, collapse_to_expected_score, binary_probit_prediction_cols
 
 ####################
 # CONSTANTS

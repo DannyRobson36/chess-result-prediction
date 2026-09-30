@@ -15,13 +15,13 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix as sk_confusion_matrix, classification_report
 from sklearn.metrics import roc_curve, auc
 
-from scripts.utils.utils_chess import (
+from src.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, RESULT_TO_CLASS, RESULT_CLASS_NAMES,
     total_material, material_diff, game_phase, phase_label, title_track, title_strength,
 )
-from scripts.utils.utils_eval import resolve_display_name
-from scripts.utils.utils_plotting import colors_for, linestyles_for, BASE_FIGSIZE
-from scripts.features.features import SEC_MAPPING, INC_FLAG_MAPPING
+from src.utils.utils_eval import resolve_display_name
+from src.utils.utils_plotting import colors_for, linestyles_for, BASE_FIGSIZE
+from src.features.features import SEC_MAPPING, INC_FLAG_MAPPING
 
 ####################
 # CONSTANTS

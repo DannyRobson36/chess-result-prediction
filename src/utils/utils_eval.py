@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, phase_label
+from src.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_labels, phase_label
 
 ####################
 # CONSTANTS

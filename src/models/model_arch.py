@@ -11,9 +11,9 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
-from scripts.utils.utils_chess import FEN_VOCAB, BOARD_SEQ_LEN
+from src.utils.utils_chess import FEN_VOCAB, BOARD_SEQ_LEN
 
-from scripts.models.model_support import (
+from src.models.model_support import (
     ChessCNN, Attention,
     RotaryAttention, FeedForward,
     build_pool, get_activation, resolve_active_features,
@@ -21,7 +21,7 @@ from scripts.models.model_support import (
     TokenAuxHead, SpatialAuxHead,
 )
 
-from scripts.models.model_config import (
+from src.models.model_config import (
     BaseModelConfig,
     LogRegBaselineConfig,
     Maia2ValueBoardConfig, Maia2ValueFeatureConfig,

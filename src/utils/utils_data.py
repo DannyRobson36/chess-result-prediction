@@ -12,7 +12,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from scripts.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_edges, elo_bin_labels
+from src.utils.utils_chess import EloBinConfig, ELO_BINS, elo_bin_by_mover, elo_bin_edges, elo_bin_labels
 
 ####################
 # FUNCTIONS

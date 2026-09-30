@@ -21,7 +21,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from scripts.config import GAME_DIR
+from src.config import GAME_DIR
 
 import argparse
 import csv

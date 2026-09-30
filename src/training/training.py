@@ -18,11 +18,11 @@ import torch.nn as nn
 from sklearn.metrics import accuracy_score, classification_report
 from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 
-from scripts.features.features import SplitData, PrepConfig
-from scripts.models.model_arch import get_output_type, get_predict_fn
-from scripts.models.model_config import BaseModelConfig
-from scripts.utils.utils_chess import RESULT_CLASS_NAMES
-from scripts.utils.utils_eval import (
+from src.features.features import SplitData, PrepConfig
+from src.models.model_arch import get_output_type, get_predict_fn
+from src.models.model_config import BaseModelConfig
+from src.utils.utils_chess import RESULT_CLASS_NAMES
+from src.utils.utils_eval import (
     metric_mode, is_better, fit_temperature, fit_binary_probit, collapse_to_expected_score,
 )
 

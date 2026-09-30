@@ -13,12 +13,12 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, classification_report
 
-from scripts.features.features import SplitData
-from scripts.models.model_arch import get_output_type, get_predict_fn
-from scripts.training.training import (
+from src.features.features import SplitData
+from src.models.model_arch import get_output_type, get_predict_fn
+from src.training.training import (
     iterate_batches, make_batch, get_targets, get_device, build_loss, resolve_loss_name,
 )
-from scripts.utils.utils_chess import RESULT_CLASS_NAMES
+from src.utils.utils_chess import RESULT_CLASS_NAMES
 
 ####################
 # FUNCTIONS

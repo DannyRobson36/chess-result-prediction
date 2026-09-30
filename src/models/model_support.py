@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from scripts.utils.utils_chess import TITLE_VOCAB_SIZE
+from src.utils.utils_chess import TITLE_VOCAB_SIZE
 
 ####################
 # CONSTANTS

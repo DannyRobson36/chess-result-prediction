@@ -17,11 +17,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from scripts.features.features import SplitData
-from scripts.models.model_arch import MODEL_REGISTRY, build_model, get_output_type
-from scripts.training.training import TRAIN_PROBE_SIZE, TrainConfig, get_device, probe_idx, run_training
-from scripts.utils.utils_eval import metric_mode, is_better
-from scripts.utils.utils_setup import set_seed
+from src.features.features import SplitData
+from src.models.model_arch import MODEL_REGISTRY, build_model, get_output_type
+from src.training.training import TRAIN_PROBE_SIZE, TrainConfig, get_device, probe_idx, run_training
+from src.utils.utils_eval import metric_mode, is_better
+from src.utils.utils_setup import set_seed
 
 ####################
 # FUNCTIONS

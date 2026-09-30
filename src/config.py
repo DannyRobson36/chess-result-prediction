@@ -57,7 +57,7 @@ LOCAL_SPLITS_DIR = '/content/prepared_splits'
 ####################
 
 REPO_DIR = f'/content/{REPO_NAME}'
-REPO_SCRIPTS_DIR = f'{REPO_DIR}/scripts'
+REPO_SRC_DIR = f'{REPO_DIR}/src'
 
 ####################
 # Overleaf

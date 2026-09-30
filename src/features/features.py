@@ -24,8 +24,8 @@ import psutil
 import torch
 from tqdm import tqdm
 
-from scripts.config import STOCKFISH_PATH
-from scripts.utils.utils_chess import (
+from src.config import STOCKFISH_PATH
+from src.utils.utils_chess import (
     EloBinConfig, ELO_BINS, elo_bin_edges, elo_bin_labels,
     fen_to_tensor, fen_to_token_ids, fen_to_legal_dest, fen_to_attacked_squares,
     encode_result_class, encode_result_continuous, encode_title_idx, BOARD_SEQ_LEN,

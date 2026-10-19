@@ -104,9 +104,9 @@ class Maia2ValueReplicaConfig(BaseModelConfig):
     aux_head: AuxHeadConfig = field(default_factory=AuxHeadConfig)
 
 @dataclass
-class Maia2ValueFeatureConfig(BaseModelConfig):
-    """Config for Maia2ValueFeature."""
-    arch_name: str = "maia2_value_feature"
+class CNNAttentionConfig(BaseModelConfig):
+    """Config for CNNAttention."""
+    arch_name: str = "cnn_attention"
 
     input_channels: int = 18
     dim_cnn: int = 64

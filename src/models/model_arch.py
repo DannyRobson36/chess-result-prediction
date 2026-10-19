@@ -24,7 +24,7 @@ from src.models.model_support import (
 from src.models.model_config import (
     BaseModelConfig,
     LogRegBaselineConfig,
-    Maia2ValueBoardConfig, Maia2ValueFeatureConfig,
+    Maia2ValueBoardConfig, CNNAttentionConfig,
     Maia2ValueReplicaConfig, PureTransformerConfig
 )
 
@@ -36,7 +36,7 @@ OUTPUT_TYPE_REGISTRY = {
     "log_reg_baseline": "classification",
     "maia2_value_board": "regression",
     "maia2_value_replica": "regression",
-    "maia2_value_feature": "classification",
+    "cnn_attention": "classification",
     "pure_transformer": "classification",
 }
 
@@ -56,7 +56,7 @@ def get_model_kwargs(arch_name: str, n_elo_bins: int | None = None) -> dict:
         if n_elo_bins is None:
             raise ValueError("maia2_value_replica requires n_elo_bins.")
         return {"n_elo_bins": n_elo_bins}
-    if arch_name in ("maia2_value_feature", "pure_transformer", "log_reg_baseline"):
+    if arch_name in ("cnn_attention", "pure_transformer", "log_reg_baseline"):
         return {"n_result_classes": 3}
     return {}
 
@@ -185,9 +185,9 @@ class Maia2ValueReplica(nn.Module):
         return value_pred
 
 
-class Maia2ValueFeature(nn.Module):
+class CNNAttention(nn.Module):
     """Maia2ValueReplica's trunk with features as additional attention tokens."""
-    def __init__(self, cfg: Maia2ValueFeatureConfig, n_result_classes: int = 3):
+    def __init__(self, cfg: CNNAttentionConfig, n_result_classes: int = 3):
         super().__init__()
         if n_result_classes not in (2, 3):
             raise ValueError(f"n_result_classes must be 2 or 3, got {n_result_classes}.")
@@ -353,7 +353,7 @@ MODEL_REGISTRY: dict[str, tuple[type[nn.Module], type[BaseModelConfig]]] = {
     "log_reg_baseline": (LogRegBaseline, LogRegBaselineConfig),
     "maia2_value_board": (Maia2ValueBoard, Maia2ValueBoardConfig),
     "maia2_value_replica": (Maia2ValueReplica, Maia2ValueReplicaConfig),
-    "maia2_value_feature": (Maia2ValueFeature, Maia2ValueFeatureConfig),
+    "cnn_attention": (CNNAttention, CNNAttentionConfig),
     "pure_transformer": (PureTransformer, PureTransformerConfig),
 }
 
@@ -405,8 +405,8 @@ def predict_log_reg_baseline(model: nn.Module, batch: dict) -> tuple[torch.Tenso
     """Returns (preds, None) from LogRegBaseline."""
     return model(_batch_features(model, batch)), None
 
-def predict_maia2_value_feature(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Returns (preds, aux_preds) from Maia2ValueFeature."""
+def predict_cnn_attention(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Returns (preds, aux_preds) from CNNAttention."""
     return model(batch["boards"], _batch_features(model, batch))
 
 def predict_pure_transformer(model: nn.Module, batch: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -418,7 +418,7 @@ PREDICT_REGISTRY: dict[str, Callable[[nn.Module, dict], tuple[torch.Tensor, torc
     "log_reg_baseline": predict_log_reg_baseline,
     "maia2_value_board": predict_maia2_value_board,
     "maia2_value_replica": predict_maia2_value_replica,
-    "maia2_value_feature": predict_maia2_value_feature,
+    "cnn_attention": predict_cnn_attention,
     "pure_transformer": predict_pure_transformer,
 }
 
